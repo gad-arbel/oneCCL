@@ -168,9 +168,6 @@ if(ONECCL_SECURITY_COMPILE_DEFINITIONS)
 endif()
 
 if(ONECCL_BUILD_LIBS)
-    # Build libccl.so.2
-    add_subdirectory(src)
-
     if(NOT "${ONECCL_LIBSTDCXX_PATH}" STREQUAL "" AND COMPILER_SUPPORTS_NOSTDLIBXX)
         message(STATUS "Using specified libstdc++: ${ONECCL_LIBSTDCXX_PATH}")
         set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -nostdlib++ -l:${ONECCL_LIBSTDCXX_PATH}")
@@ -179,6 +176,9 @@ if(ONECCL_BUILD_LIBS)
             message(WARNING "Cannot use custom libstdc++ because -nostdlib++ is not supported by the compiler.")
         endif()
     endif()
+
+    # Build libccl.so.2
+    add_subdirectory(src)
 
     # Setup legacy libccl
     if(NOT WIN32)
