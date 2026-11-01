@@ -301,19 +301,24 @@ for mt_exec_name in "${test_names[@]}"; do
 done
 
 test_names=("graph_integration") # TODO add graph_integration/graph_mt_integration
+graph_args=("" "--native")
+graph_envs=("" "CCL_SYCL_GRAPH_TYPE=native")
 
 n_ranks=$(sycl-ls | grep "level_zero:gpu" | wc -l)
 
 pushd graph_integration
+
 for exec_name in "${test_names[@]}"; do
     for n_rank in 1 $(seq 2 2 ${n_ranks}); do
-        TEST_LOG="test_${exec_name}_${n_rank}.log"
-        cmd="mpiexec -n ${n_rank} ./${exec_name} > ${TEST_LOG} 2>&1"
-        echo "${cmd}"
-        run_and_check_log "${cmd}" ${TEST_LOG}
-        # run_cmd_no_exit "${cmd}"
-        # check_log_and_print ${TEST_LOG}
-        test $? -eq 1 && cat "${TEST_LOG}"
+        for ((g_i = 0; g_i < ${#graph_args[@]}; ++g_i)); do
+            TEST_LOG="test_${exec_name}_${n_rank}.log"
+            cmd="${graph_envs[${g_i}]} mpiexec -n ${n_rank} ./${exec_name} ${graph_args[${g_i}]} > ${TEST_LOG} 2>&1"
+            echo "${cmd}"
+            run_and_check_log "${cmd}" ${TEST_LOG}
+            # run_cmd_no_exit "${cmd}"
+            # check_log_and_print ${TEST_LOG}
+            test $? -eq 1 && cat "${TEST_LOG}"
+        done
     done
 done
 popd
@@ -331,6 +336,7 @@ thresholds=(0 1000000000)
 pushd ll_algorithms
 for threshold in "${thresholds[@]}"; do
     for ppn in "${ppns[@]}"; do
+        local graph_loops=${#graph_args[@]}
         for exec_name in "${test_names[@]}"; do
             for algo in "${algo_names[@]}"; do
                 TEST_LOG="test_${algo}_${ppn}_${threshold}_${exec_name}.log"

@@ -154,6 +154,10 @@ public:
     sycl::queue &getMainQueue() {
         return main_queue.value();
     }
+
+    bool hasMainQueue() {
+        return main_queue.has_value();
+    }
 };
 
 extern SerializedStream global_serialize_stream;
@@ -952,7 +956,26 @@ public:
     ccl_comm(ccl_comm&& src) = default;
     ccl_comm& operator=(ccl_comm& src) = delete;
     ccl_comm& operator=(ccl_comm&& src) = default;
-    ~ccl_comm() = default;
+    ~ccl_comm() {
+        LOG_TRACE("comm destructor started");
+        // The destructor is implicitly noexcept. Any exception that escapes it
+        // calls std::terminate(). The SYCL wait()/submit_barrier() calls below
+        // are not marked noexcept by the spec and may throw, so guard the body.
+        try {
+#ifdef CCL_ENABLE_SYCL
+            if (global_serialize_stream.hasMainQueue()) {
+                global_serialize_stream.getMainQueue().ext_oneapi_submit_barrier().wait();
+            }
+#ifdef CCL_ENABLE_ZE
+            last_event.wait();
+#endif
+#endif
+        }
+        catch (const std::exception& e) {
+            LOG_ERROR("exception in comm destructor: ", e.what());
+        }
+        LOG_TRACE("comm destructor finished");
+    };
 
     void set_parent_comm(ccl_comm* comm) {
         parent_comm = comm;
@@ -1454,8 +1477,6 @@ private:
     ccl_stream* last_stream = nullptr;
     // Map of streams to their most recent events for finalize tracking
     std::unordered_map<ccl_stream*, sycl::event> finalize_events;
-    // Flag to track if comm was used during graph recording (invalid for finalize)
-    bool used_in_graph_recording = false;
 
 #endif // CCL_ENABLE_SYCL && CCL_ENABLE_ZE
 

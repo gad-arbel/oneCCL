@@ -25,6 +25,7 @@
 #include "common/env/env_parser.hpp"
 #include "common/global/global.hpp"
 #include "common/log/log.hpp"
+#include "env.hpp"
 #include "exec/exec.hpp"
 #include "oneapi/ccl/environment.hpp"
 #include "common/utils/version.hpp"
@@ -75,6 +76,18 @@ std::map<process_launcher_mode, std::string> env_data::process_launcher_names = 
     std::make_pair(process_launcher_mode::pmix, "pmix"),
 #endif // CCL_ENABLE_PMIX
     std::make_pair(process_launcher_mode::none, "none")
+};
+
+std::map<graph_type, std::string> env_data::graph_type_names = {
+    std::make_pair(graph_type::auto_type, "auto"),
+    std::make_pair(graph_type::native, "native"),
+    std::make_pair(graph_type::sycl, "sycl")
+};
+
+std::map<ccl_overlapping_collectives, std::string> env_data::overlapping_collective_names = {
+    std::make_pair(ccl_overlapping_collectives::enable_always, "enable_always"),
+    std::make_pair(ccl_overlapping_collectives::enable_except_native_graph, "enable_except_native_graph"),
+    std::make_pair(ccl_overlapping_collectives::disable, "disable")
 };
 
 env_data::env_data()
@@ -148,6 +161,7 @@ env_data::env_data()
           staging_buffer(ccl_staging_regular),
           enable_op_sync(0),
           enable_op_sycl_serialize(0),
+          overlapping_collectives(ccl_overlapping_collectives::enable_except_native_graph),
           enable_hostname_sharing(1),
           enable_init_hostname_sharing(1),
           occp_server_hostname("localhost"),
@@ -256,6 +270,7 @@ env_data::env_data()
 #endif // CCL_ENABLE_ESIMD
           sycl_full_vector(1),
           sycl_force_recording_path(0),
+          sycl_graph_type(graph_type::auto_type),
           sycl_kernel_memcpy_upsize(0),
           sycl_tmp_buf_size(ccl_large_tmp_bufs::buf_count * 128 * 1024 * 1024),
           sycl_scaleout_host_buf_size(1024 * 1024 * 1024),
@@ -567,6 +582,7 @@ void env_data::parse() {
     p.env_2_enum(CCL_STAGING_BUFFER, staging_buffer_names, staging_buffer);
     p.env_2_type(CCL_OP_SYNC, enable_op_sync);
     p.env_2_type(CCL_OP_SYCL_SERIALIZE, enable_op_sycl_serialize);
+    p.env_2_enum(CCL_OVERLAPPING_COLLECTIVES, overlapping_collective_names, overlapping_collectives);
     p.env_2_type(CCL_OFI_ENABLE_HOSTNAME_SHARING, enable_hostname_sharing);
     p.env_2_type(CCL_OFI_INIT_ENABLE_HOSTNAME_SHARING, enable_init_hostname_sharing);
     p.env_2_type(CCL_OCCP_SERVER_HOSTNAME, occp_server_hostname);
@@ -670,6 +686,7 @@ void env_data::parse() {
 #endif // CCL_ENABLE_ESIMD
     p.env_2_type(CCL_SYCL_FULL_VECTOR, sycl_full_vector);
     p.env_2_type(CCL_SYCL_FORCE_RECORDING_PATH, sycl_force_recording_path);
+    p.env_2_enum(CCL_SYCL_GRAPH_TYPE, graph_type_names, sycl_graph_type);
     p.env_2_type(CCL_SYCL_KERNEL_MEMCPY_UPSIZE, sycl_kernel_memcpy_upsize);
     p.env_2_type(CCL_SYCL_TMP_BUF_SIZE, sycl_tmp_buf_size);
     p.env_2_type(CCL_SYCL_SCALEOUT_HOST_BUF_SIZE, sycl_scaleout_host_buf_size);

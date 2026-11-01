@@ -475,7 +475,9 @@ struct reduce_scatter_coll_params {
 };
 
 template <typename T, int vec_size>
+#if !RS_USE_PARALLEL_FOR 
 SYCL_EXT_ONEAPI_FUNCTION_PROPERTY((syclexp::nd_range_kernel<1>))
+#endif
 void inline reduce_scatter_kernel_wrap(const void *send_buf,
                                        void *recv_buf,
                                        size_t recv_count,

@@ -20,6 +20,27 @@
 #include <sycl/sycl.hpp>
 
 #include <iostream>
+#include <set>
+
+// types------------------------------------------------------
+
+struct Args {
+    Args(int argc, char *argv[]) {
+        for (int i = 0; i < argc; ++i) {
+            std::cout << "argument number " << i << ": " << argv[i] << std::endl;
+            args.insert(argv[i]);
+        }
+        std::cout << "finished parsing" << std::endl;
+        initialize_internal();
+    }
+    void initialize_internal() {
+        native = args.count(std::string("--native")) > 0;
+        print_help = args.count(std::string("--help")) > 0;
+    }
+    std::set<std::string> args;
+    bool native;
+    bool print_help;
+};
 
 class TestInstance;
 
@@ -96,6 +117,7 @@ protected:
     size_t comm_rank;
     ccl::stream stream;
     std::string name;
+    Args args;
 
     void reinit(size_t send_buf_size, size_t recv_buf_size, size_t new_count) {
         sycl::free(send_buf, q);
@@ -108,7 +130,8 @@ protected:
     }
 
 public:
-    TestInstance(std::string name,
+    TestInstance(const Args &args,
+                 std::string name,
                  size_t count,
                  size_t send_buf_size,
                  size_t recv_buf_size,
@@ -118,7 +141,8 @@ public:
                  sycl::context context,
                  create_kvs_function create_kvs,
                  create_comm_function create_comm)
-            : devices(devices),
+            : args(args),
+              devices(devices),
               context(context),
               q(context,
                 devices[comm_rank % devices.size()],
@@ -160,6 +184,10 @@ public:
         return count;
     }
 
+    Args& get_args() {
+        return args;
+    }
+
     virtual void init_clear_buffers() = 0;
     // manipulate input buffers
     //
@@ -179,14 +207,16 @@ public:
 
 class TestInstanceAllreduce : public TestInstance {
 public:
-    TestInstanceAllreduce(size_t count,
+    TestInstanceAllreduce(const Args &args,
+                          size_t count,
                           size_t comm_size,
                           size_t comm_rank,
                           std::vector<sycl::device> devices,
                           sycl::context context,
                           create_kvs_function create_kvs,
                           create_comm_function create_comm = ccl::create_communicator)
-            : TestInstance(std::string("allreduce"),
+            : TestInstance(args,
+                           std::string("allreduce"),
                            count,
                            count,
                            count,
@@ -317,14 +347,16 @@ public:
 
 class TestInstanceReduceScatter : public TestInstance {
 public:
-    TestInstanceReduceScatter(size_t count,
+    TestInstanceReduceScatter(const Args &args,
+                              size_t count,
                               size_t comm_size,
                               size_t comm_rank,
                               std::vector<sycl::device> devices,
                               sycl::context context,
                               create_kvs_function create_kvs,
                               create_comm_function create_comm = ccl::create_communicator)
-            : TestInstance(std::string("reduce_scatter"),
+            : TestInstance(args,
+                           std::string("reduce_scatter"),
                            count,
                            count * comm_size,
                            count,
@@ -469,14 +501,16 @@ public:
 
 class TestInstanceAllgather : public TestInstance {
 public:
-    TestInstanceAllgather(size_t count,
+    TestInstanceAllgather(const Args &args,
+                          size_t count,
                           size_t comm_size,
                           size_t comm_rank,
                           std::vector<sycl::device> devices,
                           sycl::context context,
                           create_kvs_function create_kvs,
                           create_comm_function create_comm = ccl::create_communicator)
-            : TestInstance(std::string("allgather"),
+            : TestInstance(args,
+                           std::string("allgather"),
                            count,
                            count,
                            count * comm_size,
@@ -607,14 +641,16 @@ public:
 
 class TestInstanceAlltoall : public TestInstance {
 public:
-    TestInstanceAlltoall(size_t count,
+    TestInstanceAlltoall(const Args &args,
+                         size_t count,
                          size_t comm_size,
                          size_t comm_rank,
                           std::vector<sycl::device> devices,
                           sycl::context context,
                          create_kvs_function create_kvs,
                          create_comm_function create_comm = ccl::create_communicator)
-            : TestInstance(std::string("alltoall"),
+            : TestInstance(args,
+                           std::string("alltoall"),
                            count,
                            count * comm_size,
                            count * comm_size,
@@ -745,14 +781,16 @@ public:
 
 class TestInstanceBroadcast : public TestInstance {
 public:
-    TestInstanceBroadcast(size_t count,
+    TestInstanceBroadcast(const Args &args,
+                          size_t count,
                           size_t comm_size,
                           size_t comm_rank,
                           std::vector<sycl::device> devices,
                           sycl::context context,
                           create_kvs_function create_kvs,
                           create_comm_function create_comm = ccl::create_communicator)
-            : TestInstance(std::string("broadcast"),
+            : TestInstance(args,
+                           std::string("broadcast"),
                            count,
                            count,
                            count,
@@ -874,14 +912,16 @@ public:
 
 class TestInstancePt2Pt : public TestInstance {
 public:
-    TestInstancePt2Pt(size_t count,
+    TestInstancePt2Pt(const Args &args,
+                      size_t count,
                       size_t comm_size,
                       size_t comm_rank,
                       std::vector<sycl::device> devices,
                       sycl::context context,
                       create_kvs_function create_kvs,
                       create_comm_function create_comm = ccl::create_communicator)
-            : TestInstance(std::string("pt2pt"),
+            : TestInstance(args,
+                           std::string("pt2pt"),
                            count,
                            count,
                            count,
@@ -1086,8 +1126,17 @@ static void run_test_scenario_unguarded(TestInstance& test_instance,
 
     timestamps.push_back(get_microseconds());
 
+    sycl::property_list props{};
+    if (test_instance.get_args().native) {
+#if defined(__INTEL_LLVM_COMPILER) && (__INTEL_LLVM_COMPILER >= 20260101)
+        props = sycl::property_list {sycl::ext::oneapi::experimental::property::graph::enable_native_recording{}};
+#else
+        std::cout << "unknown or old compiler version, native graph skipped (running SYCL graph instead)" << std::endl;
+#endif
+    }
     sycl::ext::oneapi::experimental::command_graph graph(test_instance.get_queue().get_context(),
-                                                         test_instance.get_queue().get_device());
+                                                         test_instance.get_queue().get_device(),
+                                                         props);
     {
         if (rank == 0) {
             std::cout << "record" << std::endl;

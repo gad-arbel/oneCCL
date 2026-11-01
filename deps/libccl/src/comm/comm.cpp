@@ -1194,6 +1194,47 @@ ccl_scaleout_pipeline_bufs& ccl_scaleout_pipeline_bufs::operator=(
 // this should avoid contention
 SerializedStream global_serialize_stream;
 
+void sync_user_to_main_native_graph(sycl::queue q, SerializedStream& ss) {
+    bool native_disabled =
+        (ccl::global_data::env().overlapping_collectives != ccl_overlapping_collectives::enable_always);
+    if (native_disabled) {
+        LOG_TRACE("native overlapping disabled, early exit");
+        return;
+    }
+    bool is_recording = q.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording;
+
+    LOG_DEBUG("syncs user to main");
+    if (is_recording) {
+        // Adding a dependency where the sync-queue awaits and event over the user-queue,
+        //  to start an implicit recording of the main-queue 
+        LOG_DEBUG("syncs user to main");
+        sycl::event q_last_event = q.ext_oneapi_submit_barrier();
+        ss.getMainQueue().ext_oneapi_submit_barrier({q_last_event});
+    }
+    // synchronize to main stream - put user queue "in front of" the main queue
+    sycl::event last_event = ss.getMainQueue().ext_oneapi_submit_barrier();
+    q.ext_oneapi_submit_barrier({last_event});
+
+    // end recording on main queue - supported right now only with sycl graph
+}
+
+void sync_user_to_main_sycl_graph(sycl::queue q, SerializedStream& ss) {
+    bool is_recording =
+        q.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording;
+    LOG_DEBUG("syncs user to main");
+    if (is_recording) {
+        // start recording ops on main stream - sycl graph requires the sync as well
+        q.ext_oneapi_get_graph().begin_recording(ss.getMainQueue());
+    }
+    // synchronize to main stream - put user queue "in front of" the main queue
+    sycl::event last_event = ss.getMainQueue().ext_oneapi_submit_barrier();
+    q.ext_oneapi_submit_barrier({last_event});
+    if (is_recording) {
+        // start recording ops on main stream - sycl graph requires the sync as well
+        q.ext_oneapi_get_graph().end_recording(ss.getMainQueue());
+    }
+}
+
 // after the function finishes:
 //
 // 1. any future ops on user queue will happen after main queue completes its
@@ -1202,23 +1243,47 @@ SerializedStream global_serialize_stream;
 // 3. main queue is behind user queue
 //
 // the points 2 and 3 above are equivalent statements
-void sync_user_to_main(
-    sycl::queue q,
-    SerializedStream &ss) {
+void sync_user_to_main(sycl::queue q, SerializedStream& ss) {
+    auto sycl_graph_type = ccl::global_data::env().sycl_graph_type;
+    if (sycl_graph_type == graph_type::sycl ||
+        (sycl_graph_type == graph_type::auto_type
+         && !ccl::ze::is_arc_card(ccl::global_data::get().ze_data->devices[0].family))) {
+        sync_user_to_main_sycl_graph(q, ss);
+    }
+    else {
+        sync_user_to_main_native_graph(q, ss);
+    }
+}
 
-  bool is_recording = q.ext_oneapi_get_state() ==
-                      sycl::ext::oneapi::experimental::queue_state::recording;
-    LOG_DEBUG("syncs user to main");
+void sync_main_to_user_native_graph(sycl::queue q, SerializedStream& ss) {
+    bool native_disabled =
+        (ccl::global_data::env().overlapping_collectives != ccl_overlapping_collectives::enable_always);
+    if (native_disabled) {
+        LOG_TRACE("native overlapping disabled, early exit");
+        return;
+    }
+    LOG_DEBUG("syncs main to user");
+
+    sycl::event last_event = q.ext_oneapi_submit_barrier();
+    // transitions the main queue into recording mode - in case q is in recording mode
+    ss.getMainQueue().ext_oneapi_submit_barrier({last_event});
+}
+
+void sync_main_to_user_sycl_graph(sycl::queue q, SerializedStream& ss) {
+    bool is_recording =
+        q.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording;
+    LOG_TRACE("syncs main to user");
     if (is_recording) {
         // start recording ops on main stream - sycl graph requires the sync as well
         q.ext_oneapi_get_graph().begin_recording(ss.getMainQueue());
     }
-    // synchronize to main stream - put user queue "in front of" the main queue
-    sycl::event last_event = ss.getMainQueue().ext_oneapi_submit_barrier();
-    q.ext_oneapi_set_external_event(last_event);
+    // sync to main stream - put main queue "in front of" the user queue
+    sycl::event last_event = q.ext_oneapi_submit_barrier();
+    ss.getMainQueue().ext_oneapi_submit_barrier({last_event});
+
     if (is_recording) {
-        // start recording ops on main stream - sycl graph requires the sync as well
-        q.ext_oneapi_get_graph().end_recording(ss.getMainQueue());
+        // no more ops on main queue should be recorded
+        ss.getMainQueue().ext_oneapi_get_graph().end_recording(ss.getMainQueue());
     }
 }
 
@@ -1230,30 +1295,15 @@ void sync_user_to_main(
 // 3. user queue is behind main queue
 //
 // the points 2 and 3 above are equivalent statements
-void sync_main_to_user(
-    sycl::queue q,
-    SerializedStream &ss) {
-
-    bool is_recording = q.ext_oneapi_get_state() ==
-                      sycl::ext::oneapi::experimental::queue_state::recording;
-    LOG_DEBUG("syncs main to user");
-    if (is_recording) {
-        // start recording ops on main stream - sycl graph requires the sync as well
-        q.ext_oneapi_get_graph().begin_recording(ss.getMainQueue());
+void sync_main_to_user(sycl::queue q, SerializedStream& ss) {
+    auto sycl_graph_type = ccl::global_data::env().sycl_graph_type;
+    if (sycl_graph_type == graph_type::sycl ||
+        (sycl_graph_type == graph_type::auto_type
+         && !ccl::ze::is_arc_card(ccl::global_data::get().ze_data->devices[0].family))) {
+        sync_main_to_user_sycl_graph(q, ss);
     }
-    // sync to main stream - put main queue "in front of" the user queue
-    std::optional<sycl::event> opt_last_event = q.ext_oneapi_get_last_event();
-    if (!opt_last_event.has_value()) {
-        // no kernel was submitted, the coll is no-op
-        // sync is still required, submit a barrier
-        opt_last_event = std::optional(q.ext_oneapi_submit_barrier());
-    }
-    ss.getMainQueue().ext_oneapi_set_external_event(opt_last_event.value());
-    ss.getMainQueue().ext_oneapi_submit_barrier(); // this barrier seems to be required
-
-    if (is_recording) {
-        // no more ops on main queue should be recorded
-        ss.getMainQueue().ext_oneapi_get_graph().end_recording(ss.getMainQueue());
+    else {
+        sync_main_to_user_native_graph(q, ss);
     }
 }
 
@@ -1281,7 +1331,7 @@ void ccl_comm::post_coll_serialize(const ccl::stream::impl_value_t& stream) {
     ccl_stream* op_stream = get_stream_ptr(stream);
     if (!group_impl::is_group_active && op_stream != nullptr &&
         op_stream->get_backend() == ccl::utils::get_level_zero_backend()) {
-        LOG_DEBUG("post_coll called");
+        LOG_TRACE("post_coll called");
 
         sync_main_to_user(op_stream->get_native_stream(), global_serialize_stream);
     }
@@ -1324,7 +1374,7 @@ void ccl_comm::post_coll_events(const ccl::stream::impl_value_t& stream, ccl::ev
     ccl_stream* op_stream = get_stream_ptr(stream);
     if (!group_impl::is_group_active && op_stream != nullptr &&
         op_stream->get_backend() == ccl::utils::get_level_zero_backend()) {
-        LOG_DEBUG("post_coll called");
+        LOG_TRACE("post_coll called");
         // host event may not have native event, catch exceptions and ignore
         try {
             last_event = e.get_native();
@@ -1345,35 +1395,8 @@ void ccl_comm::post_coll_for_finalize(const ccl::stream::impl_value_t& stream, c
         return;
     }
 
-    // If already detected graph recording usage, skip all further checks and tracking
-    if (used_in_graph_recording) {
-        return;
-    }
-
     ccl_stream* op_stream = get_stream_ptr(stream);
     if (op_stream != nullptr && op_stream->get_backend() == ccl::utils::get_level_zero_backend()) {
-        // Check if queue is in graph recording mode
-        bool is_recording = false;
-        try {
-            auto sycl_queue = op_stream->get_native_stream();
-            // Try to detect graph recording state
-            // Intel SYCL extension: ext_oneapi_get_state()
-#ifdef SYCL_EXT_ONEAPI_GRAPH
-            bool is_recording = sycl_queue.ext_oneapi_get_state() ==
-                                sycl::ext::oneapi::experimental::queue_state::recording;
-#endif
-        }
-        catch (...) {
-            // If we can't determine recording state, means
-            // that most likely the compiler does not support graphs
-            is_recording = false;
-        }
-
-        if (is_recording) {
-            used_in_graph_recording = true;
-            return;
-        }
-
         LOG_DEBUG("post_coll_for_finalize called for stream: ", op_stream);
         // Store or update the event for this stream
         std::optional<sycl::event> native_event;
@@ -1381,9 +1404,11 @@ void ccl_comm::post_coll_for_finalize(const ccl::stream::impl_value_t& stream, c
             native_event = e.get_native();
         }
         catch (...) {
+            LOG_TRACE("non-native event");
             // Host event - scheduler code for CPU path, no more processing
             return;
         }
+        LOG_TRACE("handling native event");
 
         // native event is valid
         finalize_events[op_stream] = native_event.value();
@@ -1433,6 +1458,11 @@ void ccl_comm::post_coll_for_finalize(const ccl::stream::impl_value_t& stream, c
 const ccl::vector_class<ccl::event>& ccl_comm::pre_coll(const ccl::stream::impl_value_t& stream,
                                                         const ccl::vector_class<ccl::event>& deps,
                                                         ccl::vector_class<ccl::event>& newdeps) {
+    bool overlapping_disabled =
+        (ccl::global_data::env().overlapping_collectives == ccl_overlapping_collectives::disable);
+    if (overlapping_disabled) {
+        return deps;
+    }
 #if defined(CCL_ENABLE_SYCL) && defined(CCL_ENABLE_ZE)
     ccl_stream* cclstream = get_stream_ptr(stream);
     if (cclstream != nullptr && cclstream->get_backend() == ccl::utils::get_level_zero_backend() && global_serialize_stream.update_check_ever_recorded(cclstream->get_native_stream())) {
@@ -1447,15 +1477,21 @@ const ccl::vector_class<ccl::event>& ccl_comm::pre_coll(const ccl::stream::impl_
 }
 
 void ccl_comm::post_coll(const ccl::stream::impl_value_t& stream, ccl::event& e) {
+    bool overlapping_disabled =
+        (ccl::global_data::env().overlapping_collectives == ccl_overlapping_collectives::disable);
+    if (overlapping_disabled) {
+        return;
+    }
 #if defined(CCL_ENABLE_SYCL) && defined(CCL_ENABLE_ZE)
     ccl_stream* cclstream = get_stream_ptr(stream);
     if (cclstream != nullptr && cclstream->get_backend() == ccl::utils::get_level_zero_backend() && global_serialize_stream.update_check_ever_recorded(cclstream->get_native_stream())) {
         post_coll_serialize(stream);
-    } else {
-        post_coll_events(stream, e);
+        // no need to track events for finalize
     }
-    // Track event for finalize regardless of serialization path
-    post_coll_for_finalize(stream, e);
+    else {
+        post_coll_events(stream, e);
+        post_coll_for_finalize(stream, e);
+    }
 #else
     post_coll_events(stream, e);
 #endif
@@ -1492,13 +1528,6 @@ void ccl_comm::finalize() {
         CCL_THROW("comm.finalize() called while group operation is active - call ccl::group_end() first");
     }
 
-    // Check if communicator was used during graph recording
-    if (used_in_graph_recording) {
-        LOG_WARN("comm.finalize() called on communicator that was used during graph recording. "
-                 "Event tracking is incomplete - user must manually synchronize all graph submissions. ");
-        return;
-    }
-
     LOG_DEBUG("finalize called on comm: ", std::hex, this, ", waiting on ", finalize_events.size(), " stream(s)");
 
     // Wait on all outstanding events from all streams
@@ -1517,6 +1546,12 @@ void ccl_comm::finalize() {
 
     // Clear the finalize events map after waiting
     finalize_events.clear();
+
+    
+    if (global_serialize_stream.hasMainQueue()) {
+        LOG_DEBUG("waiting on global_serialize_stream queue");
+        global_serialize_stream.getMainQueue().ext_oneapi_submit_barrier().wait();
+    }
     LOG_DEBUG("finalize completed on comm: ", std::hex, this);
 #else
     LOG_DEBUG("finalize called on comm: ", std::hex, this, " (no-op for non-SYCL builds)");

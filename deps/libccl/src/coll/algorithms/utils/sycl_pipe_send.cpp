@@ -762,7 +762,6 @@ sycl::event gpu_send_plain(sycl::queue& q,
                   dest,
                   ", sendtag=",
                   sendtag);
-        sycl::event e;
         std::shared_ptr<atl_base_comm> atl_comm = comm->get_atl_comm();
         auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
         size_t send_size = send_count * ccl_dtype.size();
