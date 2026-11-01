@@ -317,6 +317,7 @@ thresholds=(0 1000000000)
 pushd ll_algorithms
 for threshold in "${thresholds[@]}"; do
     for ppn in "${ppns[@]}"; do
+        local graph_loops=${#graph_args[@]}
         for exec_name in "${test_names[@]}"; do
             for algo in "${algo_names[@]}"; do
                 TEST_LOG="test_${algo}_${ppn}_${threshold}_${exec_name}.log"
