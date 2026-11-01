@@ -489,6 +489,18 @@ constexpr const char* CCL_SYCL_FULL_VECTOR = "CCL_SYCL_FULL_VECTOR";
  * By-default: "0 (disabled)"
  */
 constexpr const char* CCL_SYCL_FORCE_RECORDING_PATH = "CCL_SYCL_FORCE_RECORDING_PATH";
+/*
+ * @brief Specify what type of graph is being recorded
+ *
+ * @details Currently, there is no API to distinguish native graph from sycl graph
+ * but the functionality of the two varies; this env variable shows what graph type
+ * is currently used, for reasons related to functional coverage and performance
+ *
+ * "<value>" : "auto", "native", "sycl"
+ *
+ * By-default: "auto (internal logic is used to distinguish the two)"
+ */
+constexpr const char* CCL_SYCL_GRAPH_TYPE = "CCL_SYCL_GRAPH_TYPE";
 constexpr const char* CCL_SYCL_KERNEL_MEMCPY_UPSIZE = "CCL_SYCL_KERNEL_MEMCPY_UPSIZE ";
 constexpr const char* CCL_SYCL_TMP_BUF_SIZE = "CCL_SYCL_TMP_BUF_SIZE";
 constexpr const char* CCL_SYCL_SCALEOUT_HOST_BUF_SIZE = "CCL_SYCL_SCALEOUT_HOST_BUF_SIZE";
@@ -551,3 +563,16 @@ constexpr const char* CCL_UMF_LIBRARY_PATH = "CCL_UMF_LIBRARY_PATH";
 #endif // CCL_ENABLE_SYCL
 
 constexpr const char* CCL_IPC_ALLGATHERV_WA = "CCL_IPC_ALLGATHERV_WA";
+
+/*
+ * @brief Specify whether overlapping collectives should be supported
+ *
+ * @details This variable allows to disable support for overlapping
+ * collectives. It might be useful for debugging of hangs
+ * and performance issues.
+ *
+ * "<value>" : "enable_always", "enable_except_native_graph", "disable"
+ *
+ * By-default: "enable_except_native_graph"
+ */
+constexpr const char* CCL_OVERLAPPING_COLLECTIVES = "CCL_OVERLAPPING_COLLECTIVES";

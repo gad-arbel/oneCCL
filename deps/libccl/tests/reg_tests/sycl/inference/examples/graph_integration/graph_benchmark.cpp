@@ -98,8 +98,18 @@ static void run_benchmark(TestInstance& test_instance,
         }
         timestamps.push_back(get_microseconds());
     }
+
+    sycl::property_list props{};
+    if (test_instance.get_args().native) {
+#if defined(__INTEL_LLVM_COMPILER) && (__INTEL_LLVM_COMPILER >= 20260101)
+        props = sycl::property_list {sycl::ext::oneapi::experimental::property::graph::enable_native_recording{}};
+#else
+        std::cout << "unknown or old compiler version, native graph skipped (running SYCL graph instead)" << std::endl;
+#endif
+    }
     sycl::ext::oneapi::experimental::command_graph graph(test_instance.get_queue().get_context(),
-                                                         test_instance.get_queue().get_device());
+                                                         test_instance.get_queue().get_device(),
+                                                         props);
     {
         // if (rank == 0) {
         //     std::cout << "record" << std::endl;
@@ -186,7 +196,7 @@ static void run_benchmark(TestInstance& test_instance,
     }
 }
 
-void run_benchmarks() {
+void run_benchmarks(const Args &args) {
     size_t size = 0, rank = 0;
     int t_size = 0, t_rank = 0;
     initialize_global(t_size, t_rank);
@@ -218,15 +228,15 @@ void run_benchmarks() {
     auto context = sycl::context(devices);
 
     TestInstanceAllreduce test_allreduce(
-        msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
+        args, msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
     TestInstanceReduceScatter test_reduce_scatter(
-        msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
+        args, msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
     TestInstanceAllgather test_allgather(
-        msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
+        args, msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
     TestInstanceAlltoall test_alltoall(
-        msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
+        args, msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
     TestInstanceBroadcast test_broadcast(
-        msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
+        args, msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
 
     run_benchmark(test_allreduce, sizes_to_bench, 10, 1000, 1);
     run_benchmark(test_allreduce, sizes_to_bench, 10, 10, 100);
@@ -248,8 +258,17 @@ void run_benchmarks() {
 }
 
 int main(int argc, char* argv[]) {
+    Args args(argc, argv);
+    if (args.print_help) {
+        std::cout << "Usage:" << std::endl;
+        std::cout << "./graph_integration <arguments>" << std::endl << std::endl;
+        std::cout << "Available arguments:" << std::endl;
+        std::cout << "\t--help: print help and exit" << std::endl;
+        std::cout << "\t--native: forces native graph recording" << std::endl;
+        return 0;
+    }
     try {
-        run_benchmarks();
+        run_benchmarks(args);
     }
     catch (const std::exception& e) {
         std::cout << "Exception occurred, aborting" << std::endl << e.what() << std::endl;

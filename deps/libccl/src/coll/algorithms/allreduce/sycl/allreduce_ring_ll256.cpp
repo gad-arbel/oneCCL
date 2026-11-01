@@ -238,6 +238,7 @@ sycl::event arc_ll256_allreduce(const void *src,
         }
         else {
             // use small kernel persistent buffers
+            // algo does not support record-replay, no reason to get `tmp_bufs_gpu`
             auto [local_small_buf, remote_ptrs] = node_comm->get_all_tmp_bufs(true);
             for (int i = 0; i < local_world_size; i++) {
                 local_peer_bufs[i] = (char *)remote_ptrs[i];

@@ -85,7 +85,7 @@ enum class TestScope {
     Full,
 };
 
-void run_regular_tests() {
+void run_regular_tests(const Args &args) {
     size_t size = 0, rank = 0;
     int t_size = 0, t_rank = 0;
     initialize_global(t_size, t_rank);
@@ -124,16 +124,16 @@ void run_regular_tests() {
     auto context = sycl::context(devices);
 
     TestInstanceAllreduce test_allreduce(
-        msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
+        args, msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
     TestInstanceReduceScatter test_reduce_scatter(
-        msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
+        args, msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
     TestInstanceAllgather test_allgather(
-        msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
+        args, msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
     TestInstanceAlltoall test_alltoall(
-        msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
+        args, msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
     TestInstanceBroadcast test_broadcast(
-        msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
-    TestInstancePt2Pt test_pt2pt(msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
+        args, msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
+    TestInstancePt2Pt test_pt2pt(args, msg_size, size, rank, devices, context, create_mpi_kvs, ccl::create_communicator);
 
     for (size_t i = 0; i < iterations; ++i) {
         test_allreduce.reinit(msg_size);
@@ -260,8 +260,17 @@ void run_regular_tests() {
 }
 
 int main(int argc, char* argv[]) {
+    Args args(argc, argv);
+    if (args.print_help) {
+        std::cout << "Usage:" << std::endl;
+        std::cout << "./graph_integration <arguments>" << std::endl << std::endl;
+        std::cout << "Available arguments:" << std::endl;
+        std::cout << "\t--help: print help and exit" << std::endl;
+        std::cout << "\t--native: forces native graph recording" << std::endl;
+        return 0;
+    }
     try {
-        run_regular_tests();
+        run_regular_tests(args);
     }
     catch (const std::exception& e) {
         std::cout << "Exception occurred, aborting" << std::endl << e.what() << std::endl;

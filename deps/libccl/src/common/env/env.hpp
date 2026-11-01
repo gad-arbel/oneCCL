@@ -71,6 +71,18 @@ enum class process_launcher_mode {
     none
 };
 
+enum class graph_type {
+    auto_type,
+    native,
+    sycl
+};
+
+enum class ccl_overlapping_collectives {
+    enable_always,
+    enable_except_native_graph,
+    disable
+};
+
 enum ccl_selection_border_type {
     ccl_selection_border_left,
     ccl_selection_border_right,
@@ -207,6 +219,7 @@ public:
     ccl_staging_buffer staging_buffer;
     bool enable_op_sync;
     bool enable_op_sycl_serialize;
+    ccl_overlapping_collectives overlapping_collectives;
     bool enable_hostname_sharing;
     bool enable_init_hostname_sharing;
     std::string occp_server_hostname;
@@ -303,6 +316,7 @@ public:
 #endif // CCL_ENABLE_ESIMD
     bool sycl_full_vector;
     bool sycl_force_recording_path;
+    graph_type sycl_graph_type;
     bool sycl_kernel_memcpy_upsize;
     size_t sycl_tmp_buf_size;
     size_t sycl_scaleout_host_buf_size;
@@ -469,6 +483,8 @@ public:
     static std::map<ccl_staging_buffer, std::string> staging_buffer_names;
     static std::map<backend_mode, std::string> backend_names;
     static std::map<process_launcher_mode, std::string> process_launcher_names;
+    static std::map<graph_type, std::string> graph_type_names;
+    static std::map<ccl_overlapping_collectives, std::string> overlapping_collective_names;
 
     int env_2_worker_affinity(int local_proc_idx, int local_proc_count);
     int env_2_worker_mem_affinity(int local_proc_count);
