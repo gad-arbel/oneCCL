@@ -427,7 +427,7 @@ enable_testing()
 add_subdirectory(plugins)
 add_subdirectory(examples)
 add_subdirectory(tests)
-# Not shipped in the open source distribution — see scripts/lib/publish_excludes.txt
+# Optional: not part of the source distribution
 if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/utils")
     add_subdirectory(utils)
 endif()
@@ -461,8 +461,6 @@ install(FILES cmake/oneCCL2Config.cmake DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/
 install(FILES cmake/oneCCL2ConfigVersion.cmake DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/cmake/oneCCL2)
 
 # Install vars.sh (override vars.sh from v1)
-# Not shipped in the open source distribution — see scripts/lib/publish_excludes.txt.
-# There the v1 vars.sh, generated from deps/libccl/ccl_public/vars.sh.in, is used.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/etc/vars.sh")
     install(FILES etc/vars.sh DESTINATION ${CMAKE_INSTALL_PREFIX}/env)
 endif()
