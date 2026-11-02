@@ -63,10 +63,12 @@ struct AllToAll {
              uint32_t seqNo,
              T* scatterBuf,
              T* gatherBuf,
+             size_t ipcbuf_size,
              T* const peerBuf[],
              bool p2p)
             : rank(rank),
               nRanks(nranks),
+              ipcbuf_size(ipcbuf_size),
               gr(calcAccessGranularity(input, output, nelems)),
               workSize(nelems * sizeof(T)),
               transmit(nranks,
@@ -119,7 +121,7 @@ struct AllToAll {
                               const size_t* offsets,
                               T* ipcbuf0,
                               T* ipcbuf1,
-                              size_t tmp_buf_size,
+                              size_t ipcbuf_size,
                               T* const peerbuf[],
                               size_t nelems,
                               int rank,
@@ -132,6 +134,8 @@ struct AllToAll {
                               bool& done) {
         sycl::event e1, e2;
 
+        size_t tmp_buf_size = RingTransmit<int, Rt64_128_PCIE, true>::ringSize / sizeof(T);
+
         if (LoadSeqNoInRuntime) {
             AllToAll offload(nranks,
                              input,
@@ -143,6 +147,7 @@ struct AllToAll {
                              0,
                              ipcbuf0,
                              ipcbuf1,
+                             ipcbuf_size,
                              peerbuf,
                              p2p);
             done = true;
@@ -167,12 +172,8 @@ struct AllToAll {
                         ll_pattern_data.process_update(
                             type, global_current_id, rank, peer_rank, n_steps);
                     }
-                    check_zero_buffers_gpu(ll_pattern_data,
-                                           it,
-                                           barrier_data,
-                                           ipcbuf0,
-                                           ipcbuf1,
-                                           tmp_buf_size);
+                    check_zero_buffers_gpu(
+                        ll_pattern_data, it, barrier_data, ipcbuf0, ipcbuf1, tmp_buf_size, type);
                            });
             });
 
@@ -197,6 +198,7 @@ struct AllToAll {
                              ll_pattern_data.get_tmp_pattern(),
                              ipcbuf0,
                              ipcbuf1,
+                             ipcbuf_size,
                              peerbuf,
                              p2p);
             done = true;
@@ -228,13 +230,13 @@ struct AllToAll {
         auto nWires = pos.get_global_range(0) / SubGroupSize;
         auto wireId_x = pos.get_global_id(0) / SubGroupSize / transmit.parallel_sg;
 
-        auto loopSize = nWires / transmit.parallel_sg * ProtoT::wireCapacity;
+        auto loopSize = TransmitT::calcLoopSize(nWires, transmit.parallel_sg, ipcbuf_size);
         size_t local_id = pos.get_sub_group().get_local_id()[0];
 
         for (size_t gOff = 0, tOff = 0; gOff < workSize; gOff += loopSize, ++tOff) {
             auto wireOff = wireId_x * ProtoT::wireCapacity + gOff;
 
-            ssize_t workLeft = workSize - wireOff;
+            ssize_t workLeft = std::min((size_t)workSize, gOff + loopSize) - wireOff;
 #if defined(__enable_device_verbose__)
             if (local_id == 0)
                 sycl::ext::oneapi::experimental::printf(
@@ -268,6 +270,7 @@ private:
 
     size_t rank;
     size_t nRanks;
+    size_t ipcbuf_size;
     AccessGranularity gr;
     ssize_t workSize;
     TransmitT transmit;

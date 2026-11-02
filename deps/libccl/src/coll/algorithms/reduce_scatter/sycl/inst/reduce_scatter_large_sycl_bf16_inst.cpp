@@ -20,9 +20,12 @@
 
 #include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_impl.hpp"
 #include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_ring.hpp"
+#include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_device_proxy_ring.hpp"
 
 #ifdef CCL_SYCL_VEC_SUPPORT_BF16
 TEMPLATE_REDUCE_SCATTER_LARGE(sycl::ext::oneapi::bfloat16, true);
 TEMPLATE_REDUCE_SCATTER_LARGE(sycl::ext::oneapi::bfloat16, false);
 TEMPLATE_REDUCE_SCATTER_LARGE_SU_RING(sycl::ext::oneapi::bfloat16);
+TEMPLATE_REDUCE_SCATTER_DEVICE_PROXY_RING(sycl::ext::oneapi::bfloat16);
 #endif
+

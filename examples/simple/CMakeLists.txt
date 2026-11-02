@@ -13,5 +13,5 @@ target_link_libraries(simple PRIVATE oneCCL2)
 target_link_libraries(simple PRIVATE Threads::Threads)
 
 add_test(NAME example_simple COMMAND $<TARGET_FILE:simple> CONFIGURATIONS examples)
-set_property(TEST example_simple PROPERTY ENVIRONMENT_MODIFICATION "LD_LIBRARY_PATH=path_list_prepend:$<TARGET_FILE_DIR:ccl_null>")
+set_property(TEST example_simple PROPERTY ENVIRONMENT_MODIFICATION "LD_LIBRARY_PATH=path_list_prepend:$<TARGET_FILE_DIR:ccl_null>;CCL_PLUGIN=set:ONECCL_NULL")
 set_tests_properties(example_simple PROPERTIES TIMEOUT 30)

@@ -16,6 +16,8 @@
 
 #include "coll/algorithms/allgatherv/sycl/allgatherv_sycl.hpp"
 #include "coll/algorithms/allgatherv/sycl/allgatherv_large_sycl_impl.hpp"
+#include "coll/algorithms/utils/sycl_selection.hpp"
+#include "coll/selection/policy/policy_env.hpp"
 
 ccl::event allgatherv_large(sycl::queue &q,
                             const void *send_buf,
@@ -25,9 +27,10 @@ ccl::event allgatherv_large(sycl::queue &q,
                             const ccl::vector_class<size_t> &offsets,
                             ccl::datatype dtype,
                             ccl_comm *comm,
+                            const std::shared_ptr<ccl_comm> p2p_comm,
                             ccl_stream *global_stream,
                             const ccl::vector_class<ccl::event> &deps,
-                            sycl_coll_scaleup_attr coll_attr) {
+                            sycl_scaleup_options coll_attr) {
     if (comm->is_multi_thread_instance() == true) {
         LOG_DEBUG("invoking MT allgatherv_large");
         ccl::global_data::env().sycl_allgatherv_tmp_buf = 1;
@@ -43,9 +46,17 @@ ccl::event allgatherv_large(sycl::queue &q,
     std::shared_ptr<ccl_comm> pair_comm = comm->get_pair_comm();
     std::shared_ptr<ccl_comm> even_comm = comm->get_even_comm();
 
-    const size_t comm_size = node_comm->size();
+    const size_t comm_size = p2p_comm->size();
 
     const size_t dsize = ccl::global_data::get().dtypes->get(dtype).size();
+    static const simple_chunk_size_table_t simple_chunk_sizes =
+        parse_simple_chunk_size_spec(CCL_SYCL_ALLGATHERV_SIMPLE_CHUNK_SIZE,
+                                     ccl::global_data::env().sycl_allgatherv_simple_chunk_size);
+    // allgatherv with different send_count on different ranks does not reach here
+    // the policy knob `simple_chunk_size`, when set for this call, replaces the spec
+    size_t chunk_size = ccl::selection::call_env().sycl_allgatherv_simple_chunk_size_override
+                            ? ccl::selection::call_env().sycl_allgatherv_simple_chunk_size_override
+                            : select_simple_chunk_size(simple_chunk_sizes, send_count * dsize);
     // use full vector (>= 8 bytes) if buffers and data size are 4 byte aligned
     bool use_full_vector = can_use_full_vector(send_buf, recv_buf, send_count, dsize);
     // TODO : generalize constraints for different hardware.
@@ -62,10 +73,10 @@ ccl::event allgatherv_large(sycl::queue &q,
                        ((!use_full_vector || !is_aligned) && ccl::global_data::env().sycl_auto_use_tmp_buf);
     // scale-out step can force to use "tmp buffer version" for async support purposes
     is_tmp_used |= (coll_attr.force_use_tmp && ccl::global_data::env().sycl_force_use_tmp_buf_scaleout);
-    is_tmp_used |= !node_comm->get_topo_manager().has_p2p_access();
+    is_tmp_used |= !comm->get_topo_manager().has_p2p_access();
 
     if (is_tmp_used) {
-        CCL_THROW_IF_NOT(!ccl::global_data::env().sycl_copy_engine || is_arc,
+        CCL_THROW_IF_NOT(!ccl::selection::call_env().sycl_copy_engine || is_arc,
                          "allgatherv using copy engines not supported with tmp buffer");
 
         // global rank of pair_comm neighbors should be adjacent for using tmp buffer
@@ -98,13 +109,14 @@ ccl::event allgatherv_large(sycl::queue &q,
             if (registered_recv_ptrs.size()) {
                 LOG_DEBUG("allgatherv pointers are registered \n");
                 sycl_ptrs.node_ptrs_wr =
-                    get_ipc_ptrs<void, MAX_NODE_RANKS>(registered_recv_ptrs, comm, node_comm, (void *)recv_buf);
+                    get_ipc_ptrs<void, MAX_NODE_RANKS>(registered_recv_ptrs, comm, p2p_comm, (void *)recv_buf);
             }
             else {
+                LOG_DEBUG("arc flow without registerd pointers filling node ptrs wr");
                 std::vector<void *> ptrs{ recv_buf }; // index 0
-                auto [sched, exchange_entry] = do_ipc_exchange(comm, global_stream, ptrs);
+                auto [sched, exchange_entry] = do_ipc_exchange(p2p_comm.get(), global_stream, ptrs);
 
-                sycl_ptrs.node_ptrs_wr = get_ipc_ptrs<void, MAX_NODE_RANKS>(node_comm, 0, recv_buf, sched);
+                sycl_ptrs.node_ptrs_wr = get_ipc_ptrs<void, MAX_NODE_RANKS>(p2p_comm, 0, recv_buf, sched);
 
                 delete exchange_entry;
                 delete sched;
@@ -123,18 +135,19 @@ ccl::event allgatherv_large(sycl::queue &q,
             if (registered_recv_ptrs.size() && registered_send_ptrs.size()) {
                 LOG_DEBUG("allgather pointers are registered \n");
                 sycl_ptrs.xelink_ptrs_rd =
-                    get_ipc_ptrs<void, MAX_GPUS>(registered_send_ptrs, comm, even_comm, (void *)send_buf);
+                    get_ipc_ptrs<void, MAX_NODE_RANKS>(registered_send_ptrs, comm, even_comm, (void *)send_buf);
                 sycl_ptrs.xelink_ptrs_wr =
-                    get_ipc_ptrs<void, MAX_GPUS>(registered_recv_ptrs, comm, even_comm, (void *)recv_buf);
+                    get_ipc_ptrs<void, MAX_NODE_RANKS>(registered_recv_ptrs, comm, even_comm, (void *)recv_buf);
             }
             else {
+                LOG_DEBUG("non arc flow without registerd pointers filling xelink ptrs rd/wr");
                 std::vector<void *> ptrs{ (void *)send_buf, recv_buf }; // index 0 and 1
                 auto p = do_ipc_exchange(comm, global_stream, ptrs);
                 sched = p.first;
                 exchange_entry = p.second;
 
-                sycl_ptrs.xelink_ptrs_rd = get_ipc_ptrs<void, MAX_GPUS>(even_comm, 0, (void *)send_buf, sched);
-                sycl_ptrs.xelink_ptrs_wr = get_ipc_ptrs<void, MAX_GPUS>(even_comm, 1, recv_buf, sched);
+                sycl_ptrs.xelink_ptrs_rd = get_ipc_ptrs<void, MAX_NODE_RANKS>(even_comm, 0, (void *)send_buf, sched);
+                sycl_ptrs.xelink_ptrs_wr = get_ipc_ptrs<void, MAX_NODE_RANKS>(even_comm, 1, recv_buf, sched);
             }
             // use full vector (>= 8 bytes) if remote buffers and data size are 4 byte aligned
             use_full_vector =
@@ -143,6 +156,7 @@ ccl::event allgatherv_large(sycl::queue &q,
                 all_aligned(sycl_ptrs.xelink_ptrs_wr.data(), even_comm->size(), send_count, dsize, 4);
 
             if (pair_comm->size() > 1) {
+                LOG_DEBUG("pair comm > 1, filling mdfi ptrs rd/wr");
                 assert(pair_comm->size() == MAX_TILES);
                 int peer_pair_rank = pair_comm->rank() ? 0 : 1;
                 if (registered_recv_ptrs.size() && registered_send_ptrs.size()) {
@@ -165,45 +179,77 @@ ccl::event allgatherv_large(sycl::queue &q,
             delete sched;
         }
         else {
-            sycl_ptrs.xelink_ptrs_rd = get_remote_even_tmp_buf(0, comm);
+            sycl_ptrs.xelink_ptrs_rd = get_remote_large_tmp_buf(0, even_comm.get());
             if (pair_comm->size() > 1) {
                 assert(pair_comm->size() == MAX_TILES);
                 int peer_pair_rank = pair_comm->rank() ? 0 : 1;
-                sycl_ptrs.mdfi_ptr_wr = get_remote_pair_tmp_buf(0, comm)[peer_pair_rank];
+                sycl_ptrs.mdfi_ptr_wr = get_remote_large_tmp_buf(0, pair_comm.get())[peer_pair_rank];
             }
         }
     } // if is_arc
 
-    auto lambda = [&]<typename T>() {
-        if (use_full_vector) {
-            return allgatherv_large_impl<T, true>(q,
-                                                  send_buf,
-                                                  send_count,
-                                                  recv_buf,
-                                                  recv_counts,
-                                                  offsets,
-                                                  dtype,
-                                                  comm,
-                                                  global_stream,
-                                                  sycl_ptrs,
-                                                  deps,
-                                                  is_tmp_used);
-        }
-        else {
-            return allgatherv_large_impl<T, false>(q,
-                                                   send_buf,
-                                                   send_count,
-                                                   recv_buf,
-                                                   recv_counts,
-                                                   offsets,
-                                                   dtype,
-                                                   comm,
-                                                   global_stream,
-                                                   sycl_ptrs,
-                                                   deps,
-                                                   is_tmp_used);
-        }
-    };
+    // the L0 copy engine signals peers with one flag that cannot tell chunks apart, so a chunk can
+    // lose the next chunk's signal and hang; a copy engine gains nothing from chunking anyway.
+    // allgatherv_large_impl() picks the copy engine per call, so check the variable enabling it.
+    if (ccl::global_data::env().enable_ze_ce && chunk_size) {
+        LOG_WARN_ONCE("allgatherv: CCL_ENABLE_ZE_CE=1 runs the large allgatherv unchunked, ",
+                      "ignoring chunk size ",
+                      chunk_size,
+                      "; ");
+        chunk_size = 0;
+    }
 
-    return invoke_collective(lambda, dtype);
+    return for_each_chunk(chunk_size, send_count, dsize, [&](size_t offset, size_t pack_count) {
+        const size_t offset_bytes = offset * dsize;
+        // only peer send buffers are shifted; recv blocks move through the chunk offsets
+        sycl_ptrs_type chunk_ptrs = is_tmp_used ? sycl_ptrs : offset_sycl_ptrs(sycl_ptrs, offset_bytes, 0);
+        const void *chunk_send_buf = (const char *)send_buf + offset_bytes;
+        ccl::vector_class<size_t> chunk_counts(recv_counts);
+        ccl::vector_class<size_t> chunk_offsets(offsets);
+        if (pack_count != send_count) {
+            // kernels index offsets by node rank, so cover the whole node
+            const size_t offsets_size =
+                offsets.empty() ? std::max(comm_size, (size_t)node_comm->size()) : offsets.size();
+            chunk_counts.assign(recv_counts.size(), pack_count);
+            chunk_offsets.resize(offsets_size);
+            for (size_t r = 0; r < offsets_size; r++) {
+                chunk_offsets[r] = (offsets.empty() ? r * send_count * dsize : offsets[r]) + offset_bytes;
+            }
+        }
+        auto lambda = [&]<typename T>() {
+            if (use_full_vector) {
+                return allgatherv_large_impl<T, true>(q,
+                                                      chunk_send_buf,
+                                                      pack_count,
+                                                      send_count,
+                                                      recv_buf,
+                                                      chunk_counts,
+                                                      chunk_offsets,
+                                                      dtype,
+                                                      comm,
+                                                      p2p_comm,
+                                                      global_stream,
+                                                      chunk_ptrs,
+                                                      deps,
+                                                      is_tmp_used);
+            }
+            else {
+                return allgatherv_large_impl<T, false>(q,
+                                                       chunk_send_buf,
+                                                       pack_count,
+                                                       send_count,
+                                                       recv_buf,
+                                                       chunk_counts,
+                                                       chunk_offsets,
+                                                       dtype,
+                                                       comm,
+                                                       p2p_comm,
+                                                       global_stream,
+                                                       chunk_ptrs,
+                                                       deps,
+                                                       is_tmp_used);
+            }
+        };
+        return invoke_collective(lambda, dtype);
+    });
 }

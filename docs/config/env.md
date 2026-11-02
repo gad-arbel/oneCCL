@@ -38,7 +38,7 @@ CCL_PLUGIN="/home/user/oneCCL/build/plugins/legacy/libccl_legacy.so"
 | ------------------- | -------------------------------------------------------------------------- |
 | `ONECCL_LEGACY`     | Legacy oneCCL implementation based on SYCL for CPU and GPU workloads       |
 | `ONECCL_LEGACY_CPU` | Legacy oneCCL implementation for CPU only workloads                        |
-| `ONECCL_NULL`       | Empty implementation of oneCCL plugin, will always return `ONECCL_SUCCESS` |
+| `ONECCL_NULL`       | Empty implementation of oneCCL plugin, will always return `ONECCL_SUCCESS`. Used only when selected with `CCL_PLUGIN`, never selected automatically |
 
 
 **Description**

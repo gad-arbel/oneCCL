@@ -17,6 +17,10 @@
 #include "atl_ofi_helper.hpp"
 #include "common/api_wrapper/pmix_api_wrapper.hpp"
 
+/* the occp headers must not depend on libfabric, so the payload is checked here */
+static_assert(sizeof(ofi_endpoint_t::data) >= FI_NAME_MAX,
+              "occp ofi endpoint payload is smaller than FI_NAME_MAX");
+
 atl_ofi_global_data_t global_data;
 
 std::string atl_ofi_get_short_nic_name(const struct fi_info* prov) {
@@ -127,9 +131,7 @@ atl_ofi_prov_t* atl_ofi_get_prov(atl_ofi_ctx_t& ctx,
 
 atl_status_t atl_ofi_get_local_proc_coord(atl_proc_coord_t& coord,
                                           std::shared_ptr<ipmi> pmi,
-                                          occp_client_t* occp_client,
-                                          uint16_t occp_srv_port,
-                                          occp_server_t* occp_server) {
+                                          occp_client_t* occp_client) {
     atl_status_t ret = ATL_STATUS_SUCCESS;
     int i;
     int local_idx = 0, local_count = 0;
@@ -164,7 +166,7 @@ atl_status_t atl_ofi_get_local_proc_coord(atl_proc_coord_t& coord,
     }
 
     // OCCP
-    if (ccl::global_data::env().kvs_init_mode == ccl::kvs_mode::occp) {
+    if (occp_client) {
         LOG_DEBUG("Step 1: Getting local hostname (already done), rank: ", pmi->get_rank());
 
         rank_info_t my_info;
@@ -318,7 +320,6 @@ atl_status_t atl_ofi_prov_update_addr_table(atl_ofi_ctx_t& ctx,
                                             std::shared_ptr<ipmi> pmi,
                                             ep_names_t& ep_names,
                                             occp_client_t* occp_client = nullptr,
-                                            uint16_t occp_srv_port = 0,
                                             void* shared_memory = nullptr,
                                             size_t length = 0,
                                             size_t total_named_eps = 0,
@@ -361,21 +362,46 @@ atl_status_t atl_ofi_prov_update_addr_table(atl_ofi_ctx_t& ctx,
               ", proc_count ",
               proc_count);
     // OCCP
-    if (ccl::global_data::env().kvs_init_mode == ccl::kvs_mode::occp) {
+    if (occp_client) {
         LOG_DEBUG("Step 1: Preparing local endpoint(s) for OCCP exchange");
 
-        ofi_endpoints_t my_ofi_eps(named_ep_count);
+        size_t comm_size = pmi->get_size();
+        CCL_THROW_IF_NOT(comm_size == static_cast<size_t>(coord.global_count),
+                         "pmi size ",
+                         comm_size,
+                         " does not match coord.global_count ",
+                         coord.global_count);
+
+        ofi_endpoints_t all_efis(comm_size * named_ep_count);
+
+        /* one exchange per named endpoint: a single reply carries one endpoint per rank */
         for (size_t j = 0; j < named_ep_count; j++) {
-            memcpy(my_ofi_eps[j].data, prov->eps[j].name.addr, addr_len);
-        }
+            auto& ep_name = prov->eps[j].name;
+            CCL_THROW_IF_NOT(ep_name.len <= sizeof(ofi_endpoint_t::data),
+                             "ofi endpoint name (",
+                             ep_name.len,
+                             " bytes) does not fit into the occp payload (",
+                             sizeof(ofi_endpoint_t::data),
+                             " bytes)");
 
-        ofi_endpoints_t all_efis(coord.global_count * named_ep_count);
+            /* send the length fi_getname reported: the source is allocated at that
+             * length, while addr_len is inflated to FI_NAME_MAX for shm */
+            ofi_endpoint_t my_ofi_ep;
+            memcpy(my_ofi_ep.data, ep_name.addr, ep_name.len);
 
-        LOG_DEBUG("Step 2: OCCP exchange_ofi_config start rank: ", pmi->get_rank());
-        if (!occp_client->exchange_ofi_config(
-                pmi->get_rank(), pmi->get_size(), my_ofi_eps[0], all_efis)) {
-            LOG_ERROR("OCCP exchange_ofi_config failed");
-            return ATL_STATUS_FAILURE;
+            ofi_endpoints_t peer_ofi_eps(comm_size);
+
+            LOG_DEBUG(
+                "Step 2: OCCP exchange_ofi_config start rank: ", pmi->get_rank(), ", ep_idx: ", j);
+            if (!occp_client->exchange_ofi_config(
+                    pmi->get_rank(), comm_size, my_ofi_ep, peer_ofi_eps)) {
+                LOG_ERROR("OCCP exchange_ofi_config failed");
+                return ATL_STATUS_FAILURE;
+            }
+
+            for (size_t i = 0; i < comm_size; i++) {
+                all_efis[i * named_ep_count + j] = peer_ofi_eps[i];
+            }
         }
         LOG_DEBUG("Step 2 completed. rank: ", pmi->get_rank());
 
@@ -387,6 +413,10 @@ atl_status_t atl_ofi_prov_update_addr_table(atl_ofi_ctx_t& ctx,
         }
 
         LOG_DEBUG("Step 4: Build ep_names_table from OCCP results");
+        /* fi_av_insert walks the table at the provider's real address size, so the
+         * names are packed contiguously, exactly as the PMI path does */
+        std::vector<char> peer_ep_name;
+        next_ep_name = ep_names_table;
         addr_idx = 0;
         for (int i = 0; i < coord.global_count; i++) {
             if (prov->is_shm && coord.global2local_map[i] == -1)
@@ -394,10 +424,29 @@ atl_status_t atl_ofi_prov_update_addr_table(atl_ofi_ctx_t& ctx,
 
             for (size_t j = 0; j < named_ep_count; j++) {
                 const auto& peer_ofi_ep = all_efis[i * named_ep_count + j];
-                memcpy(ep_names_table + addr_idx * addr_len, peer_ofi_ep.data, addr_len);
+                peer_ep_name.assign(peer_ofi_ep.data, peer_ofi_ep.data + addr_len);
+                if (prov->is_shm) {
+                    /* a shm address is a string: keep it and its terminator within
+                     * the addr_len this table is sized for, whatever the peer sent */
+                    size_t name_len = strnlen(peer_ep_name.data(), addr_len);
+                    if (name_len == static_cast<size_t>(addr_len)) {
+                        LOG_WARN(
+                            "Endpoint name truncated from ",
+                            name_len,
+                            " to ",
+                            addr_len - 1,
+                            " bytes due to FI_NAME_MAX limit. "
+                            "This might cause collisions if names differ only in the truncated portion.");
+                        name_len = addr_len - 1;
+                    }
+                    peer_ep_name.resize(name_len + 1);
+                    peer_ep_name.back() = '\0';
+                }
 
-                ep_names.push_back(
-                    std::vector<char>(peer_ofi_ep.data, peer_ofi_ep.data + addr_len));
+                memcpy(next_ep_name, peer_ep_name.data(), peer_ep_name.size());
+                next_ep_name += peer_ep_name.size();
+
+                ep_names.push_back(peer_ep_name);
                 addr_idx++;
             }
         }
@@ -710,8 +759,7 @@ atl_status_t atl_ofi_prov_eps_connect(atl_ofi_ctx_t& ctx,
                                       size_t prov_idx,
                                       std::shared_ptr<ipmi> pmi,
                                       ep_names_t& ep_names,
-                                      occp_client_t* occp_client,
-                                      uint16_t occp_srv_port) {
+                                      occp_client_t* occp_client) {
     int ret;
     size_t ep_idx;
 
@@ -729,12 +777,11 @@ atl_status_t atl_ofi_prov_eps_connect(atl_ofi_ctx_t& ctx,
         }
     }
 
-    // Step 2: Branch depending on kvs_init_mode
-    if (ccl::global_data::env().kvs_init_mode == ccl::kvs_mode::occp) {
+    // Step 2: Branch depending on the bootstrap channel
+    if (occp_client) {
         LOG_DEBUG("Using OCCP for endpoint exchange, rank: ", pmi->get_rank());
 
-        ret = atl_ofi_prov_update_addr_table(
-            ctx, coord, prov_idx, pmi, ep_names, occp_client, occp_srv_port);
+        ret = atl_ofi_prov_update_addr_table(ctx, coord, prov_idx, pmi, ep_names, occp_client);
     }
     else if (ccl::global_data::env().kvs_init_mode == ccl::kvs_mode::pmix_ofi_shm) {
         int global_rank = coord.global_idx;
@@ -803,7 +850,6 @@ atl_status_t atl_ofi_prov_eps_connect(atl_ofi_ctx_t& ctx,
                                              pmi,
                                              ep_names,
                                              nullptr,
-                                             0,
                                              shared_memory,
                                              length,
                                              total_named_eps,
@@ -1277,8 +1323,7 @@ atl_status_t atl_ofi_prov_init(atl_ofi_ctx_t& ctx,
                                atl_attr_t* attr,
                                std::shared_ptr<ipmi> pmi,
                                ep_names_t& ep_names,
-                               occp_client_t* occp_client,
-                               uint16_t occp_srv_port) {
+                               occp_client_t* occp_client) {
     struct fi_av_attr av_attr;
     size_t ep_idx = 0;
     ssize_t ret = 0;
@@ -1303,6 +1348,10 @@ atl_status_t atl_ofi_prov_init(atl_ofi_ctx_t& ctx,
     }
 
     prov->max_msg_size = info->ep_attr->max_msg_size;
+
+    /* verbs keeps its own mr cache, so skip ours there */
+    prov->mr_cache_enabled = ccl::global_data::env().enable_atl_cache &&
+                             !strstr(info->fabric_attr->prov_name, "verbs");
 
     ATL_OFI_CALL(fi_fabric(info->fabric_attr, &prov->fabric, nullptr), ret, goto err);
 
@@ -1350,8 +1399,7 @@ atl_status_t atl_ofi_prov_init(atl_ofi_ctx_t& ctx,
     }
 
     /* TODO: make separate function to be called on CCL comm creation */
-    ret = atl_ofi_prov_eps_connect(
-        ctx, coord, prov->idx, std::move(pmi), ep_names, occp_client, occp_srv_port);
+    ret = atl_ofi_prov_eps_connect(ctx, coord, prov->idx, std::move(pmi), ep_names, occp_client);
     if (ret) {
         LOG_ERROR("atl_ofi_prov_eps_connect error, prov_idx ", prov->idx);
         goto err;
@@ -1587,6 +1635,73 @@ bool atl_ofi_compare_nics(const struct fi_info* nic1, const struct fi_info* nic2
     return (atl_ofi_get_short_nic_name(nic1) < atl_ofi_get_short_nic_name(nic2));
 }
 
+/* An explicit group (CCL_OFI_DOMAIN_NAMES) is not a filter but the answer itself: one provider per
+ * name, in the order written, so provider i is the i-th name and endpoint i selects it. Built directly
+ * rather than filtered and sorted - a filter can only drop and reorder, and there is nothing here to
+ * drop and the order is given. A name matching no usable provider is fatal: every rank must reach the
+ * same nw_prov_count, the address exchange being per provider index, so a typo or a nic that is down
+ * would otherwise surface much later as a transfer whose peer provider does not exist. */
+static atl_status_t atl_ofi_select_exact_provs(const atl_ofi_ctx_t& ctx,
+                                               struct fi_info* prov_list,
+                                               std::vector<struct fi_info*>& provs) {
+    std::set<std::string> all_nic_names;
+    for (struct fi_info* prov_iter = prov_list; prov_iter; prov_iter = prov_iter->next) {
+        all_nic_names.insert(atl_ofi_get_short_nic_name(prov_iter));
+    }
+
+    for (const auto& name : ctx.mnic_exact_names) {
+        struct fi_info* match = nullptr;
+        for (struct fi_info* prov_iter = prov_list; prov_iter && !match;
+             prov_iter = prov_iter->next) {
+            // First match wins: one domain shows up once per provider variant (verbs, verbs;ofi_rxm).
+            if (atl_ofi_get_short_nic_name(prov_iter) == name && !atl_ofi_is_nic_down(prov_iter)) {
+                match = prov_iter;
+            }
+        }
+
+        if (!match) {
+            LOG_ERROR("no usable provider for domain ",
+                      name,
+                      " named in ",
+                      CCL_OFI_DOMAIN_NAMES,
+                      ", domains offered: ",
+                      ccl::utils::vec_to_string(all_nic_names));
+            return ATL_STATUS_FAILURE;
+        }
+
+        LOG_DEBUG(
+            "exact names: found nic ", atl_ofi_get_nic_name(match), ", nic idx ", provs.size());
+        provs.push_back(fi_dupinfo(match));
+    }
+
+    return ATL_STATUS_SUCCESS;
+}
+
+/* Open one network provider per selected fi_info, however it came to be selected. */
+static atl_status_t atl_ofi_create_nw_provs(atl_ofi_ctx_t& ctx,
+                                            const atl_proc_coord_t& coord,
+                                            atl_attr_t* attr,
+                                            std::shared_ptr<ipmi> pmi,
+                                            std::vector<ep_names_t>& ep_names,
+                                            const std::vector<struct fi_info*>& provs,
+                                            occp_client_t* occp_client) {
+    ctx.nw_prov_count = provs.size();
+    if (ep_names.size() < ctx.nw_prov_count + ctx.nw_prov_first_idx) {
+        ep_names.resize(ctx.nw_prov_count + ctx.nw_prov_first_idx);
+    }
+    for (size_t idx = 0; idx < ctx.nw_prov_count; idx++) {
+        size_t prov_idx = ctx.nw_prov_first_idx + idx;
+        atl_ofi_prov_t* prov = &ctx.provs[prov_idx];
+        prov->idx = prov_idx;
+        prov->is_shm = 0;
+        ATL_CALL(atl_ofi_prov_init(
+                     ctx, coord, provs[idx], prov, attr, pmi, ep_names[prov->idx], occp_client),
+                 return ATL_STATUS_FAILURE);
+    }
+
+    return ATL_STATUS_SUCCESS;
+}
+
 atl_status_t atl_ofi_open_nw_provs(atl_ofi_ctx_t& ctx,
                                    const atl_proc_coord_t& coord,
                                    struct fi_info* base_hints,
@@ -1594,14 +1709,12 @@ atl_status_t atl_ofi_open_nw_provs(atl_ofi_ctx_t& ctx,
                                    std::shared_ptr<ipmi> pmi,
                                    std::vector<ep_names_t>& ep_names,
                                    bool log_on_error,
-                                   occp_client_t* occp_client,
-                                   uint16_t occp_srv_port) {
+                                   occp_client_t* occp_client) {
     atl_status_t ret = ATL_STATUS_SUCCESS;
     struct fi_info* prov_list = nullptr;
     struct fi_info* prov_iter = nullptr;
-    size_t idx = 0, prov_idx = 0;
+    size_t idx = 0;
     char* prov_name = nullptr;
-    atl_ofi_prov_t* prov = nullptr;
     std::vector<struct fi_info*> name_provs;
     std::vector<struct fi_info*> topo_provs;
     std::vector<struct fi_info*> final_provs;
@@ -1623,6 +1736,22 @@ atl_status_t atl_ofi_open_nw_provs(atl_ofi_ctx_t& ctx,
                 ret);
         }
         goto err;
+    }
+
+    /* An explicit group settles the whole list, so steps 2-5 have nothing left to decide: skipping
+     * them outright beats neutralizing each one, which would leave a reader to check that a name
+     * filter, a topo filter, a rotate and a truncate are all identities here. */
+    if (!ctx.mnic_exact_names.empty()) {
+        ret = atl_ofi_select_exact_provs(ctx, prov_list, final_provs);
+        if (ret == ATL_STATUS_SUCCESS) {
+            LOG_INFO("found ", final_provs.size(), " nic(s) according to ", CCL_OFI_DOMAIN_NAMES);
+            ret =
+                atl_ofi_create_nw_provs(ctx, coord, attr, pmi, ep_names, final_provs, occp_client);
+        }
+        if (ret != ATL_STATUS_SUCCESS) {
+            goto err;
+        }
+        goto exit;
     }
 
     /* 2. filter out by names */
@@ -1737,25 +1866,9 @@ atl_status_t atl_ofi_open_nw_provs(atl_ofi_ctx_t& ctx,
 
     /* 6. create network providers */
     LOG_INFO("found ", final_provs.size(), " nic(s) according to all filters");
-    ctx.nw_prov_count = final_provs.size();
-    if (ep_names.size() < ctx.nw_prov_count + ctx.nw_prov_first_idx) {
-        ep_names.resize(ctx.nw_prov_count + ctx.nw_prov_first_idx);
-    }
-    for (idx = 0; idx < ctx.nw_prov_count; idx++) {
-        prov_idx = ctx.nw_prov_first_idx + idx;
-        prov = &ctx.provs[prov_idx];
-        prov->idx = prov_idx;
-        prov->is_shm = 0;
-        ATL_CALL(atl_ofi_prov_init(ctx,
-                                   coord,
-                                   final_provs[idx],
-                                   prov,
-                                   attr,
-                                   pmi,
-                                   ep_names[prov->idx],
-                                   occp_client,
-                                   occp_srv_port),
-                 goto err);
+    ret = atl_ofi_create_nw_provs(ctx, coord, attr, pmi, ep_names, final_provs, occp_client);
+    if (ret != ATL_STATUS_SUCCESS) {
+        goto err;
     }
 
 exit:

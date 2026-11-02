@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+
+  "notes": {
+    "_note": "Fixture for acceptance_sycl_policy_knobs: the shipped scaleup trees of allreduce, reduce_scatter, allgather, alltoall and alltoallv, with different knob values on each large leaf. allreduce adds bands around its 32 MiB call to check < and <=, and a band no call reaches with a misspelled knob and an invalid copy_path."
+  },
+
+  "collective=allreduce": {
+    "p2p_domain=any": {
+      "phase=scaleup": {
+        "is_arc=yes": {
+          "is_multi_thread=yes": { "protocol=sycl_simple": { "algorithm=large": { "copy_path=bogus": {}, "simple_chunk_szie=1048576": {} } } },
+          "has_p2p_access=no":   { "protocol=sycl_ll":     { "algorithm=ring":  { "ll_table=oneshot:0-256;twoshots:257-2048;ring:2049-max": {} } } },
+          "msg_size<=4194304":   { "protocol=sycl_ll":     { "algorithm=ring":  { "ll_table=oneshot:0-256;twoshots:257-2048;ring:2049-max": {} } } },
+          "msg_size<33554432":   { "protocol=sycl_simple": { "algorithm=large": { "simple_chunk_size=9437184": {} } } },
+          "msg_size<=33554432":  { "protocol=sycl_simple": { "algorithm=large": { "copy_path=kernel": {}, "simple_ring_segment_size=5242880": {}, "simple_chunk_size=1048576": {} } } },
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large": { "simple_chunk_size=10485760": {} } } }
+        },
+        "is_arc=no": {
+          "msg_size<=524288":    { "protocol=sycl_simple": { "algorithm=small": {} } },
+          "msg_size<33554432":   { "protocol=sycl_simple": { "algorithm=large": { "simple_chunk_size=9437184": {} } } },
+          "msg_size<=33554432":  { "protocol=sycl_simple": { "algorithm=large": { "copy_path=kernel": {}, "simple_ring_segment_size=5242880": {}, "simple_chunk_size=1048576": {} } } },
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large": { "simple_chunk_size=10485760": {} } } }
+        }
+      }
+    }
+  },
+
+  "collective=reduce_scatter": {
+    "p2p_domain=any": {
+      "phase=scaleup": {
+        "is_arc=yes": {
+          "is_multi_thread=yes":    { "protocol=sycl_ll":     { "algorithm=ring":  { "ll_table=oneshot:0-256;ring:257-max": {} } } },
+          "has_p2p_access=no":      { "protocol=sycl_ll":     { "algorithm=ring":  { "ll_table=oneshot:0-256;ring:257-max": {} } } },
+          "send_msg_size<=8388608": { "protocol=sycl_ll":     { "algorithm=ring":  { "ll_table=oneshot:0-256;ring:257-max": {} } } },
+          "msg_size=any":           { "protocol=sycl_simple": { "algorithm=large": { "copy_path=kernel": {}, "simple_ring_segment_size=6291456": {}, "simple_chunk_size=2097152": {} } } }
+        },
+        "is_arc=no": {
+          "send_msg_size<=2097152": { "protocol=sycl_simple": { "algorithm=small": {} } },
+          "msg_size=any":           { "protocol=sycl_simple": { "algorithm=large": { "copy_path=kernel": {}, "simple_ring_segment_size=6291456": {}, "simple_chunk_size=2097152": {} } } }
+        }
+      }
+    }
+  },
+
+  "collective=allgather": {
+    "p2p_domain=any": {
+      "phase=scaleup": {
+        "is_arc=yes": {
+          "is_multi_thread=yes": { "protocol=sycl_ll":     { "algorithm=ring":    { "ll_table=oneshot:0-256;ring:257-max": {} } } },
+          "has_p2p_access=no":   { "protocol=sycl_ll":     { "algorithm=ring":    { "ll_table=oneshot:0-256;ring:257-max": {} } } },
+          "msg_size<=1048576":   { "protocol=sycl_ll":     { "algorithm=ring":    { "ll_table=oneshot:0-256;ring:257-max": {} } } },
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large":   { "self_copy_threshold=1000001": {}, "copy_path=kernel": {}, "simple_ring_segment_size=7340032": {}, "simple_chunk_size=3145728": {} } } }
+        },
+        "is_arc=no": {
+          "msg_size<=131072":    { "protocol=sycl_simple": { "algorithm=small":   {} } },
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large":   { "self_copy_threshold=1000001": {}, "copy_path=kernel": {}, "simple_ring_segment_size=7340032": {}, "simple_chunk_size=3145728": {} } } }
+        }
+      }
+    }
+  },
+
+  "collective=alltoall": {
+    "p2p_domain=any": {
+      "phase=scaleup": {
+        "is_arc=yes": {
+          "is_multi_thread=yes": { "protocol=sycl_ll":     { "algorithm=ring":  {} } },
+          "has_p2p_access=no":   { "protocol=sycl_ll":     { "algorithm=ring":  {} } },
+          "msg_size<=524288":    { "protocol=sycl_ll":     { "algorithm=ring":  {} } },
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large": { "self_copy_threshold=2000002": {}, "copy_path=copy_engine": {}, "simple_chunk_size=4194304": {} } } }
+        },
+        "is_arc=no": {
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large": { "self_copy_threshold=2000002": {}, "copy_path=copy_engine": {}, "simple_chunk_size=4194304": {} } } }
+        }
+      }
+    }
+  },
+
+  "collective=alltoallv": {
+    "p2p_domain=any": {
+      "phase=scaleup": {
+        "is_arc=yes": {
+          "is_multi_thread=yes": { "protocol=sycl_ll":     { "algorithm=ring":  {} } },
+          "has_p2p_access=no":   { "protocol=sycl_ll":     { "algorithm=ring":  {} } },
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large": { "self_copy_threshold=3000003": {}, "copy_path=default": {} } } }
+        },
+        "is_arc=no": {
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large": { "self_copy_threshold=3000003": {}, "copy_path=default": {} } } }
+        }
+      }
+    }
+  }
+}

@@ -20,7 +20,9 @@
 
 #include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_impl.hpp"
 #include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_ring.hpp"
+#include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_device_proxy_ring.hpp"
 
 TEMPLATE_REDUCE_SCATTER_LARGE(short, true);
 TEMPLATE_REDUCE_SCATTER_LARGE(short, false);
 TEMPLATE_REDUCE_SCATTER_LARGE_SU_RING(short);
+TEMPLATE_REDUCE_SCATTER_DEVICE_PROXY_RING(short);

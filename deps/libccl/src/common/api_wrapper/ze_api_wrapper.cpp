@@ -19,6 +19,8 @@
 #include "common/stream/stream.hpp"
 #include "sched/entry/ze/ze_primitives.hpp"
 
+#include <dlfcn.h>
+
 namespace ccl {
 
 ccl::lib_info_t ze_lib_info;
@@ -43,7 +45,17 @@ bool ze_api_init() {
     ze_lib_info.additional_fn_names = &ze_fn_names_optional;
     int error = load_library(ze_lib_info);
     if (error != CCL_LOAD_LB_SUCCESS) {
-        print_error(error, ze_lib_info);
+        auto& reason = ccl::global_data::get().ze_init_error;
+        if (error == CCL_LOAD_LB_DLOPEN_ERROR) {
+            // read dlerror() here, print_error() would consume it
+            const char* dl_error = dlerror();
+            reason = dl_error ? dl_error : "could not open the library: " + ze_lib_info.path;
+            LOG_INFO("could not open the library: ", ze_lib_info.path, " - ", reason);
+        }
+        else {
+            reason = "library path is not valid: " + ze_lib_info.path;
+            print_error(error, ze_lib_info);
+        }
         ret = false;
     }
 

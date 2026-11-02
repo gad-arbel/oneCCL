@@ -403,8 +403,27 @@ kvs_status_t internal_kvs::kvs_main_server_address_reserve(char* main_address) {
     // add rank to main_address
     if (!can_use_internal_kvs()) {
 #ifdef CCL_ENABLE_MPI
-        int rank;
-        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        int rank = 0;
+        int mpi_is_inited = 0, mpi_is_finalized = 0;
+        int mpi_ret = MPI_Initialized(&mpi_is_inited);
+        CCL_THROW_IF_NOT(
+            mpi_ret == MPI_SUCCESS, "MPI_Initialized in internal_kvs failed: ", mpi_ret);
+        if (mpi_is_inited) {
+            mpi_ret = MPI_Finalized(&mpi_is_finalized);
+            CCL_THROW_IF_NOT(
+                mpi_ret == MPI_SUCCESS, "MPI_Finalized in internal_kvs failed: ", mpi_ret);
+        }
+        if (mpi_is_inited && !mpi_is_finalized) {
+            mpi_ret = MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+            CCL_THROW_IF_NOT(
+                mpi_ret == MPI_SUCCESS, "MPI_Comm_rank in internal_kvs failed: ", mpi_ret);
+        }
+        else {
+            LOG_WARN_ONCE("MPI is not initialized (or already finalized) before internal_kvs "
+                          "reached.\nRank will always be 0 - matches MPI_Comm_rank() ",
+                          "behavior when MPI not initialized and ",
+                          "--enable-error-checking=no - ");
+        }
         int str_len = strnlen(main_address, ccl::v1::kvs::address_max_size);
         sprintf(main_address + str_len, "_%d", rank);
 #else

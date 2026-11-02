@@ -17,14 +17,15 @@
 #pragma once
 #include "oneapi/ccl.hpp"
 #include "common/global/global.hpp"
+#include "coll/selection/policy/policy_env.hpp"
 
 #if defined(CCL_ENABLE_ZE) || defined(CCL_ENABLE_SYCL)
 #include "coll/algorithms/utils/sycl_barrier.hpp"
 #include "coll/algorithms/utils/sycl_copy.hpp"
 #include "coll/algorithms/utils/sycl_reductions.hpp"
 #include "coll/algorithms/utils/sycl_ptrs.hpp"
+#include "coll/algorithms/utils/sycl_ce_eu_pipeline.hpp"
 #include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_ring.hpp"
-#include "coll/algorithms/allgatherv/sycl/allgatherv_large_sycl_ring.hpp"
 #include "coll/algorithms/allreduce/sycl/allreduce_sycl.hpp"
 #include "coll/algorithms/utils/transmit/ring_transmit.hpp"
 #endif // defined(CCL_ENABLE_ZE) || defined(CCL_ENABLE_SYCL)
@@ -198,6 +199,7 @@ void allreduce_large_su_ring_write_single_kernel(const void *send_buf,
                                                  ccl::datatype dtype,
                                                  ccl::reduction reduction,
                                                  ccl_comm *comm,
+                                                 std::shared_ptr<ccl_comm> p2p_comm,
                                                  ccl_stream *global_stream,
                                                  sycl_ptrs_type &sycl_ptrs,
                                                  const ccl::vector_class<ccl::event> &deps) {
@@ -208,9 +210,8 @@ void allreduce_large_su_ring_write_single_kernel(const void *send_buf,
     const size_t dsize = ccl_dtype.size();
     sycl::queue q = global_stream->get_native_stream();
 
-    std::shared_ptr<ccl_comm> node_comm = comm->get_node_comm();
-    const int N = node_comm->size();
-    const int rank = node_comm->rank();
+    const int N = p2p_comm->size();
+    const int rank = p2p_comm->rank();
     const int peer_rank = (rank + 1) % N;
     const size_t count_per_rank = count / N;
 
@@ -252,6 +253,8 @@ void allreduce_large_su_ring_write_single_kernel(const void *send_buf,
     const size_t recv_bytes = recv_count * dsize;
     const size_t last_recv_bytes = last_block_count * dsize;
 
+    // the segment variables are for the multi-kernel rings; this one always takes a whole
+    // tmp buffer per slot, so its chunks only ever come from a slice that does not fit
     size_t chunk_size = get_tmp_buf_size_per_rank();
     if (chunk_size > last_recv_bytes)
         chunk_size = last_recv_bytes;
@@ -261,11 +264,11 @@ void allreduce_large_su_ring_write_single_kernel(const void *send_buf,
     std::array<void *, pipeline_size> work_bufs;
     std::array<void *, pipeline_size> remote_work_bufs;
     for (int i = 0; i < pipeline_size; i++) {
-        work_bufs[i] = get_tmp_buf(i, comm);
-        remote_work_bufs[i] = get_remote_node_tmp_buf(i, comm)[peer_rank];
+        work_bufs[i] = get_large_tmp_buf(i, comm);
+        remote_work_bufs[i] = get_remote_large_tmp_buf(i, p2p_comm.get())[peer_rank];
     }
 
-    invoke_barrier(node_comm, q, dep_events, is_cpu_barrier);
+    invoke_barrier(p2p_comm, q, dep_events, is_cpu_barrier);
 
     size_t chunk_data_count = chunk_size / dsize;
     size_t chunk_kernel_threads =
@@ -276,11 +279,11 @@ void allreduce_large_su_ring_write_single_kernel(const void *send_buf,
 
     ccl_reduction_data reduction_op = make_reduction_operation(reduction);
 
-    ccl_comm_flag_data flag_data = node_comm->flag_data();
+    ccl_comm_flag_data flag_data = p2p_comm->flag_data();
 
     rs_coll_params rs_params;
     rs_params.flag_data = flag_data;
-    rs_params.barrier_data = node_comm->barrier_data();
+    rs_params.barrier_data = p2p_comm->barrier_data();
     rs_params.peer_recv = peer_recv;
     rs_params.chunk_size = chunk_size;
     rs_params.num_chunks = num_chunks;
@@ -299,8 +302,8 @@ void allreduce_large_su_ring_write_single_kernel(const void *send_buf,
 
     // allgather
     coll_params params;
-    params.flag_data = node_comm->flag_data();
-    params.barrier_data = node_comm->barrier_data();
+    params.flag_data = p2p_comm->flag_data();
+    params.barrier_data = p2p_comm->barrier_data();
     params.peer_recv = peer_recv;
     if (use_full_vector) {
         AllgatherPhaseKernel<T, full_vec_size> ag_kernel(send_buf, recv_buf, count, params);
@@ -320,6 +323,7 @@ void allreduce_large_su_ring_write_multi_kernel(const void *send_buf,
                                                 ccl::datatype dtype,
                                                 ccl::reduction reduction,
                                                 ccl_comm *comm,
+                                                std::shared_ptr<ccl_comm> p2p_comm,
                                                 ccl_stream *global_stream,
                                                 sycl_ptrs_type &sycl_ptrs,
                                                 const ccl::vector_class<ccl::event> &deps) {
@@ -330,9 +334,8 @@ void allreduce_large_su_ring_write_multi_kernel(const void *send_buf,
     const size_t dsize = ccl_dtype.size();
     sycl::queue q = global_stream->get_native_stream();
 
-    std::shared_ptr<ccl_comm> node_comm = comm->get_node_comm();
-    const int N = node_comm->size();
-    const int rank = node_comm->rank();
+    const int N = p2p_comm->size();
+    const int rank = p2p_comm->rank();
     const int peer_rank = (rank + 1) % N;
     const size_t count_per_rank = count / N;
 
@@ -351,8 +354,41 @@ void allreduce_large_su_ring_write_multi_kernel(const void *send_buf,
 
     T *peer_recv = (T *)(sycl_ptrs.node_ptrs_wr[peer_rank]);
 
-    const bool use_memcpy = ccl::global_data::env().sycl_copy_engine;
+    const bool use_memcpy = ccl::selection::call_env().sycl_copy_engine;
     size_t num_threads = ccl::global_data::env().sycl_num_threads;
+
+    {
+        ce_eu_pipeline_request_t request;
+        request.collective = "allreduce";
+        request.stream = global_stream;
+        request.comm = comm;
+        request.ranks = N;
+        request.is_cpu_barrier = is_cpu_barrier;
+        request.has_whole_vectors = is_whole_vector_count(count_per_rank, dsize);
+        request.dsize = dsize;
+        request.message_bytes = count * dsize;
+        request.count_per_rank = count_per_rank;
+        request.preferred_chunk_bytes = CE_EU_ALLREDUCE_CHUNK_BYTES;
+        const ce_eu_pipeline_plan_t plan = plan_ce_eu_pipeline(request);
+        if (plan.use_pipeline) {
+            ce_eu_args_t args;
+            args.is_allreduce = true;
+            args.send_buf = send_buf;
+            args.recv_buf = recv_buf;
+            args.count_per_rank = count_per_rank;
+            args.send_stride = count_per_rank;
+            args.dtype = dtype;
+            args.reduction = reduction;
+            args.comm = comm;
+            args.p2p_comm = p2p_comm;
+            args.global_stream = global_stream;
+            args.peer_recv_buf = peer_recv;
+            args.deps_ptr = &deps;
+            // like the serial path below, no event: the stream queue is in order
+            run_ce_eu_pipeline<T>(args, plan);
+            return;
+        }
+    }
 
     sycl::device device = q.get_device();
     // Query the maximum work-group size
@@ -371,16 +407,22 @@ void allreduce_large_su_ring_write_multi_kernel(const void *send_buf,
     const size_t recv_bytes = recv_count * dsize;
     void *recv_buf_rank_offset = (T *)recv_buf + my_offset_count;
     void *peer_recv_buf_rank_offset = (T *)peer_recv + my_offset_count;
-    const size_t chunk_size = ccl::global_data::env().sycl_tmp_buf_size / pipeline_size /
-                              sizeof(message_t) * sizeof(message_t);
+    const size_t chunk_size = get_simple_ring_segment_size(
+        CCL_SYCL_ALLREDUCE_SIMPLE_RING_SEGMENT_SIZE,
+        simple_ring_segment_request(
+            CCL_SYCL_ALLREDUCE_SIMPLE_RING_SEGMENT_SIZE,
+            ccl::selection::call_env().sycl_allreduce_simple_ring_segment_size,
+            use_full_vector),
+        pipeline_size,
+        large_tmp_buf_align);
     const size_t chunk_count = chunk_size / dsize;
     const size_t rem_chunk_count = recv_count % chunk_count;
     const size_t num_chunks = recv_count / chunk_count + (rem_chunk_count != 0);
 
     std::array<void *, ARC_MAX_NUM> work_bufs;
     std::array<void *, ARC_MAX_NUM> remote_work_bufs;
-    work_bufs[0] = get_tmp_buf(0, comm);
-    remote_work_bufs[0] = get_remote_node_tmp_buf(0, comm)[peer_rank];
+    work_bufs[0] = get_large_tmp_buf(0, comm);
+    remote_work_bufs[0] = get_remote_large_tmp_buf(0, p2p_comm.get())[peer_rank];
     for (int i = 1; i < pipeline_size; i++) {
         work_bufs[i] = (char *)work_bufs[i - 1] + chunk_size;
         remote_work_bufs[i] = (char *)remote_work_bufs[i - 1] + chunk_size;
@@ -388,7 +430,7 @@ void allreduce_large_su_ring_write_multi_kernel(const void *send_buf,
 
     ccl_reduction_data reduction_op = make_reduction_operation(reduction);
 
-    invoke_barrier(node_comm, q, dep_events, is_cpu_barrier);
+    invoke_barrier(p2p_comm, q, dep_events, is_cpu_barrier);
 
     int slot = 0;
     for (size_t nc = 0; nc < num_chunks; nc++) {
@@ -432,7 +474,7 @@ void allreduce_large_su_ring_write_multi_kernel(const void *send_buf,
             }
 
             // barrier
-            invoke_p2p_barrier(node_comm, q, {}, is_cpu_barrier);
+            invoke_p2p_barrier(p2p_comm, q, {}, is_cpu_barrier);
 
             // local reduce + remote write
             if (use_memcpy) {
@@ -461,7 +503,7 @@ void allreduce_large_su_ring_write_multi_kernel(const void *send_buf,
         }
     }
 
-    invoke_p2p_barrier(node_comm, q, {}, is_cpu_barrier);
+    invoke_p2p_barrier(p2p_comm, q, {}, is_cpu_barrier);
 
     // allgather
     size_t kernel_threads = count_per_rank / vec_size + count_per_rank % vec_size;
@@ -487,7 +529,7 @@ void allreduce_large_su_ring_write_multi_kernel(const void *send_buf,
                     copy_kernel_wrap<T, full_vec_size, partial_vec_size>(dst, src, count_per_rank, use_full_vector);
                 });
         }
-        invoke_p2p_barrier(node_comm, q, {}, is_cpu_barrier);
+        invoke_p2p_barrier(p2p_comm, q, {}, is_cpu_barrier);
     }
 }
 
@@ -499,6 +541,7 @@ sycl::event allreduce_large_su_ring_write_no_ipc(const void *send_buf,
                                                  ccl::datatype dtype,
                                                  ccl::reduction reduction,
                                                  ccl_comm *comm,
+                                                 const std::shared_ptr<ccl_comm> p2p_comm,
                                                  ccl_stream *global_stream,
                                                  const ccl::vector_class<ccl::event> &deps) {
     const bool is_cpu_barrier = ccl::global_data::env().sycl_ccl_barrier;
@@ -508,9 +551,8 @@ sycl::event allreduce_large_su_ring_write_no_ipc(const void *send_buf,
     const size_t dsize = ccl_dtype.size();
     sycl::queue q = global_stream->get_native_stream();
 
-    std::shared_ptr<ccl_comm> node_comm = comm->get_node_comm();
-    const int N = node_comm->size();
-    const int rank = node_comm->rank();
+    const int N = p2p_comm->size();
+    const int rank = p2p_comm->rank();
     const int peer_rank = (rank + 1) % N;
     const size_t count_per_rank = count / N;
 
@@ -519,7 +561,7 @@ sycl::event allreduce_large_su_ring_write_no_ipc(const void *send_buf,
     constexpr int partial_vec_size = get_num_elements<T, 16, false>();
     int vec_size = use_full_vector ? full_vec_size : partial_vec_size;
 
-    const bool use_memcpy = ccl::global_data::env().sycl_copy_engine;
+    const bool use_memcpy = ccl::selection::call_env().sycl_copy_engine;
     size_t num_threads = ccl::global_data::env().sycl_num_threads;
 
     sycl::device device = q.get_device();
@@ -541,7 +583,15 @@ sycl::event allreduce_large_su_ring_write_no_ipc(const void *send_buf,
     sycl::event work_event;
 
     const int pipeline_size = N;
-    const size_t chunk_size = ccl::global_data::env().sycl_tmp_buf_size / pipeline_size;
+    // whole vectors, so every segment and slot stays aligned
+    const size_t chunk_size = get_simple_ring_segment_size(
+        CCL_SYCL_ALLREDUCE_SIMPLE_RING_SEGMENT_SIZE,
+        simple_ring_segment_request(
+            CCL_SYCL_ALLREDUCE_SIMPLE_RING_SEGMENT_SIZE,
+            ccl::selection::call_env().sycl_allreduce_simple_ring_segment_size,
+            use_full_vector),
+        pipeline_size,
+        large_tmp_buf_align);
 
     const size_t my_offset_count = count_per_rank * rank;
     const size_t recv_count = count_per_rank;
@@ -552,8 +602,8 @@ sycl::event allreduce_large_su_ring_write_no_ipc(const void *send_buf,
 
     std::array<void *, ARC_MAX_NUM> work_bufs;
     std::array<void *, ARC_MAX_NUM> remote_work_bufs;
-    work_bufs[0] = get_tmp_buf(0, comm);
-    remote_work_bufs[0] = get_remote_node_tmp_buf(0, comm)[peer_rank];
+    work_bufs[0] = get_large_tmp_buf(0, comm);
+    remote_work_bufs[0] = get_remote_large_tmp_buf(0, p2p_comm.get())[peer_rank];
     for (int i = 1; i < pipeline_size; i++) {
         work_bufs[i] = (char *)work_bufs[i - 1] + chunk_size;
         remote_work_bufs[i] = (char *)remote_work_bufs[i - 1] + chunk_size;
@@ -561,7 +611,7 @@ sycl::event allreduce_large_su_ring_write_no_ipc(const void *send_buf,
 
     ccl_reduction_data reduction_op = make_reduction_operation(reduction);
 
-    invoke_barrier(node_comm, q, dep_events, is_cpu_barrier);
+    invoke_barrier(p2p_comm, q, dep_events, is_cpu_barrier);
 
     int slot = 0;
     for (size_t nc = 0; nc < num_chunks; nc++) {
@@ -602,7 +652,7 @@ sycl::event allreduce_large_su_ring_write_no_ipc(const void *send_buf,
             }
 
             // barrier
-            invoke_p2p_barrier(node_comm, q, {}, is_cpu_barrier);
+            invoke_p2p_barrier(p2p_comm, q, {}, is_cpu_barrier);
 
             // local reduce + remote write
             if (use_memcpy) {
@@ -626,7 +676,7 @@ sycl::event allreduce_large_su_ring_write_no_ipc(const void *send_buf,
         }
 
         // allgather
-        invoke_p2p_barrier(node_comm, q, {}, is_cpu_barrier);
+        invoke_p2p_barrier(p2p_comm, q, {}, is_cpu_barrier);
 
         s = rank;
         for (int i = 1; i < N - 1; i++) {
@@ -646,7 +696,7 @@ sycl::event allreduce_large_su_ring_write_no_ipc(const void *send_buf,
                         copy_2dst_wrap<T, full_vec_size, partial_vec_size>(local_dst, remote_dst, src, data_count, use_full_vector);
                     });
             }
-            invoke_p2p_barrier(node_comm, q, {}, is_cpu_barrier);
+            invoke_p2p_barrier(p2p_comm, q, {}, is_cpu_barrier);
             slot = next_slot;
         }
         // last step
@@ -686,6 +736,7 @@ sycl::event allreduce_large_su_ring_write_no_ipc(const void *send_buf,
                                                   dtype,
                                                   reduction,
                                                   comm,
+                                                  p2p_comm,
                                                   global_stream,
                                                   done);
         assert(done);
@@ -702,7 +753,8 @@ sycl::event allreduce_large_su_ring(const void *send_buf,
                                     size_t count,
                                     ccl::datatype dtype,
                                     ccl::reduction reduction,
-                                    ccl_comm *comm,
+                                    ccl_comm *global_comm,
+                                    const std::shared_ptr<ccl_comm> p2p_comm,
                                     ccl_stream *global_stream,
                                     sycl_ptrs_type &sycl_ptrs,
                                     const ccl::vector_class<ccl::event> &deps) {
@@ -711,9 +763,8 @@ sycl::event allreduce_large_su_ring(const void *send_buf,
     const size_t dsize = ccl_dtype.size();
     sycl::queue q = global_stream->get_native_stream();
 
-    std::shared_ptr<ccl_comm> node_comm = comm->get_node_comm();
-    const int N = node_comm->size();
-    const int rank = node_comm->rank();
+    const int N = p2p_comm->size();
+    const int rank = p2p_comm->rank();
     const int peer_rank = (rank + 1) % N;
     const size_t count_per_rank = count / N;
 
@@ -745,7 +796,7 @@ sycl::event allreduce_large_su_ring(const void *send_buf,
     T *peer_send = (T *)(sycl_ptrs.node_ptrs_rd[peer_rank]);
     T *peer_recv = (T *)(sycl_ptrs.node_ptrs_wr[peer_rank]);
 
-    const bool use_memcpy = ccl::global_data::env().sycl_copy_engine;
+    const bool use_memcpy = ccl::selection::call_env().sycl_copy_engine;
     const bool use_single_kernel = ccl::global_data::env().sycl_simple_single_kernel;
     const bool read_algo = ccl::global_data::env().sycl_allreduce_simple_read;
 
@@ -766,7 +817,7 @@ sycl::event allreduce_large_su_ring(const void *send_buf,
     if (read_algo) {
         ccl_reduction_data reduction_op = make_reduction_operation(reduction);
 
-        invoke_barrier(node_comm, q, dep_events, is_cpu_barrier);
+        invoke_barrier(p2p_comm, q, dep_events, is_cpu_barrier);
 
         // reduce_scatter
         int s = (rank + 2) % N;
@@ -783,7 +834,7 @@ sycl::event allreduce_large_su_ring(const void *send_buf,
 #else
             syclexp::nd_launch(q, nd_range, k_func_rs, out, in1, in2, count_per_rank);
 #endif
-            invoke_barrier(node_comm, q, {}, is_cpu_barrier);
+            invoke_barrier(p2p_comm, q, {}, is_cpu_barrier);
             s = (s + 1) % N;
         }
 
@@ -806,18 +857,18 @@ sycl::event allreduce_large_su_ring(const void *send_buf,
                 syclexp::nd_launch(q, nd_range, k_func_cp, dst, src, count_per_rank);
 #endif
             }
-            invoke_barrier(node_comm, q, {}, is_cpu_barrier);
+            invoke_barrier(p2p_comm, q, {}, is_cpu_barrier);
             s = (s + 1) % N;
         }
     }
     else {
         if (!use_memcpy && use_single_kernel) {
             allreduce_large_su_ring_write_single_kernel<T>(
-                send_buf, recv_buf, count, dtype, reduction, comm, global_stream, sycl_ptrs, deps);
+                send_buf, recv_buf, count, dtype, reduction, global_comm, p2p_comm, global_stream, sycl_ptrs, deps);
         }
         else {
             allreduce_large_su_ring_write_multi_kernel<T>(
-                send_buf, recv_buf, count, dtype, reduction, comm, global_stream, sycl_ptrs, deps);
+                send_buf, recv_buf, count, dtype, reduction, global_comm, p2p_comm, global_stream, sycl_ptrs, deps);
         }
     }
 
@@ -840,7 +891,8 @@ sycl::event allreduce_large_su_ring(const void *send_buf,
                                                   count % N,
                                                   dtype,
                                                   reduction,
-                                                  comm,
+                                                  global_comm,
+                                                  p2p_comm,
                                                   global_stream,
                                                   done);
         assert(done);
@@ -861,6 +913,7 @@ sycl::event allreduce_large_su_ring(const void *send_buf,
                                                      ccl::datatype dtype, \
                                                      ccl::reduction reduction, \
                                                      ccl_comm *comm, \
+                                                     const std::shared_ptr<ccl_comm> p2p_comm, \
                                                      ccl_stream *global_stream, \
                                                      sycl_ptrs_type &sycl_ptrs, \
                                                      const ccl::vector_class<ccl::event> &deps)
@@ -873,6 +926,7 @@ sycl::event allreduce_large_su_ring(const void *send_buf,
         ccl::datatype dtype, \
         ccl::reduction reduction, \
         ccl_comm *comm, \
+        const std::shared_ptr<ccl_comm> p2p_comm, \
         ccl_stream *global_stream, \
         const ccl::vector_class<ccl::event> &deps)
 

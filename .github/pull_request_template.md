@@ -1,4 +1,7 @@
-## Pull Request Description
+
+> [!WARNING]
+> On PR open (including draft PRs), GitHub Actions overwrites the PR title/body with the first commit message (subject/body). Text entered in the PR form is not preserved.
+---
 
 ## Author Checklist
 * [ ] Provide PR Description \
@@ -16,13 +19,7 @@
 
 Comment structure **test:\<conf>**
 
-* justbuild|scan
-* func
-* pr|example|reg_tests
-* pr/debug
-* example/debug
-* reg_tests/debug
-* horovod|pytorch|torch_ccl
-* kw|abi|format
-* mpich_ats|mpich_pvc
-* all
+* all - builds + all tests + all scans
+* quicktests - builds + all tests 
+* builds - builds only
+* scans - builds + all scans

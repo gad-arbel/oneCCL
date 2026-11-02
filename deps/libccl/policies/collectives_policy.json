@@ -1,0 +1,257 @@
+{
+  "schema_version": 1,
+
+  "global_config": {
+    "_note": "CCL_<VAR>=<value>; replaces a oneCCL environment variable, also one set in the environment (e.g. \"CCL_SYCL_P2P_LEVEL\": \"node\", \"CCL_SYCL_TMP_BUF_SIZE\": \"512Mb\"). Only variables read by the environment parser can be set; ones read directly from the environment (worker affinity, KVS, ATL MPI, topology) and CCL_LOG_LEVEL, CCL_ABORT_ON_THROW, CCL_SELECTION_POLICY_PATH are warned about and ignored.",
+    "CCL_SYCL_P2P_LEVEL":    "node"
+  },
+
+  "notes": {
+    "_note": "Documentation only; ignored by the engine. The shipped tree reproduces the built-in defaults. An empty phase or an unlisted algorithm leaves the decision to the built-in selector.",
+    "_numbers": "Filter, knobs and global_config numbers accept a case-insensitive K/M/G/T suffix (x1000) or Kb/Mb/Gb/Tb (x1024): 8M = 8000000, 8Mb = 8388608",
+
+    "p2p_domains":        ["auto", "node", "numa", "switch", "none"],
+    "phases":             ["scaleup", "scaleout"],
+    "filters":            ["msg_size<N", "send_msg_size<N (reduce_scatter)", "count<N",
+                           "comm_size<N|=pow2|=any",
+                           "phase=scaleup|scaleout", "p2p_domain=node|numa|switch|none",
+                           "dtype=float16|bfloat16|float32|...",
+                           "has_p2p_access=yes|no", "is_multi_thread=yes|no", "is_arc=yes|no", "is_recording=yes|no",
+                           "transport=ofi|mpi (CCL_ATL_TRANSPORT)",
+                           "direct_gpu_rdma=yes|no (CCL_SYCL_ENABLE_DIRECT_GPU_RDMA)",
+                           "use_copy_engine=yes|no (CCL_ENABLE_ZE_CE)"],
+
+    "scaleup_protocols":  ["sycl_ll", "sycl_simple", "copy_engine"],
+    "scaleup_algorithms": {
+      "allgather":      { "sycl_ll": ["ring", "oneshot"],             "sycl_simple": ["small", "large"] },
+      "allreduce":      { "sycl_ll": ["ring", "oneshot", "twoshots"], "sycl_simple": ["small", "large"] },
+      "reduce_scatter": { "sycl_ll": ["ring", "oneshot"],             "sycl_simple": ["small", "large"] },
+      "broadcast":      { "sycl_ll": ["ring"],                        "sycl_simple": ["small", "large"], "copy_engine": ["sycl_copy_engine", "l0_copy_engine"] },
+      "reduce":         { "sycl_ll": ["ring"] },
+      "scatter":        {                                             "sycl_simple": ["small", "large"] },
+      "alltoall":       { "sycl_ll": ["ring"],                        "sycl_simple": ["large"] },
+      "alltoallv":      { "sycl_ll": ["ring"],                        "sycl_simple": ["large"] }
+    },
+    "scaleup_knobs":      ["ll_table=<algo>:<lo>-<hi>; picks the LL algorithm per chunk, same format as CCL_SYCL_<COLL>_LL;",
+                           "self_copy_threshold=<bytes>; own-block bytes from which the CRI copy-engine self copy of allgather, alltoall and alltoallv runs on a second copy engine, 0 = never (CCL_SYCL_<COLL>_SELF_COPY_THRESHOLD)",
+                           "copy_path=copy_engine|kernel|default; copy engine or compute kernel for the peer copies of a large call (CCL_SYCL_COPY_ENGINE; alltoall, alltoallv: CCL_SYCL_ALLTOALL_COPY_ENGINE); default leaves the variable's value",
+                           "simple_ring_segment_size=<bytes>; bytes per pipeline slot of the large ring kernels of allreduce, reduce_scatter and allgather (CCL_SYCL_<COLL>_SIMPLE_RING_SEGMENT_SIZE)",
+                           "simple_chunk_size=<bytes>; splits a large allreduce, reduce_scatter, allgather or alltoall call into chunks of at most this size, in place of the CCL_SYCL_<COLL>_SIMPLE_CHUNK_SIZE spec and, for alltoall on Arc, of CCL_SYCL_ALLTOALL_CHUNKING_THRESHOLD; 0 = no knob"],
+
+    "scaleout_algorithms": {
+      "allgather":      ["direct", "ring"],
+      "allreduce":      ["direct", "ring", "rabenseifner"],
+      "reduce_scatter": ["direct", "ring"],
+      "broadcast":      ["direct", "scatter_allgather"],
+      "reduce":         ["direct"],
+      "scatter":        ["direct", "scatter_two_phase"],
+      "alltoall":       ["direct", "gdr_only_pairwise", "scatter", "numa_gdr_split", "non_sycl"],
+      "alltoallv":      ["direct", "gdr_only_pairwise", "scatter", "non_sycl"]
+    },
+    "scaleout_knobs":     ["chunk_bytes=<N>"]
+  },
+
+  "collective=allgather": {
+    "_note": "Serves both allgather and allgatherv.",
+
+    "p2p_domain=any": {
+      "phase=scaleup": {
+        "is_arc=yes": {
+          "is_multi_thread=yes": { "protocol=sycl_ll":     { "algorithm=ring":    { "ll_table=oneshot:0-256;ring:257-max": {} } } },
+          "has_p2p_access=no":   { "protocol=sycl_ll":     { "algorithm=ring":    { "ll_table=oneshot:0-256;ring:257-max": {} } } },
+          "msg_size<=1048576":   { "protocol=sycl_ll":     { "algorithm=ring":    { "ll_table=oneshot:0-256;ring:257-max": {} } } },
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large":   {} } }
+        },
+        "is_arc=no": {
+          "msg_size<=131072":    { "protocol=sycl_simple": { "algorithm=small":   {} } },
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large":   {} } }
+        }
+      },
+      "phase=scaleout": {
+        "_note": "Non-MPI transports always use ring. Over MPI, ring only inside a comm-size-dependent message window, direct outside it.",
+        "is_recording=yes": { "algorithm=direct": {} },
+        "transport=ofi":    { "algorithm=ring":   {} },
+        "comm_size<4":      { "msg_size<524288":     { "algorithm=direct": {} },
+                              "msg_size<=134217728": { "algorithm=ring":   {} },
+                              "msg_size=any":        { "algorithm=direct": {} } },
+        "comm_size<8":      { "msg_size<2097152":    { "algorithm=direct": {} },
+                              "msg_size<=33554432":  { "algorithm=ring":   {} },
+                              "msg_size=any":        { "algorithm=direct": {} } },
+        "comm_size=any":    { "msg_size<2097152":    { "algorithm=direct": {} },
+                              "msg_size<=9437184":   { "algorithm=ring":   {} },
+                              "msg_size=any":        { "algorithm=direct": {} } }
+      }
+    }
+  },
+
+  "collective=allreduce": {
+    "p2p_domain=any": {
+      "phase=scaleup": {
+        "is_arc=yes": {
+          "is_multi_thread=yes": { "protocol=sycl_ll":     { "algorithm=ring":     { "ll_table=oneshot:0-256;twoshots:257-2048;ring:2049-max": {} } } },
+          "has_p2p_access=no":   { "protocol=sycl_ll":     { "algorithm=ring":     { "ll_table=oneshot:0-256;twoshots:257-2048;ring:2049-max": {} } } },
+          "msg_size<=4194304":   { "protocol=sycl_ll":     { "algorithm=ring":     { "ll_table=oneshot:0-256;twoshots:257-2048;ring:2049-max": {} } } },
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large":    {} } }
+        },
+        "is_arc=no": {
+          "msg_size<=524288":    { "protocol=sycl_simple": { "algorithm=small":    {} } },
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large":    {} } }
+        }
+      },
+      "phase=scaleout": {
+        "_note": "Small messages go direct, with dtype-specific thresholds; larger ones use rabenseifner (pow2 > 2 ranks), ring (<= 16 ranks) or direct. Above 64 ranks only OFI keeps the large-message algorithms; other transports go direct.",
+        "is_recording=yes": { "algorithm=direct": {} },
+        "comm_size<=8": {
+          "dtype=float16":     { "msg_size<=524288":  { "algorithm=direct": {} },
+                                 "msg_size=any":      { "comm_size<=2":   { "algorithm=ring":         {} },
+                                                        "comm_size=pow2": { "algorithm=rabenseifner": {} },
+                                                        "comm_size=any":  { "algorithm=ring":         {} } } },
+          "dtype=bfloat16":    { "msg_size<=1048576": { "algorithm=direct": {} },
+                                 "msg_size=any":      { "comm_size<=2":   { "algorithm=ring":         {} },
+                                                        "comm_size=pow2": { "algorithm=rabenseifner": {} },
+                                                        "comm_size=any":  { "algorithm=ring":         {} } } },
+          "msg_size<=4194304": { "algorithm=direct": {} },
+          "comm_size<=2":      { "algorithm=ring":         {} },
+          "comm_size=pow2":    { "algorithm=rabenseifner": {} },
+          "comm_size=any":     { "algorithm=ring":         {} }
+        },
+        "comm_size<=64": {
+          "dtype=float16":     { "msg_size<=1048576": { "algorithm=direct": {} },
+                                 "msg_size=any":      { "comm_size=pow2": { "algorithm=rabenseifner": {} },
+                                                        "comm_size<=16":  { "algorithm=ring":         {} },
+                                                        "comm_size=any":  { "algorithm=direct":       {} } } },
+          "dtype=bfloat16":    { "msg_size<=4194304": { "algorithm=direct": {} },
+                                 "msg_size=any":      { "comm_size=pow2": { "algorithm=rabenseifner": {} },
+                                                        "comm_size<=16":  { "algorithm=ring":         {} },
+                                                        "comm_size=any":  { "algorithm=direct":       {} } } },
+          "msg_size<=4194304": { "algorithm=direct": {} },
+          "comm_size=pow2":    { "algorithm=rabenseifner": {} },
+          "comm_size<=16":     { "algorithm=ring":         {} },
+          "comm_size=any":     { "algorithm=direct":       {} }
+        },
+        "transport=ofi": {
+          "dtype=float16":     { "msg_size<=1048576": { "algorithm=direct": {} },
+                                 "msg_size=any":      { "comm_size=pow2": { "algorithm=rabenseifner": {} },
+                                                        "comm_size=any":  { "algorithm=direct":       {} } } },
+          "msg_size<=4194304": { "algorithm=direct":       {} },
+          "comm_size=pow2":    { "algorithm=rabenseifner": {} },
+          "comm_size=any":     { "algorithm=direct":       {} }
+        },
+        "comm_size=any": { "algorithm=direct": {} }
+      }
+    }
+  },
+
+  "collective=reduce_scatter": {
+    "_note": "Scaleup thresholds use send_msg_size (recv_count x p2p ranks), as the C++ gates do.",
+    "p2p_domain=any": {
+      "phase=scaleup": {
+        "is_arc=yes": {
+          "is_multi_thread=yes":    { "protocol=sycl_ll":     { "algorithm=ring":  { "ll_table=oneshot:0-256;ring:257-max": {} } } },
+          "has_p2p_access=no":      { "protocol=sycl_ll":     { "algorithm=ring":  { "ll_table=oneshot:0-256;ring:257-max": {} } } },
+          "send_msg_size<=8388608": { "protocol=sycl_ll":     { "algorithm=ring":  { "ll_table=oneshot:0-256;ring:257-max": {} } } },
+          "msg_size=any":           { "protocol=sycl_simple": { "algorithm=large": {} } }
+        },
+        "is_arc=no": {
+          "send_msg_size<=2097152": { "protocol=sycl_simple": { "algorithm=small": {} } },
+          "msg_size=any":           { "protocol=sycl_simple": { "algorithm=large": {} } }
+        }
+      },
+      "phase=scaleout": {
+        "_note": "The 1 MB direct threshold is the same for every dtype. Above 16 ranks every transport ends up direct.",
+        "is_recording=yes":  { "algorithm=direct": {} },
+        "msg_size<=1048576": { "algorithm=direct": {} },
+        "comm_size<=16":     { "algorithm=ring":   {} },
+        "comm_size=any":     { "algorithm=direct": {} }
+      }
+    }
+  },
+
+  "collective=broadcast": {
+    "p2p_domain=any": {
+      "phase=scaleup": {
+        "is_arc=yes": {
+          "is_recording=yes":    { "protocol=sycl_ll":     { "algorithm=ring":  {} } },
+          "is_multi_thread=yes": { "protocol=sycl_ll":     { "algorithm=ring":  {} } },
+          "msg_size<=524288":    { "protocol=sycl_ll":     { "algorithm=ring":  {} } },
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large": {} } }
+        },
+        "is_arc=no": {
+          "msg_size<=524288":  { "protocol=sycl_simple": { "algorithm=small": {} } },
+          "msg_size=any":      { "protocol=sycl_simple": { "algorithm=large": {} } }
+        }
+      },
+      "phase=scaleout": {
+        "_note": "scatter_allgather is off by default (CCL_SYCL_BROADCAST_SCATTER_ALLGATHER_ENABLE=0).",
+        "msg_size=any": { "algorithm=direct": {} }
+      }
+    }
+  },
+
+  "collective=reduce": {
+    "p2p_domain=any": {
+      "phase=scaleup": {
+        "is_arc=yes":   { "protocol=sycl_ll": { "algorithm=ring": {} } }
+      },
+      "phase=scaleout": {
+        "msg_size=any": { "algorithm=direct": {} }
+      }
+    }
+  },
+
+  "collective=scatter": {
+    "p2p_domain=any": {
+      "phase=scaleup": {
+        "msg_size<=524288": { "protocol=sycl_simple": { "algorithm=small": {} } },
+        "msg_size=any":     { "protocol=sycl_simple": { "algorithm=large": {} } }
+      },
+      "phase=scaleout": {
+        "msg_size<=131072": { "algorithm=direct":            {} },
+        "msg_size=any":     { "algorithm=scatter_two_phase": {} }
+      }
+    }
+  },
+
+  "collective=alltoall": {
+    "p2p_domain=any": {
+      "phase=scaleup": {
+        "is_arc=yes": {
+          "is_multi_thread=yes": { "protocol=sycl_ll":     { "algorithm=ring":  {} } },
+          "has_p2p_access=no":   { "protocol=sycl_ll":     { "algorithm=ring":  {} } },
+          "msg_size<=524288":    { "protocol=sycl_ll":     { "algorithm=ring":  {} } },
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large": {} } }
+        },
+        "is_arc=no": {
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large": {} } }
+        }
+      },
+      "phase=scaleout": {
+        "is_recording=yes":    { "algorithm=direct": {} },
+        "direct_gpu_rdma=yes": { "msg_size<=268435456": { "algorithm=scatter":           {} },
+                                 "msg_size=any":        { "algorithm=gdr_only_pairwise": {} } },
+        "msg_size=any":        { "algorithm=direct": {} }
+      }
+    }
+  },
+
+  "collective=alltoallv": {
+    "p2p_domain=any": {
+      "phase=scaleup": {
+        "is_arc=yes": {
+          "is_multi_thread=yes": { "protocol=sycl_ll":     { "algorithm=ring":  {} } },
+          "has_p2p_access=no":   { "protocol=sycl_ll":     { "algorithm=ring":  {} } },
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large": {} } }
+        },
+        "is_arc=no": {
+          "msg_size=any":        { "protocol=sycl_simple": { "algorithm=large": {} } }
+        }
+      },
+      "phase=scaleout": {
+        "is_recording=yes":    { "algorithm=direct": {} },
+        "direct_gpu_rdma=yes": { "msg_size<=268435456": { "algorithm=scatter":           {} },
+                                 "msg_size=any":        { "algorithm=gdr_only_pairwise": {} } },
+        "msg_size=any":        { "algorithm=direct": {} }
+      }
+    }
+  }
+}

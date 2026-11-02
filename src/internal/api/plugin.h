@@ -37,9 +37,21 @@ typedef enum onecclPluginCall {
     ONECCL_PLUGIN_PLATFORM_SCORE,
     ONECCL_PLUGIN_MEM_ALLOC,
     ONECCL_PLUGIN_MEM_FREE,
+    ONECCL_PLUGIN_GET_PEER_DEVICE_POINTER,
+    ONECCL_PLUGIN_GET_LSA_DEVICE_POINTER,
+    ONECCL_PLUGIN_GET_LOCAL_DEVICE_POINTER,
 } onecclPluginCall_t;
 
 // Typedef for the only plugin entrypoint
+//
+// Without CCL_PLUGIN, libccl.so.2 dlopen()s each bundled plugin, calls its
+// ONECCL_PLUGIN_INIT and ONECCL_PLUGIN_PLATFORM_SCORE, and selects the one
+// with the highest score. It dlclose()s every other plugin, with no finalize
+// call: a plugin must not leave behind anything that outlives its library.
+// A score of 0 or less means the plugin is never selected automatically.
+// Selection holds a lock: INIT and PLATFORM_SCORE must not wait for another
+// thread that calls the oneCCL API, or the process deadlocks. A call on the
+// same thread fails with onecclError.
 typedef void *(*onecclPluginEntrypoint_t)(onecclPluginCall_t call_type);
 
 // Typedefs for plugin calls
@@ -54,6 +66,12 @@ typedef onecclResult_t (*onecclPluginCallGroupEnd_t)();
 typedef onecclResult_t (*onecclPluginCallPlatformScore_t)(int *score_ptr);
 typedef onecclResult_t (*onecclPluginCallMemAlloc_t)(void **ptr, size_t size);
 typedef onecclResult_t (*onecclPluginCallMemFree_t)(void *ptr);
+typedef onecclResult_t (*onecclPluginCallGetPeerDevicePointer_t)(
+    onecclWindow_t window, size_t offset, int peer, void **out_ptr);
+typedef onecclResult_t (*onecclPluginCallGetLsaDevicePointer_t)(
+    onecclWindow_t window, size_t offset, int lsa_peer, void **out_ptr);
+typedef onecclResult_t (*onecclPluginCallGetLocalDevicePointer_t)(
+    onecclWindow_t window, size_t offset, void **out_ptr);
 
 // Structure holding pointers to the plugin's implementation functions
 typedef struct onecclPlugin {

@@ -1,20 +1,37 @@
+# The CODEOWNERS of the published repository, installed into .github/ by
+# publish_to_uxl.sh.
+#
+# It is kept here, outside .github/, on purpose. GitHub reads CODEOWNERS only
+# from the repository root, .github/ and docs/, so a copy under scripts/ is
+# inert internally. That matters: 4e5bef87a removed the live internal
+# CODEOWNERS because its unanchored patterns auto-requested two reviewers on
+# nearly every internal PR, and GitHub offers no way to keep the file and
+# suppress that. scripts/ is on publish_excludes.txt, so this template never
+# publishes itself either.
+#
+# Differences from the copy it was taken from: every pattern is anchored with a
+# leading / so it stops matching at any depth, and @shaykz is dropped because
+# GitHub rejects him as an unknown owner on the public repo for lack of write
+# access. Every other owner is kept -- a release PR needs two approvals, so
+# shrinking the approver pool is not free.
+
 # Documentation owners and reviewers
-doc/        @Maria1Petrova @maciekpac @jbrosenz @pmeltsin @moshe-roden
-*.md        @Maria1Petrova @maciekpac @jbrosenz @pmeltsin @moshe-roden
-man/         @maciekpac @jbrosenz @pmeltsin @moshe-roden
+/doc/        @Maria1Petrova @maciekpac @jbrosenz @pmeltsin @moshe-roden
+/doc/**/*.md        @Maria1Petrova @maciekpac @jbrosenz @pmeltsin @moshe-roden
+/man/         @maciekpac @jbrosenz @pmeltsin @moshe-roden
 
 # TTP files
 third-party*    @Maria1Petrova @maciekpac @jbrosenz @pmeltsin @moshe-roden
 
 # Tests & examples
-tests/    @jbrosenz @maciekpac @Maria1Petrova @pmeltsin @moshe-roden @shaykz
-examples/    @jbrosenz @maciekpac @Maria1Petrova @pmeltsin @moshe-roden @shaykz
+/tests/    @jbrosenz @maciekpac @Maria1Petrova @pmeltsin @moshe-roden
+/examples/    @jbrosenz @maciekpac @Maria1Petrova @pmeltsin @moshe-roden
 
 # Infrastructure and tools
-.github/    @jbrosenz @maciekpac @Maria1Petrova @zhenggb72 @pmeltsin @moshe-roden @shaykz
+/.github/    @jbrosenz @maciekpac @Maria1Petrova @zhenggb72 @pmeltsin @moshe-roden
 
 # Build & dev infrastructure
-cmake/    @zhenggb72 @jbrosenz @maciekpac @pmeltsin @moshe-roden @shaykz
+/cmake/    @zhenggb72 @jbrosenz @maciekpac @pmeltsin @moshe-roden
 
 # C++ code
-src/    @zhenggb72 @jbrosenz @maciekpac @pmeltsin @moshe-roden @shaykz
+/src/    @zhenggb72 @jbrosenz @maciekpac @pmeltsin @moshe-roden
