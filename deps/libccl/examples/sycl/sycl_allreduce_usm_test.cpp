@@ -623,26 +623,18 @@ int main(int argc, char *argv[]) {
     auto stream = ccl::create_stream(q);
 
     /* check skip conditions */
-    bool skip_case = false;
-    const char *esimd_env = std::getenv("CCL_SYCL_ESIMD");
-    if (esimd_env && std::string(esimd_env) == "1") {
-        skip_case = true;
-    }
     /* CCL_TEST_SKIP_PROD_MIN_MAX skips only prod/min/max while leaving sum/avg and the
        custom_sum (pre_mul_sum) check enabled. Used to test paths whose underlying kernel
        only supports SUM (e.g. arc_allreduce) without disabling custom-pre-op coverage. */
-    bool skip_prod_min_max = skip_case;
+    bool skip_prod_min_max = false;
     const char *skip_prod_min_max_env = std::getenv("CCL_TEST_SKIP_PROD_MIN_MAX");
     if (skip_prod_min_max_env && std::string(skip_prod_min_max_env) == "1") {
         skip_prod_min_max = true;
     }
     /* Diagnostic: confirm test-side env vars actually reach the spawned MPI processes. */
-    std::cout << "[TEST_ENV] CCL_SYCL_ESIMD="
-              << (esimd_env ? esimd_env : "(unset)")
-              << ", CCL_TEST_SKIP_PROD_MIN_MAX="
+    std::cout << "[TEST_ENV] CCL_TEST_SKIP_PROD_MIN_MAX="
               << (skip_prod_min_max_env ? skip_prod_min_max_env : "(unset)")
-              << " -> skip_case=" << skip_case
-              << ", skip_prod_min_max=" << skip_prod_min_max << "\n";
+              << " -> skip_prod_min_max=" << skip_prod_min_max << "\n";
 
     /* run examples */
     int ret = 0;
@@ -689,33 +681,31 @@ int main(int argc, char *argv[]) {
     if (ret == -1)
         return -1;
 
-    if (!skip_case) {
-        try {
-            ret =
-                custom_sum_reduction(q, comm, stream, allocator, usm_alloc_type, size, rank, count);
+    try {
+        ret =
+            custom_sum_reduction(q, comm, stream, allocator, usm_alloc_type, size, rank, count);
+    }
+    catch (ccl::exception &e) {
+        std::string exception_msg(e.what());
+        std::string check_msg("user-defined reduction operation");
+        if (exception_msg.find(check_msg) != std::string::npos) {
+            std::cout
+                << "SKIP: user-defined reduction operation is not supported for the scheduler path."
+                << std::endl;
+            ret = 0;
         }
-        catch (ccl::exception &e) {
-            std::string exception_msg(e.what());
-            std::string check_msg("user-defined reduction operation");
-            if (exception_msg.find(check_msg) != std::string::npos) {
-                std::cout
-                    << "SKIP: user-defined reduction operation is not supported for the scheduler path."
-                    << std::endl;
-                ret = 0;
-            }
-            else {
-                std::cout << e.what() << std::endl;
-                std::cout << "FAILED\n";
-                return -1;
-            }
-        }
-        catch (...) {
+        else {
+            std::cout << e.what() << std::endl;
             std::cout << "FAILED\n";
             return -1;
         }
-        if (ret == -1)
-            return -1;
     }
+    catch (...) {
+        std::cout << "FAILED\n";
+        return -1;
+    }
+    if (ret == -1)
+        return -1;
 
     return 0;
 }

@@ -48,6 +48,20 @@ inline const std::string ccl_coll_algorithm_to_str(int algo) {
     return std::to_string(algo);
 }
 
+// Template specialization for size_t, e.g. the byte counts of CCL_SYCL_<COLL>_SIMPLE_CHUNK_SIZE.
+template <>
+inline const std::string ccl_coll_algorithm_to_str(size_t algo) {
+    return std::to_string(algo);
+}
+
+// Template specialization for std::string: identity. Allows
+// fill_table_from_str / get_value_from_table to be reused for envs whose
+// "algo names" are free-form tokens (e.g. CCL_SYCL_ALLREDUCE_LL).
+template <>
+inline const std::string ccl_coll_algorithm_to_str(std::string algo) {
+    return algo;
+}
+
 template <typename algo_group_type>
 inline algo_group_type ccl_coll_algorithm_from_str(const std::string& str) {
     return ccl_algorithm_selector_helper<algo_group_type>::algo_from_str(str);
@@ -57,6 +71,23 @@ inline algo_group_type ccl_coll_algorithm_from_str(const std::string& str) {
 template <>
 inline int ccl_coll_algorithm_from_str(const std::string& str) {
     return std::stoi(str);
+}
+
+// Template specialization for size_t: a decimal count. std::stoull alone would accept "-1",
+// "12abc" and leading spaces; it throws std::out_of_range above 64 bits.
+template <>
+inline size_t ccl_coll_algorithm_from_str(const std::string& str) {
+    CCL_THROW_IF_NOT(!str.empty() && str.find_first_not_of("0123456789") == std::string::npos,
+                     "'",
+                     str,
+                     "' is not a non-negative count");
+    return std::stoull(str);
+}
+
+// Template specialization for std::string: identity (see comment above).
+template <>
+inline std::string ccl_coll_algorithm_from_str(const std::string& str) {
+    return str;
 }
 
 #define CCL_SELECTION_DEFINE_HELPER_METHODS( \
@@ -129,6 +160,10 @@ std::map<ccl_coll_bcast_algo, std::string>
 template <>
 std::map<ccl_coll_broadcast_algo, std::string>
     ccl_algorithm_selector_helper<ccl_coll_broadcast_algo>::algo_names;
+
+template <>
+std::map<ccl_coll_gather_algo, std::string>
+    ccl_algorithm_selector_helper<ccl_coll_gather_algo>::algo_names;
 
 template <>
 std::map<ccl_coll_reduce_algo, std::string>

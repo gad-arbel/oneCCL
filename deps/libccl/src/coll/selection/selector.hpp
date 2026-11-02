@@ -20,6 +20,7 @@
 #include "coll/coll.hpp"
 #include "common/global/global.hpp"
 
+#include <cstdint>
 #include <map>
 #include <string>
 
@@ -128,6 +129,7 @@ CCL_SELECTION_DECLARE_ALGO_SELECTOR(ccl_coll_alltoallv, ccl_coll_alltoallv_algo)
 CCL_SELECTION_DECLARE_ALGO_SELECTOR(ccl_coll_barrier, ccl_coll_barrier_algo);
 CCL_SELECTION_DECLARE_ALGO_SELECTOR(ccl_coll_bcast, ccl_coll_bcast_algo);
 CCL_SELECTION_DECLARE_ALGO_SELECTOR(ccl_coll_broadcast, ccl_coll_broadcast_algo);
+CCL_SELECTION_DECLARE_ALGO_SELECTOR(ccl_coll_gather, ccl_coll_gather_algo);
 CCL_SELECTION_DECLARE_ALGO_SELECTOR(ccl_coll_recv, ccl_coll_recv_algo);
 CCL_SELECTION_DECLARE_ALGO_SELECTOR(ccl_coll_reduce, ccl_coll_reduce_algo);
 CCL_SELECTION_DECLARE_ALGO_SELECTOR(ccl_coll_reduce_scatter, ccl_coll_reduce_scatter_algo);

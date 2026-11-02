@@ -19,6 +19,7 @@
 #include "coll/reduction/reduction.hpp"
 #include "coll/group/group.hpp"
 #include "common/log/log.hpp"
+#include "proxy/proxy.hpp"
 
 bool can_use_sycl_kernels(const ccl_selector_param& param) {
 // TODO: mitigate overhead added by can_use_sycl_kernels
@@ -27,9 +28,13 @@ bool can_use_sycl_kernels(const ccl_selector_param& param) {
 #else // CCL_ENABLE_SYCL
     return false;
 #endif // CCL_ENABLE_SYCL
-    auto supported_colls = { ccl_coll_allgather, ccl_coll_allgatherv, ccl_coll_alltoall,
-                             ccl_coll_allreduce, ccl_coll_broadcast,  ccl_coll_reduce_scatter,
-                             ccl_coll_barrier,   ccl_coll_send,       ccl_coll_recv };
+
+    auto supported_colls = { ccl_coll_allgather,      ccl_coll_allgatherv, ccl_coll_alltoall,
+                             ccl_coll_alltoallv,      ccl_coll_allreduce,  ccl_coll_broadcast,
+                             ccl_coll_reduce_scatter, ccl_coll_barrier,    ccl_coll_send,
+                             ccl_coll_recv,           ccl_coll_reduce,     ccl_coll_scatter,
+                             ccl_coll_gather };
+
     RETURN_FALSE_IF(!checkers::is_coll_supported(supported_colls, param.ctype),
                     "coll is not supported");
 
@@ -40,6 +45,19 @@ bool can_use_sycl_kernels(const ccl_selector_param& param) {
                          (param.peer_rank == CCL_INVALID_PEER_RANK_IDX),
                      "unexpected peer_rank value");
     CCL_THROW_IF_NOT(!param.is_scaleout, "unexpected is_scaleout value");
+
+    // Ahead of the multi-thread shortcut on purpose: that shortcut returns early,
+    // so an explicit CCL_GATHER would otherwise be ignored for a multi-thread
+    // communicator and the SYCL kernels would run against the user's request.
+    if (param.ctype == ccl_coll_gather) {
+        RETURN_FALSE_IF(!ccl::global_data::env().gather_algo_raw.empty() &&
+                            ccl::global_data::env().gather_algo_raw != "topo",
+                        "algo of coll: ",
+                        ccl_coll_type_to_str(param.ctype),
+                        " is specified explicitly as: ",
+                        ccl::global_data::env().gather_algo_raw,
+                        " not supported");
+    }
 
     // TODO: it is incorrect and should be revisited
     if (param.comm->is_multi_thread_instance() == true) {
@@ -113,7 +131,7 @@ bool can_use_sycl_kernels(const ccl_selector_param& param) {
     if (param.ctype != ccl_coll_allreduce && param.ctype != ccl_coll_allgatherv &&
         param.ctype != ccl_coll_allgather && param.ctype != ccl_coll_reduce_scatter &&
         param.ctype != ccl_coll_recv && param.ctype != ccl_coll_send &&
-        param.ctype != ccl_coll_alltoall) {
+        param.ctype != ccl_coll_alltoall && param.ctype != ccl_coll_alltoallv) {
         RETURN_FALSE_IF(!param.comm->get_topo_manager().has_p2p_access(),
                         "no p2p access between devices");
     }
@@ -179,6 +197,28 @@ bool can_use_sycl_kernels(const ccl_selector_param& param) {
                         " not supported");
     }
 
+    // Conditions specific to alltoallv
+    if (param.ctype == ccl_coll_alltoallv) {
+        RETURN_FALSE_IF(!ccl::global_data::env().alltoallv_algo_raw.empty() &&
+                            ccl::global_data::env().alltoallv_algo_raw != "topo",
+                        "algo of coll: ",
+                        ccl_coll_type_to_str(param.ctype),
+                        " is specified explicitly as: ",
+                        ccl::global_data::env().alltoallv_algo_raw,
+                        " not supported");
+    }
+
+    // Conditions specific to scatter
+    if (param.ctype == ccl_coll_scatter) {
+        RETURN_FALSE_IF(!ccl::global_data::env().scatter_algo_raw.empty() &&
+                            ccl::global_data::env().scatter_algo_raw != "topo",
+                        "algo of coll: ",
+                        ccl_coll_type_to_str(param.ctype),
+                        " is specified explicitly as: ",
+                        ccl::global_data::env().scatter_algo_raw,
+                        " not supported");
+    }
+
     // Conditions specific to broadcast
     if (param.ctype == ccl_coll_broadcast) {
         RETURN_FALSE_IF(!ccl::global_data::env().broadcast_algo_raw.empty() &&
@@ -188,12 +228,6 @@ bool can_use_sycl_kernels(const ccl_selector_param& param) {
                         " is specified explicitly as: ",
                         ccl::global_data::env().broadcast_algo_raw,
                         " not supported");
-#ifdef CCL_ENABLE_ESIMD
-        if (ccl::global_data::env().sycl_esimd) {
-            LOG_DEBUG(
-                "ESIMD kernels are not implemented for broadcast, so SYCL kernels path is selected");
-        }
-#endif // CCL_ENABLE_ESIMD
     }
 
     // Conditions specific to reduce_scatter
@@ -226,10 +260,6 @@ bool can_use_sycl_kernels(const ccl_selector_param& param) {
         CCL_ASSERT(param.comm->get_node_comm()->size() < local_proc_count);
         RETURN_FALSE_IF(!ccl::global_data::env().sycl_sub_communicator,
                         "SYCL kernels are not enabled for sub-communicators");
-#ifdef CCL_ENABLE_ESIMD
-        RETURN_FALSE_IF(ccl::global_data::env().sycl_esimd,
-                        "SYCL ESIMD kernels are not enabled for sub-communicators");
-#endif // CCL_ENABLE_ESIMD
     }
 
     if (checkers::is_unknown_device_family(param)) {
@@ -246,7 +276,7 @@ bool can_use_sycl_kernels(const ccl_selector_param& param) {
 
         // Only fallback when it's scale-out AND not group_api
         RETURN_FALSE_IF(
-            !(rank_in_node_comm && peer_rank_in_node_comm) && !group_impl::is_group_active,
+            !(rank_in_node_comm && peer_rank_in_node_comm) && !group_impl::is_group_active(),
             "it is non-group api and peer_rank must be on the same node as own rank is: comm_rank: ",
             param.comm->rank(),
             ", peer_rank: ",
@@ -288,18 +318,21 @@ bool can_use_sycl_kernels(const ccl_selector_param& param) {
     return true;
 }
 
-size_t allreduce_select_chunk_size(allreduce_scaleout_algo algo, size_t size, size_t comm_size) {
+size_t sycl_scaleout_selector::allreduce_chunk_size(ccl::sycl_policy::scaleout_algo algo, size_t size, size_t comm_size) {
     // read defaults and user input
     size_t max_pipeline_chunk_size = ccl::global_data::env().sycl_max_pipeline_chunk_size;
     ssize_t env_pipeline_chunk_size = ccl::global_data::env().sycl_pipeline_chunk_size;
-    size_t auto_pipeline_chunk_size = 2 * 1024 * 1024;
+    size_t auto_pipeline_chunk_size = ccl::sycl_policy::default_pipeline_chunk_size;
     // respect user input
     if (env_pipeline_chunk_size != CCL_ENV_SIZET_NOT_SPECIFIED) {
         return std::min((size_t)env_pipeline_chunk_size, max_pipeline_chunk_size);
     }
-    // auto tuning, based on the latest perf measurements
+    // auto tuning, based on the latest perf measurements. Every enumerator
+    // is listed explicitly so a new value trips -Wswitch instead of silently
+    // taking the 2 MB default.
+    using ccl::sycl_policy::scaleout_algo;
     switch (algo) {
-        case allreduce_scaleout_algo::rabenseifner:
+        case scaleout_algo::rabenseifner:
             if (size >= 1024L * 1024 * 1024)
                 auto_pipeline_chunk_size = 32 * 1024 * 1024;
             else if (size >= 256L * 1024 * 1024)
@@ -307,7 +340,7 @@ size_t allreduce_select_chunk_size(allreduce_scaleout_algo algo, size_t size, si
             else
                 auto_pipeline_chunk_size = 8 * 1024 * 1024;
             break;
-        case allreduce_scaleout_algo::ring:
+        case scaleout_algo::ring:
             if (size >= 1024L * 1024 * 1024)
                 auto_pipeline_chunk_size = 32 * 1024 * 1024;
             else if (size >= 256L * 1024 * 1024)
@@ -315,45 +348,52 @@ size_t allreduce_select_chunk_size(allreduce_scaleout_algo algo, size_t size, si
             else
                 auto_pipeline_chunk_size = comm_size <= 8 ? 4 * 1024 * 1024 : 8 * 1024 * 1024;
             break;
-        case allreduce_scaleout_algo::direct:
-            LOG_WARN("direct alogrithm is not supporting pipeline chunk size tuning");
+        case scaleout_algo::direct:
+            LOG_WARN("direct algorithm is not supporting pipeline chunk size tuning");
+            break;
+        // Algos that don't use pipeline_chunk_size — enumerate rather than
+        // fall through to a `default:` so a future value forces a decision.
+        case scaleout_algo::scatter_two_phase:
+        case scaleout_algo::gdr_only_pairwise:
+        case scaleout_algo::scatter:
+        case scaleout_algo::numa_gdr_split:
+        case scaleout_algo::non_sycl:
+        case scaleout_algo::scatter_allgather:
             break;
     }
     // error protection
     return std::min(auto_pipeline_chunk_size, max_pipeline_chunk_size);
 }
 
-static sycl_allreduce_tune_attr allreduce_select_large_algorithm(size_t size, size_t comm_size) {
-    if (is_pof2(comm_size)) {
+static sycl_scaleout_tune_attr allreduce_select_large_algorithm(size_t size, size_t comm_size) {
+    // rabenseifner needs to copy send buf to recv buf in the case of
+    // out-of-place, so ring is better
+    if (is_pof2(comm_size) && comm_size > 2) {
         size_t raben_chunk_size =
-            allreduce_select_chunk_size(allreduce_scaleout_algo::rabenseifner, size, comm_size);
-        return { allreduce_scaleout_algo::rabenseifner, raben_chunk_size };
+            sycl_scaleout_selector::allreduce_chunk_size(ccl::sycl_policy::scaleout_algo::rabenseifner, size, comm_size);
+        return sycl_scaleout_tune_attr{ ccl::sycl_policy::scaleout_algo::rabenseifner,
+                                        raben_chunk_size };
     }
     // TODO: do the performance analysis of larger scale ring problems
     if (comm_size <= 16) {
         size_t ring_chunk_size =
-            allreduce_select_chunk_size(allreduce_scaleout_algo::ring, size, comm_size);
-        return { allreduce_scaleout_algo::ring, ring_chunk_size };
+            sycl_scaleout_selector::allreduce_chunk_size(ccl::sycl_policy::scaleout_algo::ring, size, comm_size);
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::ring, ring_chunk_size};
     }
     // no other choices left
     // TODO: for OFI case, we shouldn't select direct, but fallback
     // to the scheduler. Currently, in case of OFI transport,
     // we fallback to the scheduler at the very beginning of scale-out func.
-    return { allreduce_scaleout_algo::direct };
+    return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
 }
 
 // TODO: collect larger scale to enable >64 nodes selection
-static sycl_allreduce_tune_attr allreduce_auto_select_tune_attr(size_t size,
+static sycl_scaleout_tune_attr allreduce_auto_select_tune_attr(size_t size,
                                                                 size_t comm_size,
                                                                 ccl_datatype ccl_dtype,
                                                                 bool is_recording) {
     if (is_recording) {
-        if (ccl::global_data::env().atl_transport != ccl_atl_ofi) {
-            return { allreduce_scaleout_algo::direct };
-        }
-        else {
-            CCL_THROW("ofi transport does not support scaleout recording");
-        }
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
     }
     // small message size
     // direct is the best option based on the latest perf results
@@ -361,25 +401,25 @@ static sycl_allreduce_tune_attr allreduce_auto_select_tune_attr(size_t size,
     if (ccl_dtype == ccl::datatype::float16) {
         // half precision data types: fp16
         if (comm_size <= 8 && size <= 512 * 1024) {
-            return { allreduce_scaleout_algo::direct };
+            return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
         }
         if (comm_size > 8 && size <= 1024 * 1024) {
-            return { allreduce_scaleout_algo::direct };
+            return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
         }
     }
     else if (ccl_dtype == ccl::datatype::bfloat16) {
         // half precision data types: bf16
         if (comm_size <= 8 && size <= 1024 * 1024) {
-            return { allreduce_scaleout_algo::direct };
+            return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
         }
         if (comm_size > 8 && size <= 4 * 1024 * 1024) {
-            return { allreduce_scaleout_algo::direct };
+            return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
         }
     }
     else {
         // full precision data types and other
         if (size <= 4 * 1024 * 1024) {
-            return { allreduce_scaleout_algo::direct };
+            return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
         }
     }
     // medium/large message size
@@ -388,7 +428,7 @@ static sycl_allreduce_tune_attr allreduce_auto_select_tune_attr(size_t size,
     }
     // default/other cases, larger scale
     if (ccl::global_data::env().atl_transport != ccl_atl_ofi) {
-        return { allreduce_scaleout_algo::direct };
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
     }
     else {
         return allreduce_select_large_algorithm(size, comm_size);
@@ -396,47 +436,51 @@ static sycl_allreduce_tune_attr allreduce_auto_select_tune_attr(size_t size,
 }
 
 // TODO: work on selection framework MLSL-3253
-sycl_allreduce_tune_attr allreduce_select_tune_attr(size_t size,
-                                                    size_t comm_size,
-                                                    ccl_datatype ccl_dtype,
-                                                    bool is_recording) {
+sycl_scaleout_tune_attr sycl_scaleout_selector::allreduce() const {
     if (ccl::global_data::env().sycl_allreduce_scaleout_algo == "auto") {
-        return allreduce_auto_select_tune_attr(size, comm_size, ccl_dtype, is_recording);
+        return allreduce_auto_select_tune_attr(size, comm_size, dtype, is_recording);
     }
     if (ccl::global_data::env().sycl_allreduce_scaleout_algo == "direct") {
-        return { allreduce_scaleout_algo::direct };
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
     }
-    if (is_recording) {
+    // The proxy variants of "ring" and "rabenseifner" run their exchange on the proxy
+    // thread instead of in a host task, so unlike the other non-"direct" algorithms
+    // they are recording-safe.
+    const bool algo_proxy =
+        (ccl::global_data::env().sycl_allreduce_scaleout_algo == "ring" ||
+         ccl::global_data::env().sycl_allreduce_scaleout_algo == "rabenseifner") &&
+        ccl::global_data::env().sycl_enable_allreduce_scaleout_proxy;
+    if (is_recording && !algo_proxy) {
         CCL_THROW("sycl graph scaleout does not support ring and rabenseifner algorithms");
     }
     if (ccl::global_data::env().sycl_allreduce_scaleout_algo == "rabenseifner") {
         size_t chunk_size =
-            allreduce_select_chunk_size(allreduce_scaleout_algo::rabenseifner, size, comm_size);
-        return { allreduce_scaleout_algo::rabenseifner, chunk_size };
+            sycl_scaleout_selector::allreduce_chunk_size(ccl::sycl_policy::scaleout_algo::rabenseifner, size, comm_size);
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::rabenseifner, chunk_size};
     }
     if (ccl::global_data::env().sycl_allreduce_scaleout_algo == "ring") {
         size_t chunk_size =
-            allreduce_select_chunk_size(allreduce_scaleout_algo::ring, size, comm_size);
-        return { allreduce_scaleout_algo::ring, chunk_size };
+            sycl_scaleout_selector::allreduce_chunk_size(ccl::sycl_policy::scaleout_algo::ring, size, comm_size);
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::ring, chunk_size};
     }
     CCL_THROW("unsupported selection");
 }
 
 // reduce-scatter
-size_t reduce_scatter_select_chunk_size(reduce_scatter_scaleout_algo algo,
+size_t sycl_scaleout_selector::reduce_scatter_chunk_size(ccl::sycl_policy::scaleout_algo algo,
                                         size_t size,
                                         size_t comm_size) {
     // read defaults and user input
     size_t max_pipeline_chunk_size = ccl::global_data::env().sycl_max_pipeline_chunk_size;
     ssize_t env_pipeline_chunk_size = ccl::global_data::env().sycl_pipeline_chunk_size;
-    size_t auto_pipeline_chunk_size = 2 * 1024 * 1024;
+    size_t auto_pipeline_chunk_size = ccl::sycl_policy::default_pipeline_chunk_size;
     // respect user input
     if (env_pipeline_chunk_size != CCL_ENV_SIZET_NOT_SPECIFIED) {
         return std::min((size_t)env_pipeline_chunk_size, max_pipeline_chunk_size);
     }
-    // auto tuning, based on the latest perf measurements
+    using ccl::sycl_policy::scaleout_algo;
     switch (algo) {
-        case reduce_scatter_scaleout_algo::ring:
+        case scaleout_algo::ring:
             if (comm_size >= 16)
                 auto_pipeline_chunk_size = 8 * 1024 * 1024;
             else if (comm_size >= 4)
@@ -444,40 +488,43 @@ size_t reduce_scatter_select_chunk_size(reduce_scatter_scaleout_algo algo,
             else
                 auto_pipeline_chunk_size = 2 * 1024 * 1024;
             break;
-        case reduce_scatter_scaleout_algo::direct:
-            LOG_WARN("direct alogrithm is not supporting pipeline chunk size tuning");
+        case scaleout_algo::direct:
+            LOG_WARN("direct algorithm is not supporting pipeline chunk size tuning");
+            break;
+        case scaleout_algo::rabenseifner:
+        case scaleout_algo::scatter_two_phase:
+        case scaleout_algo::gdr_only_pairwise:
+        case scaleout_algo::scatter:
+        case scaleout_algo::numa_gdr_split:
+        case scaleout_algo::non_sycl:
+        case scaleout_algo::scatter_allgather:
             break;
     }
     // error protection
     return std::min(auto_pipeline_chunk_size, max_pipeline_chunk_size);
 }
 
-static sycl_reduce_scatter_tune_attr reduce_scatter_select_large_algorithm(size_t size,
+static sycl_scaleout_tune_attr reduce_scatter_select_large_algorithm(size_t size,
                                                                            size_t comm_size) {
     // TODO: do the performance analysis of larger scale ring problems
     if (comm_size <= 16) {
         size_t ring_chunk_size =
-            reduce_scatter_select_chunk_size(reduce_scatter_scaleout_algo::ring, size, comm_size);
-        return { reduce_scatter_scaleout_algo::ring, ring_chunk_size };
+            sycl_scaleout_selector::reduce_scatter_chunk_size(ccl::sycl_policy::scaleout_algo::ring, size, comm_size);
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::ring, ring_chunk_size};
     }
     // no other choices left
     // TODO: for OFI case, we shouldn't select direct, but fallback
     // to the scheduler. Currently, in case of OFI transport,
     // we fallback to the scheduler at the very beginning of scale-out func.
-    return { reduce_scatter_scaleout_algo::direct };
+    return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
 }
 
-static sycl_reduce_scatter_tune_attr reduce_scatter_auto_select_tune_attr(size_t size,
+static sycl_scaleout_tune_attr reduce_scatter_auto_select_tune_attr(size_t size,
                                                                           size_t comm_size,
                                                                           ccl_datatype ccl_dtype,
                                                                           bool is_recording) {
     if (is_recording) {
-        if (ccl::global_data::env().atl_transport != ccl_atl_ofi) {
-            return { reduce_scatter_scaleout_algo::direct };
-        }
-        else {
-            CCL_THROW("ofi transport does not support scaleout recording");
-        }
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
     }
     // small message size
     // direct is the best option based on the latest perf results
@@ -486,25 +533,25 @@ static sycl_reduce_scatter_tune_attr reduce_scatter_auto_select_tune_attr(size_t
     if (ccl_dtype == ccl::datatype::float16) {
         // half precision data types: fp16
         if (comm_size <= 8 && size <= 1024 * 1024) {
-            return { reduce_scatter_scaleout_algo::direct };
+            return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
         }
         if (comm_size > 8 && size <= 1024 * 1024) {
-            return { reduce_scatter_scaleout_algo::direct };
+            return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
         }
     }
     else if (ccl_dtype == ccl::datatype::bfloat16) {
         // half precision data types: bf16
         if (comm_size <= 8 && size <= 1024 * 1024) {
-            return { reduce_scatter_scaleout_algo::direct };
+            return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
         }
         if (comm_size > 8 && size <= 1 * 1024 * 1024) {
-            return { reduce_scatter_scaleout_algo::direct };
+            return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
         }
     }
     else {
         // full precision data types and other
         if (size <= 1 * 1024 * 1024) {
-            return { reduce_scatter_scaleout_algo::direct };
+            return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
         }
     }
     //    }
@@ -514,87 +561,84 @@ static sycl_reduce_scatter_tune_attr reduce_scatter_auto_select_tune_attr(size_t
     }
     // default/other cases, larger scale
     if (ccl::global_data::env().atl_transport != ccl_atl_ofi) {
-        return { reduce_scatter_scaleout_algo::direct };
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
     }
     else {
         return reduce_scatter_select_large_algorithm(size, comm_size);
     }
 }
 
-sycl_reduce_scatter_tune_attr reduce_scatter_select_tune_attr(size_t size,
-                                                              size_t comm_size,
-                                                              ccl_datatype ccl_dtype,
-                                                              bool is_recording) {
+sycl_scaleout_tune_attr sycl_scaleout_selector::reduce_scatter() const {
     if (ccl::global_data::env().sycl_reduce_scatter_scaleout_algo == "auto") {
-        return reduce_scatter_auto_select_tune_attr(size, comm_size, ccl_dtype, is_recording);
+        return reduce_scatter_auto_select_tune_attr(size, comm_size, dtype, is_recording);
     }
     if (ccl::global_data::env().sycl_reduce_scatter_scaleout_algo == "direct") {
-        return { reduce_scatter_scaleout_algo::direct };
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
     }
-    if (is_recording) {
+    // The proxy variant of "ring" runs its exchange on the proxy thread instead of in a
+    // host task, so unlike the other non-"direct" algorithms it is recording-safe.
+    const bool ring_proxy = ccl::global_data::env().sycl_reduce_scatter_scaleout_algo == "ring" &&
+                            ccl::global_data::env().sycl_enable_reduce_scatter_scaleout_proxy;
+    if (is_recording && !ring_proxy) {
         CCL_THROW("sycl graph scaleout does not support ring and rabenseifner algorithms");
     }
     if (ccl::global_data::env().sycl_reduce_scatter_scaleout_algo == "ring") {
         size_t chunk_size =
-            reduce_scatter_select_chunk_size(reduce_scatter_scaleout_algo::ring, size, comm_size);
-        return { reduce_scatter_scaleout_algo::ring, chunk_size };
+            sycl_scaleout_selector::reduce_scatter_chunk_size(ccl::sycl_policy::scaleout_algo::ring, size, comm_size);
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::ring, chunk_size};
     }
     CCL_THROW("unsupported reduce-scatter algo selection");
 }
 
 // allgatherv
-static sycl_allgatherv_tune_attr allgatherv_auto_select_tune_attr(size_t size,
+static sycl_scaleout_tune_attr allgatherv_auto_select_tune_attr(size_t size,
                                                                   size_t comm_size,
                                                                   ccl_datatype ccl_dtype,
                                                                   bool is_recording) {
     if (is_recording) {
-        if (ccl::global_data::env().atl_transport != ccl_atl_ofi) {
-            return { allgatherv_scaleout_algo::direct };
-        }
-        else {
-            CCL_THROW("ofi transport does not support scaleout recording");
-        }
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
     }
 
     if (ccl::global_data::env().atl_transport != ccl_atl_mpi) {
-        return { allgatherv_scaleout_algo::ring };
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::ring};
     }
 
     // experimental values, should be reviewed later
     if (comm_size < 4 && (size < 512 * 1024 || size > 128 * 1024 * 1024) ||
         comm_size >= 4 && comm_size < 8 && (size < 2 * 1024 * 1024 || size > 32 * 1024 * 1024) ||
         comm_size >= 8 && (size < 2 * 1024 * 1024 || size > 9 * 1024 * 1024)) {
-        return { allgatherv_scaleout_algo::direct };
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
     }
     else {
         size_t chunk_size =
-            allgatherv_select_chunk_size(allgatherv_scaleout_algo::ring, size, comm_size);
-        return { allgatherv_scaleout_algo::ring, chunk_size };
+            sycl_scaleout_selector::allgatherv_chunk_size(ccl::sycl_policy::scaleout_algo::ring, size, comm_size);
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::ring, chunk_size};
     }
 }
 
-sycl_allgatherv_tune_attr allgatherv_select_tune_attr(size_t size,
-                                                      size_t comm_size,
-                                                      ccl_datatype ccl_dtype,
-                                                      bool is_recording) {
+sycl_scaleout_tune_attr sycl_scaleout_selector::allgatherv() const {
     if (ccl::global_data::env().sycl_allgatherv_scaleout_algo == "auto") {
-        return allgatherv_auto_select_tune_attr(size, comm_size, ccl_dtype, is_recording);
+        return allgatherv_auto_select_tune_attr(size, comm_size, dtype, is_recording);
     }
     if (ccl::global_data::env().sycl_allgatherv_scaleout_algo == "direct") {
-        return { allgatherv_scaleout_algo::direct };
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
     }
-    if (is_recording) {
+    // The proxy variant of "ring" runs its exchange on the proxy thread instead of in a
+    // host task, so unlike the other non-"direct" algorithms it is recording-safe.
+    const bool ring_proxy = ccl::global_data::env().sycl_allgatherv_scaleout_algo == "ring" &&
+                            ccl::global_data::env().sycl_enable_allgatherv_scaleout_proxy;
+    if (is_recording && !ring_proxy) {
         CCL_THROW("sycl graph scaleout does not support ring and rabenseifner algorithms");
     }
     if (ccl::global_data::env().sycl_allgatherv_scaleout_algo == "ring") {
         size_t chunk_size =
-            allgatherv_select_chunk_size(allgatherv_scaleout_algo::ring, size, comm_size);
-        return { allgatherv_scaleout_algo::ring, chunk_size };
+            sycl_scaleout_selector::allgatherv_chunk_size(ccl::sycl_policy::scaleout_algo::ring, size, comm_size);
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::ring, chunk_size};
     }
     CCL_THROW("unsupported allgatherv algo selection");
 }
 
-size_t allgatherv_select_chunk_size(allgatherv_scaleout_algo algo, size_t size, size_t comm_size) {
+size_t sycl_scaleout_selector::allgatherv_chunk_size(ccl::sycl_policy::scaleout_algo algo, size_t size, size_t comm_size) {
     // read defaults and user input
     size_t max_pipeline_chunk_size = ccl::global_data::env().sycl_max_pipeline_chunk_size;
     ssize_t env_pipeline_chunk_size = ccl::global_data::env().sycl_pipeline_chunk_size;
@@ -602,9 +646,10 @@ size_t allgatherv_select_chunk_size(allgatherv_scaleout_algo algo, size_t size, 
     if (env_pipeline_chunk_size != CCL_ENV_SIZET_NOT_SPECIFIED) {
         return std::min((size_t)env_pipeline_chunk_size, max_pipeline_chunk_size);
     }
-    size_t auto_pipeline_chunk_size = 2 * 1024 * 1024;
+    size_t auto_pipeline_chunk_size = ccl::sycl_policy::default_pipeline_chunk_size;
+    using ccl::sycl_policy::scaleout_algo;
     switch (algo) {
-        case allgatherv_scaleout_algo::ring:
+        case scaleout_algo::ring:
             if (size >= 128 * 1024 * 1024)
                 auto_pipeline_chunk_size = 64 * 1024 * 1024;
             else if (size >= 16 * 1024 * 1024)
@@ -612,8 +657,16 @@ size_t allgatherv_select_chunk_size(allgatherv_scaleout_algo algo, size_t size, 
             else
                 auto_pipeline_chunk_size = comm_size <= 8 ? 4 * 1024 * 1024 : 8 * 1024 * 1024;
             break;
-        case allgatherv_scaleout_algo::direct:
-            LOG_WARN("allgatherv direct alogrithm is not supporting pipeline chunk size tuning");
+        case scaleout_algo::direct:
+            LOG_WARN("allgatherv direct algorithm is not supporting pipeline chunk size tuning");
+            break;
+        case scaleout_algo::rabenseifner:
+        case scaleout_algo::scatter_two_phase:
+        case scaleout_algo::gdr_only_pairwise:
+        case scaleout_algo::scatter:
+        case scaleout_algo::numa_gdr_split:
+        case scaleout_algo::non_sycl:
+        case scaleout_algo::scatter_allgather:
             break;
     }
     // error protection
@@ -621,47 +674,130 @@ size_t allgatherv_select_chunk_size(allgatherv_scaleout_algo algo, size_t size, 
 }
 
 // alltoall
-static sycl_alltoall_tune_attr alltoall_auto_select_tune_attr(size_t size,
+static sycl_scaleout_tune_attr alltoall_auto_select_tune_attr(size_t size,
                                                               size_t comm_size,
-                                                              ccl_datatype ccl_dtype) {
+                                                              ccl_datatype ccl_dtype,
+                                                              bool is_recording) {
+    if (is_recording) {
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
+    }
     if (ccl::global_data::env().sycl_enable_direct_gpu_rdma) {
         // for BMG
         if (size <= 256 * 1024 * 1024)
-            return { alltoall_scaleout_algo::scatter };
+            return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::scatter};
         else
-            return { alltoall_scaleout_algo::gdr_only_pairwise };
+            return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::gdr_only_pairwise};
     }
 
-    if (ccl::global_data::env().atl_transport != ccl_atl_ofi) {
-        return { alltoall_scaleout_algo::direct };
-    }
-
-    return { alltoall_scaleout_algo::fallback };
+    return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
 }
 
-sycl_alltoall_tune_attr alltoall_select_tune_attr(size_t size,
-                                                  size_t comm_size,
-                                                  ccl_datatype ccl_dtype) {
+sycl_scaleout_tune_attr sycl_scaleout_selector::alltoall() const {
     if (ccl::global_data::env().sycl_alltoall_scaleout_algo == "auto") {
-        return alltoall_auto_select_tune_attr(size, comm_size, ccl_dtype);
+        return alltoall_auto_select_tune_attr(size, comm_size, dtype, is_recording);
     }
     if (ccl::global_data::env().sycl_alltoall_scaleout_algo == "direct") {
-        return { alltoall_scaleout_algo::direct };
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::direct};
     }
-    if (ccl::global_data::env().sycl_alltoall_scaleout_algo == "pairwise") {
-        return { alltoall_scaleout_algo::pairwise };
+    // The proxy variant of "scatter" runs its exchange on the proxy thread instead of in a
+    // host task, so unlike the other non-"direct" algorithms it is recording-safe.
+    const bool scatter_proxy = ccl::global_data::env().sycl_alltoall_scaleout_algo == "scatter" &&
+                               ccl::global_data::env().sycl_enable_alltoall_scaleout_proxy;
+    if (is_recording && !scatter_proxy) {
+        CCL_THROW("sycl graph scaleout does not support algorithms other than \"direct\"");
     }
     if (ccl::global_data::env().sycl_alltoall_scaleout_algo == "scatter") {
-        return { alltoall_scaleout_algo::scatter };
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::scatter};
     }
     if (ccl::global_data::env().sycl_alltoall_scaleout_algo == "gdr-only-pairwise") {
-        return { alltoall_scaleout_algo::gdr_only_pairwise };
-    }
-    if (ccl::global_data::env().sycl_alltoall_scaleout_algo == "numa-gdr-only") {
-        return { alltoall_scaleout_algo::numa_gdr_only };
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::gdr_only_pairwise};
     }
     if (ccl::global_data::env().sycl_alltoall_scaleout_algo == "numa-gdr-split") {
-        return { alltoall_scaleout_algo::numa_gdr_split };
+        return sycl_scaleout_tune_attr{ccl::sycl_policy::scaleout_algo::numa_gdr_split};
     }
     CCL_THROW("unsupported selection");
+}
+
+// scatter: `direct` runs the single-shot kernel, `scatter_two_phase` the
+// intra-node + chunked inter-node one.
+sycl_scaleout_tune_attr sycl_scaleout_selector::scatter() const {
+    return sycl_scaleout_tune_attr{
+        size <= ccl::global_data::env().sycl_scatter_scaleout_small_threshold
+            ? ccl::sycl_policy::scaleout_algo::direct
+            : ccl::sycl_policy::scaleout_algo::scatter_two_phase
+    };
+}
+
+// Scatter-AllGather only when enabled and above its size threshold.
+sycl_scaleout_tune_attr sycl_scaleout_selector::broadcast() const {
+    const auto& env = ccl::global_data::env();
+    const bool use_sag = env.sycl_broadcast_scatter_allgather_enable == 1 &&
+                         (env.sycl_broadcast_scatter_allgather_force ||
+                          size >= env.sycl_broadcast_scatter_allgather_threshold);
+    return sycl_scaleout_tune_attr{ use_sag ? ccl::sycl_policy::scaleout_algo::scatter_allgather
+                                            : ccl::sycl_policy::scaleout_algo::direct };
+}
+
+// Reduce has a single multi-node implementation.
+sycl_scaleout_tune_attr sycl_scaleout_selector::reduce() const {
+    return sycl_scaleout_tune_attr{ ccl::sycl_policy::scaleout_algo::direct };
+}
+
+// The smallest nonzero chunk size: the largest built-in datatype, so a chunk holds whole elements.
+static constexpr size_t simple_chunk_size_min = 8;
+
+simple_chunk_size_table_t parse_simple_chunk_size_spec(const char* env_name,
+                                                       const std::string& spec) {
+    simple_chunk_size_table_t table;
+    if (spec.empty()) {
+        return table;
+    }
+    try {
+        fill_table_from_str(spec, table);
+    }
+    catch (const std::out_of_range&) {
+        CCL_THROW(env_name, " chunk size does not fit in 64 bits, got: ", spec);
+    }
+    catch (const std::exception& e) {
+        CCL_THROW(env_name, ": ", e.what());
+    }
+    CCL_THROW_IF_NOT(table.find(0) != table.end() &&
+                         table.find(CCL_SELECTION_MAX_COLL_SIZE) != table.end(),
+                     env_name,
+                     " must cover all message sizes (0-max), got: ",
+                     spec);
+    size_t next = 0;
+    for (const auto& elem : table) {
+        // every range must start right after the previous one: a size in a gap
+        // would silently take the next range's value
+        const ccl_selection_border_type border = elem.second.second;
+        if (border != ccl_selection_border_right) { // left or both: a range starts here
+            CCL_THROW_IF_NOT(elem.first == next,
+                             env_name,
+                             " has no chunk size for sizes ",
+                             next,
+                             "-",
+                             elem.first - 1,
+                             ", got: ",
+                             spec);
+        }
+        if (border != ccl_selection_border_left) { // right or both: a range ends here
+            next = elem.first + 1;
+        }
+        const size_t chunk_size = elem.second.first;
+        CCL_THROW_IF_NOT(chunk_size == 0 || chunk_size >= simple_chunk_size_min,
+                         env_name,
+                         " chunk size must be 0 or at least ",
+                         simple_chunk_size_min,
+                         " bytes, got: ",
+                         chunk_size);
+    }
+    return table;
+}
+
+size_t select_simple_chunk_size(const simple_chunk_size_table_t& table, size_t msg_bytes) {
+    if (table.empty()) {
+        return 0;
+    }
+    return ccl_algorithm_selector_base<size_t>::get_value_from_table(msg_bytes, table);
 }

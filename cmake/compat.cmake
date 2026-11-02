@@ -7,12 +7,4 @@ if(WIN32)
 
     # Force gtest to use correct version of runtime libraries
     set(gtest_force_shared_crt ON CACHE BOOL on)
-
-    macro(install_symlink filepath sympath)
-    endmacro(install_symlink)
-else()
-    macro(install_symlink filepath sympath)
-        install(CODE "execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink ${filepath} ${sympath})")
-        install(CODE "message(\"-- Created symlink: ${sympath} -> ${filepath}\")")
-    endmacro(install_symlink)
 endif()

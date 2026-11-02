@@ -34,6 +34,9 @@ if (${CMAKE_PROJECT_NAME} STREQUAL ${PROJECT_NAME})
     if (COMPUTE_BACKEND)
         set_compute_backend(${COMMON_CMAKE_DIR})
     endif()
+    find_package(MPI REQUIRED)
+    # Installing onto itself with a build RPATH deletes the binary (#962).
+    set(CMAKE_SKIP_RPATH TRUE)
 endif()
 
 set(SERVICE_SRC
@@ -85,7 +88,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_COMPILER_FLAGS} -Wall -Wextra -Wno
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} ${CXX_COMPILER_FLAGS} -O0 -g -DENABLE_DEBUG")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} ${CXX_COMPILER_FLAGS} -O3")
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} ${CXX_COMPILER_FLAGS} -O2 -g")
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if (${CMAKE_C_COMPILER_ID} STREQUAL "Clang" AND ${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang" OR(${CMAKE_CXX_COMPILER_ID} STREQUAL "IntelLLVM"))
@@ -96,8 +99,6 @@ if (COMPUTE_BACKEND)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${COMPUTE_BACKEND_FLAGS}")
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${COMPUTE_BACKEND_LIBRARIES}")
 endif()
-
-link_directories(${EXAMPLES_LIB_DIRS})
 
 foreach(src ${sources})
     get_filename_component(executable ${src} NAME_WE)
@@ -117,13 +118,8 @@ foreach(src ${sources})
     target_link_libraries(${executable} PUBLIC rt)
     target_link_libraries(${executable} PUBLIC m)
     target_link_libraries(${executable} PUBLIC dl)
-    # w/a for case with 2 mpi libs, should be fixed
-    if (DEFINED ENV{I_MPI_ROOT})
-        set(I_MPI_ROOT "$ENV{I_MPI_ROOT}")
-    endif()
     target_link_libraries(${executable} PUBLIC ccl)
-    target_link_libraries(${executable} PUBLIC -L${I_MPI_ROOT}/lib/release/)
-    target_link_libraries(${executable} PUBLIC mpi)
+    target_link_libraries(${executable} PUBLIC MPI::MPI_CXX)
     target_link_libraries(${executable} PUBLIC ${COMPUTE_BACKEND_TARGET_NAME})
     install(TARGETS ${executable} RUNTIME DESTINATION ${CCL_INSTALL_TESTS} OPTIONAL)
     add_test (NAME ${executable} CONFIGURATIONS default COMMAND mpiexec.hydra -l -n 2 -ppn 1 ${CCL_INSTALL_TESTS}/${executable} --gtest_output=xml:${CCL_INSTALL_TESTS}/${executable}_default_report.junit.xml)
@@ -179,7 +175,11 @@ foreach(proc_map ${PROC_MAPS})
             add_test (NAME reduce_scatter_${algo}_${N}_${ppn} CONFIGURATIONS reduce_scatter_${algo}_${N}_${ppn} COMMAND mpiexec.hydra -l -n ${N} -ppn ${ppn} ${CCL_INSTALL_TESTS}/reduce_scatter_test --gtest_output=xml:${CCL_INSTALL_TESTS}/reduce_scatter_${algo}_${N}_${ppn}_report.junit.xml)
         endforeach()
 
-        foreach(algo naive)
+        foreach(algo direct; topo)
+            add_test (NAME gather_${algo}_${N}_${ppn} CONFIGURATIONS gather_${algo}_${N}_${ppn} COMMAND mpiexec.hydra -l -n ${N} -ppn ${ppn} ${CCL_INSTALL_TESTS}/gather_test --gtest_output=xml:${CCL_INSTALL_TESTS}/gather_${algo}_${N}_${ppn}_report.junit.xml)
+        endforeach()
+
+        foreach(algo naive; topo)
             add_test (NAME scatter_${algo}_${N}_${ppn} CONFIGURATIONS scatter_${algo}_${N}_${ppn} COMMAND mpiexec.hydra -l -n ${N} -ppn ${ppn} ${CCL_INSTALL_TESTS}/scatter_test --gtest_output=xml:${CCL_INSTALL_TESTS}/scatter_${algo}_${N}_${ppn}_report.junit.xml)
         endforeach()
 

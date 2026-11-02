@@ -73,6 +73,14 @@ prepend_path() (
   path_to_add="$1"
   path_is_now="$2"
 
+  # Remove path_to_add from path_is_now if it already exists (deduplication)
+  case ":${path_is_now}:" in
+    *":${path_to_add}:"*)
+      # Path already exists, remove it first
+      path_is_now=$(printf "%s" "${path_is_now}" | sed -e "s|:${path_to_add}:|:|g" -e "s|^${path_to_add}:||" -e "s|:${path_to_add}$||" -e "s|^${path_to_add}$||")
+      ;;
+  esac
+
   if [ "" = "${path_is_now}" ]; then   # avoid dangling ":"
     printf "%s" "${path_to_add}"
   else
@@ -144,8 +152,10 @@ do
 done
 
 ccl_configuration_path=""
+ccl_configuration_defaulted=""
 if [ -z "${ccl_configuration:-}" ]; then
     ccl_configuration="${DEFAULT_CONFIGURATION}"
+    ccl_configuration_defaulted="yes"
 elif [ "$ccl_configuration" = "cpu" ]; then
     ccl_configuration_path="ccl/cpu/lib"
 elif [ "$ccl_configuration" = "cpu_gpu_dpcpp" ]; then
@@ -187,6 +197,14 @@ if [ "$(basename "${WORK_DIR}")" = "env" ] ; then   # assume a 2023 layout
 
     CCL_ROOT="$(dirname "${WORK_DIR}")"
 
+    # A CPU-only build has no GPU libccl.so.1: without --ccl-configuration, select the cpu configuration
+    if [ "$ccl_configuration_defaulted" = "yes" ] && [ ! -e "${CCL_ROOT}/lib/libccl.so.1" ]; then
+        ccl_configuration="cpu"
+        ccl_configuration_path="ccl/cpu/lib"
+        CCL_CONFIGURATION="${ccl_configuration}"; export CCL_CONFIGURATION
+        CCL_CONFIGURATION_PATH="${ccl_configuration_path}"; export CCL_CONFIGURATION_PATH
+    fi
+
     if [ -z "${SETVARS_CALL:-}" ] ; then
         if [ "$ccl_bundled_mpi" = "yes" ] ; then
             if [ -f "$CCL_ROOT/../../mpi/latest/env/vars.sh" ] ; then
@@ -220,6 +238,13 @@ if [ "$(basename "${WORK_DIR}")" = "env" ] ; then   # assume a 2023 layout
     LIBRARY_PATH=$(prepend_path "${CCL_ROOT}/lib/${ccl_configuration_path}" "${LIBRARY_PATH:-}"); export LIBRARY_PATH
     LD_LIBRARY_PATH=$(prepend_path "${CCL_ROOT}/lib/${ccl_configuration_path}" "${LD_LIBRARY_PATH:-}"); export LD_LIBRARY_PATH
 
+    # Add the libfabric co-installed with MPI to library path for OFI transport.
+    # FI_PROVIDER_PATH is intentionally not set here: libccl derives it at runtime
+    # from the libfabric it actually loaded, and honors an existing value if set.
+    if [ -d "${CCL_ROOT}/opt/mpi/libfabric/lib" ]; then
+        LD_LIBRARY_PATH=$(prepend_path "${CCL_ROOT}/opt/mpi/libfabric/lib" "${LD_LIBRARY_PATH:-}"); export LD_LIBRARY_PATH
+    fi
+
     CPATH=$(prepend_path "${CCL_ROOT}/include" "${CPATH:-}"); export CPATH
     CMAKE_PREFIX_PATH=$(prepend_path "${CCL_ROOT}/lib/cmake/oneCCL" "${CMAKE_PREFIX_PATH:-}"); export CMAKE_PREFIX_PATH
     PKG_CONFIG_PATH=$(prepend_path "${CCL_ROOT}/lib/pkgconfig/${ccl_configuration_path}" "${PKG_CONFIG_PATH:-}"); export PKG_CONFIG_PATH
@@ -247,6 +272,13 @@ else                                                # must be a 2024 layout
         LIBRARY_PATH=$(prepend_path "${ONEAPI_ROOT}/lib/${ccl_configuration_path}" "${LIBRARY_PATH:-}"); export LIBRARY_PATH
         LD_LIBRARY_PATH=$(prepend_path "${ONEAPI_ROOT}/lib/${ccl_configuration_path}" "${LD_LIBRARY_PATH:-}"); export LD_LIBRARY_PATH
         PKG_CONFIG_PATH=$(prepend_path "${ONEAPI_ROOT}/lib/pkgconfig/${ccl_configuration_path}" "${PKG_CONFIG_PATH:-}"); export PKG_CONFIG_PATH
+    fi
+
+    # Add the libfabric co-installed with MPI to library path for OFI transport.
+    # FI_PROVIDER_PATH is intentionally not set here: libccl derives it at runtime
+    # from the libfabric it actually loaded, and honors an existing value if set.
+    if [ -d "${ONEAPI_ROOT}/opt/mpi/libfabric/lib" ]; then
+        LD_LIBRARY_PATH=$(prepend_path "${ONEAPI_ROOT}/opt/mpi/libfabric/lib" "${LD_LIBRARY_PATH:-}"); export LD_LIBRARY_PATH
     fi
 
 fi

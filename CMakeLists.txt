@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.26)
 
 # Define the project
 project(oneCCL2 VERSION 1.0 LANGUAGES CXX)
@@ -18,6 +18,10 @@ option(ONECCL_VALGRIND_TESTING "Run tests through valgrind --tool=memcheck" OFF)
 option(ONECCL_ENABLE_COVERAGE "Compile with coverage enabled" OFF)
 option(ONECCL_USE_SYSTEM_LIBCCL "Use system-installed libccl instead of subdirectory" OFF)
 option(ONECCL_BUILD_TESTS "Build tests for oneCCL" ON)
+# Off by default: the suite is still under construction; flip in a deliberate
+# follow-up commit once it's ready.
+option(ONECCL_BUILD_CORRECTNESS_TESTS "Build tests/correctness/gtest tree (test infrastructure)" OFF)
+option(ONECCL_BUILD_EXAMPLES "Build examples for oneCCL" ON)
 option(ONECCL_LIBCCL_BUILD_FT         "Build libccl functional tests"   ON)
 option(ONECCL_LIBCCL_BUILD_EXAMPLES   "Build libccl examples"            ON)
 option(ONECCL_LIBCCL_BUILD_REG_TESTS  "Build libccl regression tests"    ON)
@@ -28,7 +32,7 @@ set_property(CACHE ONECCL_LIBCCL_SYCL_DEVICE_CODE_SPLIT
              PROPERTY STRINGS "" per_kernel per_source off)
 option(ONECCL_LIBCCL_EXTERN_TEMPLATE_INST
        "Emit extern template declarations + per-dtype inst files in libccl (Release iteration win, Debug link-phase cost)" ON)
-option(ONECCL_ENABLE_MPI "Enable MPI support" ON)
+option(ONECCL_TEST_USE_MPI "Use an external MPI to build, link and launch tests/examples (library transport is independent of this)" ON)
 option(CCL_ENABLE_ARCA "Enable ARCA for embedded libccl builds" OFF)
 option(CCL_ENABLE_ARCB "Enable ARCB for embedded libccl builds" OFF)
 
@@ -54,6 +58,8 @@ include(CheckCXXCompilerFlag)
 set(ONECCL_SECURITY_COMPILE_FLAGS "")
 set(ONECCL_SECURITY_LINK_FLAGS "")
 set(ONECCL_SECURITY_COMPILE_DEFINITIONS "")
+# Applied per target to libccl.so.2 and the plugins only, so tests and examples do not fail on warnings
+set(ONECCL_WARNING_COMPILE_FLAGS "")
 
 string(TOUPPER "${CMAKE_BUILD_TYPE}" ONECCL_BUILD_TYPE_UPPER)
 set(ONECCL_IS_RELEASE_BUILD OFF)
@@ -83,43 +89,58 @@ function(oneccl_append_supported_link_flag output_list flag)
     endif()
 endfunction()
 
-function(oneccl_append_compile_flag_for_min_fortify output_list min_level flag)
+# Macros, not functions: the PARENT_SCOPE in the helpers above must reach the caller's scope
+macro(oneccl_append_compile_flag_for_min_fortify output_list min_level flag)
     if(ONECCL_FORTIFY_SOURCE GREATER_EQUAL ${min_level})
         oneccl_append_supported_compile_flag(${output_list} "${flag}")
     endif()
-endfunction()
+endmacro()
 
-function(oneccl_append_link_flag_for_min_fortify output_list min_level flag)
+macro(oneccl_append_link_flag_for_min_fortify output_list min_level flag)
     if(ONECCL_FORTIFY_SOURCE GREATER_EQUAL ${min_level})
         oneccl_append_supported_link_flag(${output_list} "${flag}")
     endif()
-endfunction()
+endmacro()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|IntelLLVM")
-    oneccl_append_compile_flag_for_min_fortify(ONECCL_SECURITY_COMPILE_FLAGS 1 "-Wall")
-    oneccl_append_compile_flag_for_min_fortify(ONECCL_SECURITY_COMPILE_FLAGS 1 "-Wextra")
-    oneccl_append_compile_flag_for_min_fortify(ONECCL_SECURITY_COMPILE_FLAGS 1 "-Wformat")
-    oneccl_append_compile_flag_for_min_fortify(ONECCL_SECURITY_COMPILE_FLAGS 1 "-Wformat-security")
+    oneccl_append_compile_flag_for_min_fortify(ONECCL_WARNING_COMPILE_FLAGS 1 "-Wall")
+    oneccl_append_compile_flag_for_min_fortify(ONECCL_WARNING_COMPILE_FLAGS 1 "-Wextra")
+    oneccl_append_compile_flag_for_min_fortify(ONECCL_WARNING_COMPILE_FLAGS 1 "-Wformat")
+    oneccl_append_compile_flag_for_min_fortify(ONECCL_WARNING_COMPILE_FLAGS 1 "-Wformat-security")
     oneccl_append_compile_flag_for_min_fortify(ONECCL_SECURITY_COMPILE_FLAGS 1 "-fstack-protector")
     oneccl_append_link_flag_for_min_fortify(ONECCL_SECURITY_LINK_FLAGS 1 "-Wl,-z,noexecstack")
 
     if(ONECCL_IS_RELEASE_BUILD)
-        oneccl_append_compile_flag_for_min_fortify(ONECCL_SECURITY_COMPILE_FLAGS 1 "-Werror")
-        oneccl_append_compile_flag_for_min_fortify(ONECCL_SECURITY_COMPILE_FLAGS 1 "-Wconversion")
-        oneccl_append_compile_flag_for_min_fortify(ONECCL_SECURITY_COMPILE_FLAGS 1 "-Wimplicit-fallthrough")
+        oneccl_append_compile_flag_for_min_fortify(ONECCL_WARNING_COMPILE_FLAGS 1 "-Werror")
+        oneccl_append_compile_flag_for_min_fortify(ONECCL_WARNING_COMPILE_FLAGS 1 "-Wconversion")
+        oneccl_append_compile_flag_for_min_fortify(ONECCL_WARNING_COMPILE_FLAGS 1 "-Wimplicit-fallthrough")
     endif()
 
     oneccl_append_link_flag_for_min_fortify(ONECCL_SECURITY_LINK_FLAGS 2 "-Wl,-z,relro")
 
     oneccl_append_compile_flag_for_min_fortify(ONECCL_SECURITY_COMPILE_FLAGS 3 "-fstack-protector-strong")
-    oneccl_append_compile_flag_for_min_fortify(ONECCL_SECURITY_COMPILE_FLAGS 3 "-Werror=format-security")
+    oneccl_append_compile_flag_for_min_fortify(ONECCL_WARNING_COMPILE_FLAGS 3 "-Werror=format-security")
     oneccl_append_link_flag_for_min_fortify(ONECCL_SECURITY_LINK_FLAGS 3 "-Wl,-z,now")
 
     oneccl_append_compile_flag_for_min_fortify(ONECCL_SECURITY_COMPILE_FLAGS 4 "-fstack-clash-protection")
-    oneccl_append_compile_flag_for_min_fortify(ONECCL_SECURITY_COMPILE_FLAGS 4 "-fcf-protection=full")
+
+    # The SYCL device target does not support -fcf-protection, so give it to the host compilation only
+    if(ONECCL_FORTIFY_SOURCE GREATER_EQUAL 4)
+        check_cxx_compiler_flag("-Xarch_host -fcf-protection=full" ONECCL_HAS_COMPILE_FLAG_XARCH_HOST_CF_PROTECTION)
+        if(ONECCL_HAS_COMPILE_FLAG_XARCH_HOST_CF_PROTECTION)
+            list(APPEND ONECCL_SECURITY_COMPILE_FLAGS "SHELL:-Xarch_host -fcf-protection=full")
+        else()
+            oneccl_append_supported_compile_flag(ONECCL_SECURITY_COMPILE_FLAGS "-fcf-protection=full")
+        endif()
+    endif()
 
     if(ONECCL_FORTIFY_SOURCE GREATER 0 AND ONECCL_IS_RELEASE_BUILD)
-        list(APPEND ONECCL_SECURITY_COMPILE_DEFINITIONS "_FORTIFY_SOURCE=${ONECCL_FORTIFY_SOURCE}")
+        # glibc knows _FORTIFY_SOURCE 1-3 only and warns about higher values, which -Werror makes fatal
+        set(_fortify_macro_level ${ONECCL_FORTIFY_SOURCE})
+        if(_fortify_macro_level GREATER 3)
+            set(_fortify_macro_level 3)
+        endif()
+        list(APPEND ONECCL_SECURITY_COMPILE_DEFINITIONS "_FORTIFY_SOURCE=${_fortify_macro_level}")
     elseif(ONECCL_FORTIFY_SOURCE GREATER 0)
         message(WARNING "ONECCL_FORTIFY_SOURCE is set but CMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}'. Fortify checks typically require optimization (for example -O2).")
     endif()
@@ -130,6 +151,35 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|IntelLLVM")
 endif()
 
 include(cmake/compat.cmake)
+
+# ---------------------------------------------------------------------------
+# Git hooks — activate automatically on configure so every developer gets the
+# commit-msg linter without any manual setup step.
+# Only runs inside an actual git working tree; skipped in CI/package builds and
+# in the open source distribution, which does not ship utils/.
+# ---------------------------------------------------------------------------
+find_package(Git QUIET)
+if(GIT_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --git-dir
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_QUIET ERROR_QUIET
+        RESULT_VARIABLE _in_git_repo
+    )
+    if(_in_git_repo EQUAL 0 AND IS_DIRECTORY "${CMAKE_SOURCE_DIR}/utils/hooks")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} config core.hooksPath utils/hooks
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            RESULT_VARIABLE _hook_result
+        )
+        if(_hook_result EQUAL 0)
+            message(STATUS "oneCCL: git commit-msg hook activated (utils/hooks)")
+        else()
+            message(WARNING "oneCCL: failed to set core.hooksPath — activate manually: "
+                            "git config core.hooksPath utils/hooks")
+        endif()
+    endif()
+endif()
 
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/_install" CACHE PATH "Default install path" FORCE)
@@ -166,6 +216,11 @@ endif()
 if(ONECCL_SECURITY_COMPILE_DEFINITIONS)
     add_compile_definitions(${ONECCL_SECURITY_COMPILE_DEFINITIONS})
 endif()
+
+# Install directory of the CPU-only libccl.so.1 and libccl_openmp.so relative to lib/ (l_ccl_cpu_prefix in
+# boms/tags/*.vars), and lib/ relative to it
+set(ONECCL_CPU_LIB_SUBDIR "ccl/cpu/lib")
+string(REGEX REPLACE "[^/]+" ".." ONECCL_LIB_FROM_CPU_LIB "${ONECCL_CPU_LIB_SUBDIR}")
 
 if(ONECCL_BUILD_LIBS)
     if(NOT "${ONECCL_LIBSTDCXX_PATH}" STREQUAL "" AND COMPILER_SUPPORTS_NOSTDLIBXX)
@@ -207,8 +262,8 @@ if(ONECCL_BUILD_LIBS)
                 install(DIRECTORY "${_oneccl_root}/opt/" DESTINATION "${DEST_OPT_DIR}" USE_SOURCE_PERMISSIONS OPTIONAL)
                 install(DIRECTORY "${_oneccl_root}/share/" DESTINATION "${DEST_SHARE_DIR}" USE_SOURCE_PERMISSIONS OPTIONAL)
 
-                if(NOT EXISTS "${_oneccl_root}/lib/ccl/cpu/lib/libccl.so.1.0")
-                    message(WARNING "The file ${_oneccl_root}/lib/ccl/cpu/lib/libccl.so.1.0 does not exist. Please ensure your oneCCL install is complete and contains both CPU and GPU version of the library.")
+                if(NOT EXISTS "${_oneccl_root}/lib/${ONECCL_CPU_LIB_SUBDIR}/libccl.so.1.0")
+                    message(WARNING "The file ${_oneccl_root}/lib/${ONECCL_CPU_LIB_SUBDIR}/libccl.so.1.0 does not exist. Please ensure your oneCCL install is complete and contains both CPU and GPU version of the library.")
                 endif()
             else()
                 message(FATAL_ERROR "System Installed libccl not found. Ensure it is installed and correctly configured.")
@@ -240,7 +295,8 @@ if(ONECCL_BUILD_LIBS)
                     "-DSYCL_DEVICE_CODE_SPLIT=${ONECCL_LIBCCL_SYCL_DEVICE_CODE_SPLIT}"
                     "-DENABLE_EXTERN_TEMPLATE_INST=${ONECCL_LIBCCL_EXTERN_TEMPLATE_INST}"
                     "-DENABLE_ITT=${ONECCL_ENABLE_ITT}"
-                    "-DONECCL_ENABLE_MPI=${ONECCL_ENABLE_MPI}"
+                    "-DENABLE_MPI_TESTS=${ONECCL_TEST_USE_MPI}"
+                    "-DENABLE_LINKER_RUNPATH=ON"
                 )
                 set(SHARED_LINKER_FLAGS "-L${ONECCL2_LIB_DIR} -l:libccl.so.2 -fsycl-max-parallel-link-jobs=${SYCL_LINK_JOBS}")
 
@@ -260,6 +316,9 @@ if(ONECCL_BUILD_LIBS)
                 endif()
                 list(JOIN LIBCCL_CMAKE_ARGS ";" LIBCCL_CMAKE_ARGS_LIST)
 
+                # Create install include directory early so CMake validation passes
+                file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/libccl/_install/include")
+
                 externalproject_add(
                     oneCCL
                     PREFIX ${CMAKE_BINARY_DIR}/libccl
@@ -269,7 +328,8 @@ if(ONECCL_BUILD_LIBS)
                     CMAKE_ARGS ${LIBCCL_CMAKE_ARGS_LIST}
                     BUILD_COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}/libccl --parallel=${NPROC} --verbose
                     INSTALL_COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}/libccl --target install --verbose
-                    BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/libccl/_install/lib/libccl.so;${CMAKE_INSTALL_PREFIX}/libccl/src/libccl.so;${CMAKE_INSTALL_PREFIX}/libccl/src/libccl.so.1;${CMAKE_INSTALL_PREFIX}/libccl/src/libccl.so.1.0
+                    BUILD_BYPRODUCTS ${CMAKE_INSTALL_PREFIX}/libccl/src/libccl.so;${CMAKE_INSTALL_PREFIX}/libccl/src/libccl.so.1;${CMAKE_INSTALL_PREFIX}/libccl/src/libccl.so.1.0
+                    INSTALL_BYPRODUCTS ${CMAKE_BINARY_DIR}/libccl/_install/lib/libccl.so;${CMAKE_BINARY_DIR}/libccl/_install/include/oneapi/ccl/config.h
                     BUILD_ALWAYS 1
                     LOG_OUTPUT_ON_FAILURE TRUE
                 )
@@ -282,7 +342,7 @@ if(ONECCL_BUILD_LIBS)
                     IMPORTED_LOCATION "${CMAKE_BINARY_DIR}/libccl/_install/lib/libccl.so"
 
                 )
-                target_include_directories(ccl BEFORE INTERFACE "${CMAKE_SOURCE_DIR}/deps/libccl/include")
+                target_include_directories(ccl BEFORE INTERFACE "${CMAKE_BINARY_DIR}/libccl/_install/include")
                 install(DIRECTORY "${CMAKE_BINARY_DIR}/libccl/_install/lib/" DESTINATION "${DEST_LIB_DIR}" USE_SOURCE_PERMISSIONS)
                 install(DIRECTORY "${CMAKE_BINARY_DIR}/libccl/_install/env/" DESTINATION "${DEST_ENV_DIR}" USE_SOURCE_PERMISSIONS)
                 install(DIRECTORY "${CMAKE_BINARY_DIR}/libccl/_install/opt/" DESTINATION "${DEST_OPT_DIR}" USE_SOURCE_PERMISSIONS OPTIONAL)
@@ -304,7 +364,10 @@ if(ONECCL_BUILD_LIBS)
                     "-DBUILD_REG_TESTS=${ONECCL_LIBCCL_BUILD_REG_TESTS}"
                     "-DENABLE_EXTERN_TEMPLATE_INST=${ONECCL_LIBCCL_EXTERN_TEMPLATE_INST}"
                     "-DENABLE_ITT=${ONECCL_ENABLE_ITT}"
-                    "-DONECCL_ENABLE_MPI=${ONECCL_ENABLE_MPI}"
+                    "-DENABLE_MPI_TESTS=${ONECCL_TEST_USE_MPI}"
+                    "-DENABLE_LINKER_RUNPATH=ON"
+                    # Installed to lib/${ONECCL_CPU_LIB_SUBDIR}: libccl.so.2, libmpi.so.12 and libiomp5.so are in lib/
+                    "-DLINKER_RUNPATH_EXTRA_DIRS=${ONECCL_LIB_FROM_CPU_LIB}"
                 )
                 set(SHARED_LINKER_FLAGS "-L${ONECCL2_LIB_DIR} -l:libccl.so.2 ${STATIC_INTEL_FLAG}")
 
@@ -327,6 +390,9 @@ if(ONECCL_BUILD_LIBS)
                 endif()
                 list(JOIN LIBCCL_CPU_CMAKE_ARGS ";" LIBCCL_CPU_CMAKE_ARGS_LIST)
 
+                # Create install include directory early so CMake validation passes
+                file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/libccl_cpu/_install/include")
+
                 externalproject_add(
                     oneCCLCPU
                     PREFIX ${CMAKE_BINARY_DIR}/libccl_cpu
@@ -336,7 +402,8 @@ if(ONECCL_BUILD_LIBS)
                     CMAKE_ARGS ${LIBCCL_CPU_CMAKE_ARGS_LIST}
                     BUILD_COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}/libccl_cpu --parallel=${NPROC} --verbose
                     INSTALL_COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}/libccl_cpu --target install --verbose
-                    BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/libccl_cpu/_install/lib/libccl.so;${CMAKE_INSTALL_PREFIX}/libccl_cpu/src/libccl.so;${CMAKE_INSTALL_PREFIX}/libccl_cpu/src/libccl.so.1;${CMAKE_INSTALL_PREFIX}/libccl_cpu/src/libccl.so.1.0
+                    BUILD_BYPRODUCTS ${CMAKE_INSTALL_PREFIX}/libccl_cpu/src/libccl.so;${CMAKE_INSTALL_PREFIX}/libccl_cpu/src/libccl.so.1;${CMAKE_INSTALL_PREFIX}/libccl_cpu/src/libccl.so.1.0
+                    INSTALL_BYPRODUCTS ${CMAKE_BINARY_DIR}/libccl_cpu/_install/lib/libccl.so;${CMAKE_BINARY_DIR}/libccl_cpu/_install/include/oneapi/ccl/config.h
                     BUILD_ALWAYS 1
                     LOG_OUTPUT_ON_FAILURE TRUE
                 )
@@ -347,11 +414,16 @@ if(ONECCL_BUILD_LIBS)
                 set_target_properties(ccl_cpu PROPERTIES
                     IMPORTED_LOCATION "${CMAKE_BINARY_DIR}/libccl_cpu/_install/lib/libccl.so"
                 )
-                target_include_directories(ccl_cpu BEFORE INTERFACE "${CMAKE_SOURCE_DIR}/deps/libccl/include")
-                install(DIRECTORY "${CMAKE_BINARY_DIR}/libccl_cpu/_install/lib/" DESTINATION "${DEST_LIB_DIR}/ccl/cpu/lib/" USE_SOURCE_PERMISSIONS)
+                target_include_directories(ccl_cpu BEFORE INTERFACE "${CMAKE_BINARY_DIR}/libccl_cpu/_install/include")
+                install(DIRECTORY "${CMAKE_BINARY_DIR}/libccl_cpu/_install/lib/" DESTINATION "${DEST_LIB_DIR}/${ONECCL_CPU_LIB_SUBDIR}/" USE_SOURCE_PERMISSIONS)
                 install(DIRECTORY "${CMAKE_BINARY_DIR}/libccl_cpu/_install/env/" DESTINATION "${DEST_ENV_DIR}" USE_SOURCE_PERMISSIONS)
                 install(DIRECTORY "${CMAKE_BINARY_DIR}/libccl_cpu/_install/opt/" DESTINATION "${DEST_OPT_DIR}" USE_SOURCE_PERMISSIONS OPTIONAL)
                 install(DIRECTORY "${CMAKE_BINARY_DIR}/libccl_cpu/_install/share/" DESTINATION "${DEST_SHARE_DIR}" USE_SOURCE_PERMISSIONS OPTIONAL)
+                # Without a GPU libccl, nothing else installs lib/cmake/oneCCL, which env/vars.sh puts on
+                # CMAKE_PREFIX_PATH
+                if(NOT COMPILER_SUPPORTS_SYCL)
+                    install(DIRECTORY "${CMAKE_BINARY_DIR}/libccl_cpu/_install/lib/cmake/oneCCL/" DESTINATION "${DEST_LIB_DIR}/cmake/oneCCL" USE_SOURCE_PERMISSIONS)
+                endif()
             endif() # ONECCL_BUILD_CPU_PLUGIN
         endif()
     endif() # NOT WIN32
@@ -364,7 +436,7 @@ else() # Don't build libccl.so.1 and libccl.so.2, require presence of CCL_ROOT
 
     add_library(ccl_cpu SHARED IMPORTED)
     set_target_properties(ccl_cpu PROPERTIES
-        IMPORTED_LOCATION "$ENV{CCL_ROOT}/lib/ccl/cpu/lib/libccl.so.1"
+        IMPORTED_LOCATION "$ENV{CCL_ROOT}/lib/${ONECCL_CPU_LIB_SUBDIR}/libccl.so.1"
         INTERFACE_INCLUDE_DIRECTORIES "$ENV{CCL_ROOT}/include"
     )
 
@@ -383,16 +455,38 @@ endif()
 # Enable tests in top-level cmake for easy usage
 enable_testing()
 
+# Wrapper prepended to every test command. Expand it unquoted.
+# DEFINED, not the value, so -DONECCL_TEST_LAUNCHER= means none.
+if(NOT DEFINED ONECCL_TEST_LAUNCHER
+   AND EXISTS "${PROJECT_SOURCE_DIR}/utils/debug_hook.sh")
+    set(_oneccl_default_test_launcher "${PROJECT_SOURCE_DIR}/utils/debug_hook.sh")
+else()
+    set(_oneccl_default_test_launcher "")
+endif()
+set(ONECCL_TEST_LAUNCHER "${_oneccl_default_test_launcher}" CACHE STRING
+    "Optional wrapper prepended to every test command (e.g. a debug or profiling hook)")
+unset(_oneccl_default_test_launcher)
+
 # Build everything except API library
 add_subdirectory(plugins)
-add_subdirectory(examples)
-add_subdirectory(tests)
-# Optional: not part of the source distribution
-if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/utils)
-    add_subdirectory(utils)
+# Skip the example and test trees entirely when disabled. Both are leaves - they
+# only consume oneCCL2/ccl_null/ccl_legacy/gtest and define nothing anyone else
+# links against - and neither has an install() rule, so dropping them changes the
+# install tree not at all. Consumers that only need libccl.so (the torchcomms
+# suite, downstream framework builds) save the ~290 objects they contribute,
+# including the expensive SYCL acceptance and perf targets.
+if(ONECCL_BUILD_EXAMPLES)
+   add_subdirectory(examples)
 endif()
-if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks)
-    add_subdirectory(benchmarks)
+if(ONECCL_BUILD_TESTS)
+   add_subdirectory(tests)
+endif()
+# Not shipped in the open source distribution
+if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/utils")
+   add_subdirectory(utils)
+endif()
+if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks")
+   add_subdirectory(benchmarks)
 endif()
 
 # Install public headers
@@ -400,18 +494,69 @@ install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_PREFIX}/include)
 
 # Install legacy ccl public headers
 install(DIRECTORY deps/libccl/include/ DESTINATION ${CMAKE_INSTALL_PREFIX}/include OPTIONAL)
+# Install generated config.h from the ExternalProject install tree (libccl generates it at build time)
+# Prefer SYCL build when available; only install from CPU build if SYCL is disabled
+# Only install when building libccl internally (not when using system libccl)
+# Non-OPTIONAL so missing config.h is caught as an error during install (when a branch is active)
+if(ONECCL_BUILD_LIBS AND NOT ONECCL_USE_SYSTEM_LIBCCL)
+    if(COMPILER_SUPPORTS_SYCL)
+        install(FILES "${CMAKE_BINARY_DIR}/libccl/_install/include/oneapi/ccl/config.h"
+                DESTINATION ${CMAKE_INSTALL_PREFIX}/include/oneapi/ccl)
+    elseif(ONECCL_BUILD_CPU_PLUGIN)
+        install(FILES "${CMAKE_BINARY_DIR}/libccl_cpu/_install/include/oneapi/ccl/config.h"
+                DESTINATION ${CMAKE_INSTALL_PREFIX}/include/oneapi/ccl)
+    else()
+        message(FATAL_ERROR "Cannot install config.h: neither COMPILER_SUPPORTS_SYCL nor ONECCL_BUILD_CPU_PLUGIN is enabled")
+    endif()
+endif()
 
 # Install cmake config files
 install(FILES cmake/oneCCL2Config.cmake DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/cmake/oneCCL2)
 install(FILES cmake/oneCCL2ConfigVersion.cmake DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/cmake/oneCCL2)
 
+# Install third-party notices. Kept apart from share/doc/ccl/licensing, which
+# the libccl (v1) install fills with its own third-party-programs.txt.
+install(FILES third-party-programs.txt DESTINATION ${CMAKE_INSTALL_PREFIX}/share/doc/oneccl2/licensing)
+
 # Install vars.sh (override vars.sh from v1)
 install(FILES etc/vars.sh DESTINATION ${CMAKE_INSTALL_PREFIX}/env)
 
 # Install pkgconfig
-install(DIRECTORY pkgconfig DESTINATION ${CMAKE_INSTALL_PREFIX}/lib)
+install(FILES pkgconfig/ccl.pc DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/pkgconfig)
+# The path in the oneAPI drop: env/vars.sh --ccl-configuration=cpu puts it on PKG_CONFIG_PATH, and the prefix
+# in the file assumes it
+install(FILES pkgconfig/ccl_cpu.pc DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/pkgconfig/${ONECCL_CPU_LIB_SUBDIR}
+        RENAME ccl.pc)
 
-install_symlink(libccl.so.2 ${CMAKE_INSTALL_PREFIX}/lib/libccl.so)
+# -lccl links the C API (libccl.so.2) and, only if the program uses it, the C++ API (libccl.so.1): lib/libccl.so
+# and lib/ccl/cpu/lib/libccl.so, which env/vars.sh --ccl-configuration=cpu puts first on LIBRARY_PATH, are GNU ld
+# scripts. The linker looks for the names next to the script.
+# Written last, from the installed files: earlier rules leave both paths namelink symlinks, and the C++ API library
+# of lib/libccl.so is the GPU one if the install has it, else the CPU-only one, as in env/vars.sh.
+if(NOT WIN32)
+    install(CODE "set(_oneccl_lib_dir \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib\")
+                  set(_oneccl_cpu_lib_subdir \"${ONECCL_CPU_LIB_SUBDIR}\")
+                  set(_oneccl_lib_from_cpu_lib \"${ONECCL_LIB_FROM_CPU_LIB}\")")
+    install(CODE [[
+        set(_oneccl_cpu_lib_dir "${_oneccl_lib_dir}/${_oneccl_cpu_lib_subdir}")
+        if(EXISTS "${_oneccl_lib_dir}/libccl.so.1")
+            set(_oneccl_input "libccl.so.2 AS_NEEDED(libccl.so.1)")
+        elseif(EXISTS "${_oneccl_cpu_lib_dir}/libccl.so.1")
+            set(_oneccl_input "libccl.so.2 AS_NEEDED(${_oneccl_cpu_lib_subdir}/libccl.so.1)")
+        else()
+            set(_oneccl_input "libccl.so.2")
+        endif()
+        file(REMOVE "${_oneccl_lib_dir}/libccl.so")
+        file(WRITE "${_oneccl_lib_dir}/libccl.so" "/* GNU ld script */\nINPUT(${_oneccl_input})\n")
+        message(STATUS "Installing: ${_oneccl_lib_dir}/libccl.so")
+        if(EXISTS "${_oneccl_cpu_lib_dir}/libccl.so.1")
+            file(REMOVE "${_oneccl_cpu_lib_dir}/libccl.so")
+            file(WRITE "${_oneccl_cpu_lib_dir}/libccl.so"
+                 "/* GNU ld script */\nINPUT(${_oneccl_lib_from_cpu_lib}/libccl.so.2 AS_NEEDED(libccl.so.1))\n")
+            message(STATUS "Installing: ${_oneccl_cpu_lib_dir}/libccl.so")
+        endif()
+    ]])
+endif()
 
 message(STATUS "")
 message(STATUS "")
@@ -425,6 +570,8 @@ foreach(var IN ITEMS
     ONECCL_VALGRIND_TESTING
     CCL_ENABLE_ARCA
     CCL_ENABLE_ARCB
+    ONECCL_BUILD_TESTS
+    ONECCL_BUILD_EXAMPLES
     ONECCL_ENABLE_TESTS
     ONECCL_ENABLE_BENCHMARKS
     ONECCL_FORTIFY_SOURCE

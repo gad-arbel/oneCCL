@@ -14,88 +14,11 @@
  limitations under the License.
 */
 
-#ifdef CCL_ENABLE_ESIMD
-#include "coll/algorithms/allreduce/sycl/allreduce_large_sycl.hpp"
-
-#define MAX_RANK 16
-
-void *allreduce_large_buffer = NULL;
-void *allreduce_large_buffers[MAX_RANK];
-void *allreduce_large_sync_buffer[MAX_RANK];
-size_t allreduce_large_offsets[MAX_RANK];
-ze_ipc_mem_handle_t allreduce_large_ipc_handle[MAX_RANK];
-int allreduce_large_buffer_index = 0;
-
-#define ALLREDUCE_LARGE_API_DECL(TYPE) \
-    void init_allreduce_large_##TYPE(ccl::datatype dtype, \
-                                     sycl::queue &queue, \
-                                     ccl_comm *comm, \
-                                     ccl_stream *stream, \
-                                     uint32_t rank_in, \
-                                     uint32_t world_in); \
-    ccl::event run_allreduce_large_##TYPE(ccl::datatype dtype, \
-                                          sycl::queue &queue, \
-                                          const void *in_buf, \
-                                          void *out_buf, \
-                                          size_t count, \
-                                          ccl::reduction reduction, \
-                                          const ccl::vector_class<ccl::event> &deps, \
-                                          bool &done)
-
-ALLREDUCE_LARGE_API_DECL(fp16);
-ALLREDUCE_LARGE_API_DECL(bf16);
-ALLREDUCE_LARGE_API_DECL(fp32);
-ALLREDUCE_LARGE_API_DECL(int32);
-
-#define SWITCH_INIT_TYPE(TYPE, ccl_type) \
-    case ccl_type: \
-        init_allreduce_large_##TYPE(dtype, queue, comm, stream, rank_in, world_in); \
-        break;
-
-void init_allreduce_large(ccl::datatype dtype,
-                          sycl::queue &queue,
-                          ccl_comm *comm,
-                          ccl_stream *stream,
-                          uint32_t rank_in,
-                          uint32_t world_in) {
-    switch (dtype) {
-        SWITCH_INIT_TYPE(fp16, ccl::datatype::float16)
-        SWITCH_INIT_TYPE(bf16, ccl::datatype::bfloat16)
-        SWITCH_INIT_TYPE(fp32, ccl::datatype::float32)
-        SWITCH_INIT_TYPE(int32, ccl::datatype::int32)
-        default: CCL_THROW("unsupported datatype for allreduce"); assert(0);
-    }
-}
-
-#define SWITCH_RUN_TYPE(TYPE, ccl_type) \
-    case ccl_type: \
-        e = run_allreduce_large_##TYPE( \
-            dtype, queue, in_buf, out_buf, count, reduction, deps, done); \
-        break;
-
-ccl::event run_allreduce_large(ccl::datatype dtype,
-                               sycl::queue &queue,
-                               const void *in_buf,
-                               void *out_buf,
-                               size_t count,
-                               ccl::reduction reduction,
-                               const ccl::vector_class<ccl::event> &deps,
-                               bool &done) {
-    ccl::event e;
-    switch (dtype) {
-        SWITCH_RUN_TYPE(fp16, ccl::datatype::float16)
-        SWITCH_RUN_TYPE(bf16, ccl::datatype::bfloat16)
-        SWITCH_RUN_TYPE(fp32, ccl::datatype::float32)
-        SWITCH_RUN_TYPE(int32, ccl::datatype::int32)
-        default: CCL_THROW("unsupported datatype for allreduce"); assert(0);
-    }
-    return e;
-}
-#endif // CCL_ENABLE_ESIMD
-
 #include "coll/algorithms/allreduce/sycl/allreduce_large_sycl_impl.hpp"
 #include "coll/algorithms/allreduce/sycl/allreduce_large_sycl_ring.hpp"
 #include "coll/algorithms/utils/sycl_custom_preop.hpp"
+#include "coll/algorithms/utils/sycl_selection.hpp"
+#include "coll/selection/policy/policy_env.hpp"
 
 ccl::event allreduce_large(const void *send_buf,
                            void *recv_buf,
@@ -103,6 +26,7 @@ ccl::event allreduce_large(const void *send_buf,
                            ccl::datatype dtype,
                            ccl::reduction reduction,
                            ccl_comm *comm,
+                           const std::shared_ptr<ccl_comm> p2p_comm,
                            ccl_stream *global_stream,
                            const ccl::vector_class<ccl::event> &deps) {
     if (comm->is_multi_thread_instance() == true) {
@@ -119,10 +43,17 @@ ccl::event allreduce_large(const void *send_buf,
     std::shared_ptr<ccl_comm> pair_comm = comm->get_pair_comm();
     std::shared_ptr<ccl_comm> even_comm = comm->get_even_comm();
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
+    const size_t dsize = ccl_dtype.size();
+    static const simple_chunk_size_table_t simple_chunk_sizes =
+        parse_simple_chunk_size_spec(CCL_SYCL_ALLREDUCE_SIMPLE_CHUNK_SIZE,
+                                     ccl::global_data::env().sycl_allreduce_simple_chunk_size);
+    // the policy knob `simple_chunk_size`, when set for this call, replaces the spec
+    size_t chunk_size = ccl::selection::call_env().sycl_allreduce_simple_chunk_size_override
+                            ? ccl::selection::call_env().sycl_allreduce_simple_chunk_size_override
+                            : select_simple_chunk_size(simple_chunk_sizes, count * dsize);
 
     // BMG
-    if (is_arc_card(ccl::global_data::get().ze_data->devices[0].family) && pair_comm->size() == 1) {
-        std::shared_ptr<ccl_comm> node_comm = comm->get_node_comm();
+    if (is_arc_card(ccl::global_data::get().ze_data->devices[0].family)) {
         // The BMG su_ring path uses reduce_pair_dispatch for the in-flight reduction, which does not apply the
         // per-rank scalar multiply.
         // For custom (pre_mul_sum) reductions, stage the input into recv_buf with the scalar applied, then run
@@ -136,7 +67,7 @@ ccl::event allreduce_large(const void *send_buf,
         if (reduce_has_pre_operation) {
             sycl::queue q = global_stream->get_native_stream();
             ccl::event preop_event = stage_and_apply_custom_preop(q, recv_buf, send_buf, count, dtype,
-                                                                  reduction, node_comm->get_tmp_buf_size(),
+                                                                  reduction, p2p_comm->get_tmp_buf_size(),
                                                                   get_sycl_events(deps));
             transport_send_buf = recv_buf;
             transport_reduction = ccl::reduction::sum;
@@ -144,18 +75,30 @@ ccl::event allreduce_large(const void *send_buf,
         }
         const ccl::vector_class<ccl::event> &transport_deps =
             reduce_has_pre_operation ? transport_deps_local : deps;
+        // the narrow (4 byte) vector path of the su_ring corrupts data once the collective is
+        // split, so run it as one call and warn that the chunk size is ignored
+        if (chunk_size && !chunks_use_full_vector(chunk_size, transport_send_buf, recv_buf, count,
+                                                  dsize, p2p_comm->size())) {
+            LOG_WARN_ONCE("allreduce: the narrow vector path runs the large allreduce unchunked, ",
+                          "ignoring chunk size ",
+                          chunk_size,
+                          "; ");
+            chunk_size = 0;
+        }
         bool is_tmp_used = ccl::global_data::env().sycl_allreduce_tmp_buf ||
                            reduce_has_pre_operation ||
-                           !node_comm->get_topo_manager().has_p2p_access();
+                           !comm->get_topo_manager().has_p2p_access();
         if (is_tmp_used) {
             LOG_DEBUG("invoking allreduce_large_su_ring_write_no_ipc");
-            auto lambda = [&]<typename T>() {
-                return allreduce_large_su_ring_write_no_ipc<T>(
-                    transport_send_buf, recv_buf, count, dtype, transport_reduction,
-                    comm, global_stream, transport_deps);
-            };
-            sycl::event e = invoke_collective_sycl(lambda, dtype);
-            return ccl::event::create_from_native(e);
+            return for_each_chunk(chunk_size, count, dsize, [&](size_t offset, size_t pack_count) {
+                auto lambda = [&]<typename T>() {
+                    return allreduce_large_su_ring_write_no_ipc<T>(
+                        (const char *)transport_send_buf + offset * dsize, (char *)recv_buf + offset * dsize,
+                        pack_count, dtype, transport_reduction, comm, p2p_comm, global_stream, transport_deps);
+                };
+                sycl::event e = invoke_collective_sycl(lambda, dtype);
+                return ccl::event::create_from_native(e);
+            });
         }
         else {
             std::vector<void *> registered_send_ptrs =
@@ -164,35 +107,40 @@ ccl::event allreduce_large(const void *send_buf,
                 comm->get_registered_ptrs(recv_buf, count * ccl_dtype.size());
             if (registered_send_ptrs.size() && registered_recv_ptrs.size()) {
                 sycl_ptrs.node_ptrs_rd = get_ipc_ptrs<void, MAX_NODE_RANKS>(
-                    registered_send_ptrs, comm, node_comm, (void *)send_buf);
+                    registered_send_ptrs, comm, p2p_comm, (void *)send_buf);
                 sycl_ptrs.node_ptrs_wr = get_ipc_ptrs<void, MAX_NODE_RANKS>(
-                    registered_recv_ptrs, comm, node_comm, (void *)recv_buf);
+                    registered_recv_ptrs, comm, p2p_comm, (void *)recv_buf);
             }
             else {
                 std::vector<void *> ptrs{ (void *)send_buf, recv_buf }; // index 0 and 1
                 auto [sched, exchange_entry] = do_ipc_exchange(comm, global_stream, ptrs);
 
                 sycl_ptrs.node_ptrs_rd =
-                    get_ipc_ptrs<void, MAX_NODE_RANKS>(node_comm, 0, (void *)send_buf, sched);
+                    get_ipc_ptrs<void, MAX_NODE_RANKS>(p2p_comm, 0, (void *)send_buf, sched);
                 sycl_ptrs.node_ptrs_wr =
-                    get_ipc_ptrs<void, MAX_NODE_RANKS>(node_comm, 1, recv_buf, sched);
+                    get_ipc_ptrs<void, MAX_NODE_RANKS>(p2p_comm, 1, recv_buf, sched);
 
                 delete exchange_entry;
                 delete sched;
             }
-            auto lambda = [&]<typename T>() {
-                return allreduce_large_su_ring<T>(send_buf,
-                                                  recv_buf,
-                                                  count,
-                                                  dtype,
-                                                  reduction,
-                                                  comm,
-                                                  global_stream,
-                                                  sycl_ptrs,
-                                                  deps);
-            };
-            sycl::event e = invoke_collective_sycl(lambda, dtype);
-            return ccl::event::create_from_native(e);
+            return for_each_chunk(chunk_size, count, dsize, [&](size_t offset, size_t pack_count) {
+                const size_t offset_bytes = offset * dsize;
+                sycl_ptrs_type chunk_ptrs = offset_sycl_ptrs(sycl_ptrs, offset_bytes, offset_bytes);
+                auto lambda = [&]<typename T>() {
+                    return allreduce_large_su_ring<T>((const char *)send_buf + offset_bytes,
+                                                      (char *)recv_buf + offset_bytes,
+                                                      pack_count,
+                                                      dtype,
+                                                      reduction,
+                                                      comm,
+                                                      p2p_comm,
+                                                      global_stream,
+                                                      chunk_ptrs,
+                                                      deps);
+                };
+                sycl::event e = invoke_collective_sycl(lambda, dtype);
+                return ccl::event::create_from_native(e);
+            });
         }
     }
 
@@ -225,9 +173,9 @@ ccl::event allreduce_large(const void *send_buf,
         std::vector<void *> registered_recv_ptrs =
             comm->get_registered_ptrs(recv_buf, count * ccl_dtype.size());
         if (registered_send_ptrs.size() && registered_recv_ptrs.size()) {
-            sycl_ptrs.xelink_ptrs_rd = get_ipc_ptrs<void, MAX_GPUS>(
+            sycl_ptrs.xelink_ptrs_rd = get_ipc_ptrs<void, MAX_NODE_RANKS>(
                 registered_send_ptrs, comm, even_comm, (void *)send_buf);
-            sycl_ptrs.xelink_ptrs_wr = get_ipc_ptrs<void, MAX_GPUS>(
+            sycl_ptrs.xelink_ptrs_wr = get_ipc_ptrs<void, MAX_NODE_RANKS>(
                 registered_recv_ptrs, comm, even_comm, (void *)recv_buf);
             // use full vector (>= 8 bytes) if remote buffers are 4 byte aligned
             use_full_vector =
@@ -254,9 +202,9 @@ ccl::event allreduce_large(const void *send_buf,
             auto [sched, exchange_entry] = do_ipc_exchange(comm, global_stream, ptrs);
 
             sycl_ptrs.xelink_ptrs_rd =
-                get_ipc_ptrs<void, MAX_GPUS>(even_comm, 0, (void *)send_buf, sched);
+                get_ipc_ptrs<void, MAX_NODE_RANKS>(even_comm, 0, (void *)send_buf, sched);
             sycl_ptrs.xelink_ptrs_wr =
-                get_ipc_ptrs<void, MAX_GPUS>(even_comm, 1, (void *)recv_buf, sched);
+                get_ipc_ptrs<void, MAX_NODE_RANKS>(even_comm, 1, (void *)recv_buf, sched);
             // use full vector (>= 8 bytes) if remote buffers are 4 byte aligned
             use_full_vector =
                 use_full_vector &&
@@ -283,42 +231,49 @@ ccl::event allreduce_large(const void *send_buf,
         // 0 index is used for tmp work buffer and
         // 1 index is used to copy input data
         // 2 index is used to copy output data
-        sycl_ptrs.xelink_ptrs_rd = get_remote_even_tmp_buf(1, comm);
-        sycl_ptrs.xelink_ptrs_wr = get_remote_even_tmp_buf(2, comm);
+        sycl_ptrs.xelink_ptrs_rd = get_remote_large_tmp_buf(1, even_comm.get());
+        sycl_ptrs.xelink_ptrs_wr = get_remote_large_tmp_buf(2, even_comm.get());
         if (pair_comm->size() > 1) {
             assert(pair_comm->size() == MAX_TILES);
             int peer_pair_rank = pair_comm->rank() ? 0 : 1;
-            sycl_ptrs.mdfi_ptr_rd = get_remote_pair_tmp_buf(1, comm)[peer_pair_rank];
-            sycl_ptrs.mdfi_ptr_wr = get_remote_pair_tmp_buf(2, comm)[peer_pair_rank];
+            sycl_ptrs.mdfi_ptr_rd = get_remote_large_tmp_buf(1, pair_comm.get())[peer_pair_rank];
+            sycl_ptrs.mdfi_ptr_wr = get_remote_large_tmp_buf(2, pair_comm.get())[peer_pair_rank];
         }
     }
 
-    auto lambda = [&]<typename T>() {
-        if (use_full_vector) {
-            return allreduce_large_impl<T, true>(send_buf,
-                                                 recv_buf,
-                                                 count,
-                                                 dtype,
-                                                 reduction,
-                                                 comm,
-                                                 global_stream,
-                                                 sycl_ptrs,
-                                                 deps,
-                                                 is_use_tmp);
-        }
-        else {
-            return allreduce_large_impl<T, false>(send_buf,
-                                                  recv_buf,
-                                                  count,
-                                                  dtype,
-                                                  reduction,
-                                                  comm,
-                                                  global_stream,
-                                                  sycl_ptrs,
-                                                  deps,
-                                                  is_use_tmp);
-        }
-    };
-
-    return invoke_collective(lambda, dtype);
+    return for_each_chunk(chunk_size, count, dsize, [&](size_t offset, size_t pack_count) {
+        const size_t offset_bytes = offset * dsize;
+        // tmp-buffer peers are not user buffers, so they keep their base
+        sycl_ptrs_type chunk_ptrs =
+            is_use_tmp ? sycl_ptrs : offset_sycl_ptrs(sycl_ptrs, offset_bytes, offset_bytes);
+        const void *chunk_send_buf = (const char *)send_buf + offset_bytes;
+        void *chunk_recv_buf = (char *)recv_buf + offset_bytes;
+        auto lambda = [&]<typename T>() {
+            if (use_full_vector) {
+                return allreduce_large_impl<T, true>(chunk_send_buf,
+                                                     chunk_recv_buf,
+                                                     pack_count,
+                                                     dtype,
+                                                     reduction,
+                                                     comm,
+                                                     global_stream,
+                                                     chunk_ptrs,
+                                                     deps,
+                                                     is_use_tmp);
+            }
+            else {
+                return allreduce_large_impl<T, false>(chunk_send_buf,
+                                                      chunk_recv_buf,
+                                                      pack_count,
+                                                      dtype,
+                                                      reduction,
+                                                      comm,
+                                                      global_stream,
+                                                      chunk_ptrs,
+                                                      deps,
+                                                      is_use_tmp);
+            }
+        };
+        return invoke_collective(lambda, dtype);
+    });
 }

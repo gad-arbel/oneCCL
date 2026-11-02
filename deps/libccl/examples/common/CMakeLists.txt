@@ -1,13 +1,12 @@
 file(GLOB sources "*.c" "*.cpp")
 
-link_directories(${EXAMPLES_LIB_DIRS})
-
 foreach(src ${sources})
     get_filename_component(executable ${src} NAME_WE)
     add_executable(${executable} ${src})
     target_include_directories(${executable} PRIVATE ${EXAMPLES_INC_DIRS})
     target_link_libraries(${executable} PRIVATE ccl)
     target_link_libraries(${executable} PRIVATE ${COMPUTE_BACKEND_TARGET_NAME})
+    target_link_libraries(${executable} PUBLIC MPI::MPI_CXX)
     target_link_libraries(${executable} PUBLIC pthread)
     target_link_libraries(${executable} PUBLIC rt)
     target_link_libraries(${executable} PUBLIC m)

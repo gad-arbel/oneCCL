@@ -16,74 +16,83 @@
 
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
 #include "coll/algorithms/broadcast/sycl/broadcast_sycl.hpp"
+#include "coll/algorithms/broadcast/sycl/broadcast_scaleout_scatter_allgather.hpp"
+#include "coll/algorithms/broadcast/sycl/broadcast_large_ce.hpp" // for broadcast_large_ze_copy_engine_with_exchange
+#include "coll/algorithms/utils/sycl_policy_resolver_scaleout.hpp"
+#include "coll/algorithms/utils/sycl_policy_resolver_scaleup.hpp"
+#include "coll/algorithms/utils/barrier_data.hpp"  // use_recording_path
+#include "common/log/log.hpp"
 
-namespace ccl {
-namespace v1 {
+namespace {
 
-ccl::event broadcast_sycl_single_node(sycl::queue& q,
-                                      const void* send_buf,
-                                      void* recv_buf,
-                                      size_t count,
-                                      ccl::datatype dtype,
-                                      int root,
-                                      ccl_comm* comm,
-                                      ccl_stream* global_stream,
-                                      const vector_class<event>& deps,
-                                      bool& done) {
-    ccl::event e;
-    done = true;
+// world == 1 fast path.
+ccl::event broadcast_scaleup_single_rank(const void* send_buf,
+                                         void* recv_buf,
+                                         size_t count,
+                                         ccl::datatype dtype,
+                                         ccl_stream* global_stream,
+                                         const ccl::vector_class<ccl::event>& deps) {
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
-    uint32_t world = comm->get_node_comm()->size();
-
-    if (world == 1) {
-        sycl::event sycl_e;
-        auto sycl_q = global_stream->get_native_stream();
-        std::vector<sycl::event> dep_events = get_sycl_events(deps);
-        if (send_buf != recv_buf) {
-            LOG_DEBUG("single rank: out-of-place case, coll: bcast");
-            sycl_e = sycl_q.submit([=](sycl::handler& h) {
-                h.depends_on(dep_events);
-                h.memcpy(recv_buf, send_buf, count * ccl_dtype.size());
-            });
-        }
-        else {
-            LOG_DEBUG("single rank: inplace case, coll: bcast");
-            sycl_e = submit_wait_on_events(sycl_q, dep_events);
-        }
-        return ccl::event::create_from_native(sycl_e);
+    sycl::event sycl_e;
+    auto sycl_q = global_stream->get_native_stream();
+    std::vector<sycl::event> dep_events = get_sycl_events(deps);
+    if (send_buf != recv_buf) {
+        LOG_DEBUG("single rank: out-of-place case, coll: bcast");
+        sycl_e = sycl_q.submit([=](sycl::handler& h) {
+            h.depends_on(dep_events);
+            h.memcpy(recv_buf, send_buf, count * ccl_dtype.size());
+        });
     }
-
-    // for ARC GPUs to do ring RT256
-    if (is_arc_card(ccl::ze::get_device_family(global_stream->get_ze_device()))) {
-        if (!is_aligned(send_buf, recv_buf, count, ccl_dtype.size(), 4)) {
-            done = false;
-            return e;
-        }
-        LOG_DEBUG("invoking broadcast RT256 kernel broadcast_rt_ring, count:",
-                  count,
-                  " datatype: ",
-                  dtype);
-        e = broadcast_rt_ring(send_buf, recv_buf, count, dtype, root, comm, global_stream, done);
-        LOG_DEBUG(
-            "invoking broadcast RT256 kernel, recv_count:", count, " datatype: ", dtype, " done");
-        if (done) {
-            return e;
-        }
+    else {
+        LOG_DEBUG("single rank: inplace case, coll: bcast");
+        sycl_e = submit_wait_on_events(sycl_q, dep_events);
     }
+    return ccl::event::create_from_native(sycl_e);
+}
 
-    if (count * ccl_dtype.size() <= ccl::global_data::env().sycl_broadcast_small_threshold) {
+// Arc RT256 ring.
+ccl::event broadcast_scaleup_ll_ring(const void* send_buf,
+                                     void* recv_buf,
+                                     size_t count,
+                                     ccl::datatype dtype,
+                                     int root,
+                                     ccl_comm* comm,
+                                     std::shared_ptr<ccl_comm> p2p_comm,
+                                     ccl_stream* global_stream,
+                                     bool& done) {
+    LOG_DEBUG(
+        "invoking broadcast RT256 kernel broadcast_ll_ring, count:", count, " datatype: ", dtype);
+    ccl::event e = broadcast_ll_ring(
+        send_buf, recv_buf, count, dtype, root, comm, p2p_comm, global_stream, done);
+    LOG_DEBUG("invoking broadcast RT256 kernel, recv_count:", count, " datatype: ", dtype, " done");
+    return e;
+}
+
+// Non-RT path: small kernel for below-threshold sizes, large kernel otherwise.
+ccl::event broadcast_scaleup_default(sycl::queue& /*q*/,
+                                 const void* send_buf,
+                                 void* recv_buf,
+                                 size_t count,
+                                 ccl::datatype dtype,
+                                 int root,
+                                 ccl_comm* comm,
+                                 std::shared_ptr<ccl_comm> p2p_comm,
+                                 ccl_stream* global_stream,
+                                 const ccl::vector_class<ccl::event>& deps,
+                                 ccl::sycl_policy::scaleup_algo algo) {
+    auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
+    const size_t total_bytes = count * ccl_dtype.size();
+    ccl::event e;
+    if (algo == ccl::sycl_policy::scaleup_algo::small) {
 #ifdef CCL_ENABLE_ITT
         ccl::profile::itt::task_begin(
-            "broadcast_small", "send_size", count * ccl_dtype.size(), comm->unique_id());
+            "broadcast_small", "send_size", total_bytes, comm->unique_id());
 #endif // CCL_ENABLE_ITT
-        LOG_DEBUG(
-            "|CCL_SYCL| broadcast selects small kernel, count: ", count, " datatype: ", dtype);
-        e = broadcast_small(send_buf, recv_buf, count, dtype, root, comm, global_stream, deps);
+        LOG_DEBUG("|CCL_SYCL| broadcast selects small kernel, count: ", count, " datatype: ", dtype);
+        e = broadcast_small(
+            send_buf, recv_buf, count, dtype, root, p2p_comm.get(), global_stream, deps);
         LOG_DEBUG("|CCL_SYCL| broadcast selects small kernel, count: ",
-                  count,
-                  " datatype: ",
-                  dtype,
-                  " done");
+                  count, " datatype: ", dtype, " done");
 #ifdef CCL_ENABLE_ITT
         ccl::profile::itt::task_end();
 #endif // CCL_ENABLE_ITT
@@ -91,21 +100,95 @@ ccl::event broadcast_sycl_single_node(sycl::queue& q,
     else {
 #ifdef CCL_ENABLE_ITT
         ccl::profile::itt::task_begin(
-            "broadcast_large", "send_size", count * ccl_dtype.size(), comm->unique_id());
+            "broadcast_large", "send_size", total_bytes, comm->unique_id());
 #endif // CCL_ENABLE_ITT
-        LOG_DEBUG(
-            "|CCL_SYCL| broadcast selects large kernel, count: ", count, " datatype: ", dtype);
-        e = broadcast_large(send_buf, recv_buf, count, dtype, root, comm, global_stream, deps);
+        LOG_DEBUG("|CCL_SYCL| broadcast selects large kernel, count: ", count, " datatype: ", dtype);
+        e = broadcast_large(
+            send_buf, recv_buf, count, dtype, root, comm, p2p_comm, global_stream, deps);
         LOG_DEBUG("|CCL_SYCL| broadcast selects large kernel, count: ",
-                  count,
-                  " datatype: ",
-                  dtype,
-                  " done");
+                  count, " datatype: ", dtype, " done");
 #ifdef CCL_ENABLE_ITT
         ccl::profile::itt::task_end();
 #endif // CCL_ENABLE_ITT
     }
     return e;
+}
+
+// l0_copy_engine: append the copies to an L0 copy engine command list
+ccl::event broadcast_scaleup_l0_copy_engine(sycl::queue& q,
+                                            const void* send_buf,
+                                            void* recv_buf,
+                                            size_t count,
+                                            ccl::datatype dtype,
+                                            int root,
+                                            ccl_comm* comm,
+                                            std::shared_ptr<ccl_comm> p2p_comm,
+                                            ccl_stream* global_stream,
+                                            const ccl::vector_class<ccl::event>& deps) {
+#ifdef CCL_ENABLE_ITT
+    ccl::profile::itt::task_begin("broadcast_large_ce",
+                                  "send_size",
+                                  count * ccl::global_data::get().dtypes->get(dtype).size(),
+                                  comm->unique_id());
+#endif // CCL_ENABLE_ITT
+    LOG_DEBUG("Broadcast Large - using L0 copy engine");
+    ccl::event e = broadcast_large_ze_copy_engine_with_exchange(
+        q, send_buf, recv_buf, count, dtype, root, comm, p2p_comm, global_stream, deps);
+    LOG_DEBUG("broadcast selects large copy engine kernel: count: ",
+              count,
+              " datatype: ",
+              dtype,
+              " done");
+#ifdef CCL_ENABLE_ITT
+    ccl::profile::itt::task_end();
+#endif // CCL_ENABLE_ITT
+    return e;
+}
+
+}  // namespace
+
+namespace ccl {
+namespace v1 {
+
+ccl::event broadcast_scaleup_sycl(sycl::queue& q,
+                                  const void* send_buf,
+                                  void* recv_buf,
+                                  size_t count,
+                                  ccl::datatype dtype,
+                                  int root,
+                                  ccl_comm* comm,
+                                  std::shared_ptr<ccl_comm> p2p_comm,
+                                  ccl_stream* global_stream,
+                                  const vector_class<event>& deps,
+                                  bool& done) {
+    done = true;
+
+    if (p2p_comm->size() == 1) {
+        return broadcast_scaleup_single_rank(send_buf, recv_buf, count, dtype, global_stream, deps);
+    }
+
+    auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
+
+    const auto tune = ccl::sycl_policy_resolver::scaleup_resolver{
+        ccl::sycl_policy::policy_query(
+            ccl_coll_broadcast, count, ccl_dtype,
+            /*r2r_size=*/0, comm->size(), use_recording_path(q))
+            .with_comm(comm)
+            .with_p2p_comm(p2p_comm.get())
+            .with_stream(global_stream)
+    }.broadcast();
+
+    if (tune.protocol == ccl::sycl_policy::scaleup_protocol::ll) {
+        return broadcast_scaleup_ll_ring(
+            send_buf, recv_buf, count, dtype, root, comm, p2p_comm, global_stream, done);
+    }
+    if (tune.protocol == ccl::sycl_policy::scaleup_protocol::copy_engine &&
+        tune.algo == ccl::sycl_policy::scaleup_algo::l0_copy_engine) {
+        return broadcast_scaleup_l0_copy_engine(
+            q, send_buf, recv_buf, count, dtype, root, comm, p2p_comm, global_stream, deps);
+    }
+    return broadcast_scaleup_default(q, send_buf, recv_buf, count, dtype, root,
+                                     comm, p2p_comm, global_stream, deps, tune.algo);
 }
 
 static bool do_fallback_to_scheduler(size_t size) {
@@ -115,30 +198,77 @@ static bool do_fallback_to_scheduler(size_t size) {
     return is_above_threshold || exception_cases;
 }
 
-ccl::event broadcast_sycl_multi_node(sycl::queue& q,
-                                     const void* send_buf,
-                                     void* recv_buf,
-                                     size_t count,
-                                     ccl::datatype dtype,
-                                     int root,
-                                     ccl_comm* global_comm,
-                                     ccl_stream* global_stream,
-                                     const vector_class<event>& deps,
-                                     bool& done) {
+ccl::event broadcast_sycl_multi_domain(sycl::queue& q,
+                                       const void* send_buf,
+                                       void* recv_buf,
+                                       size_t count,
+                                       ccl::datatype dtype,
+                                       int root,
+                                       ccl_comm* global_comm,
+                                       std::shared_ptr<ccl_comm> p2p_comm,
+                                       std::shared_ptr<ccl_comm> r2r_comm,
+                                       ccl_stream* global_stream,
+                                       const vector_class<event>& deps,
+                                       bool& done) {
     done = true;
     ccl::event ev;
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
-    ccl_comm* node_comm = global_comm->get_node_comm().get();
-    ccl_comm* r2r_comm = global_comm->get_r2r_comm().get();
 
     if (do_fallback_to_scheduler(count * ccl_dtype.size())) {
         LOG_DEBUG("broadcast count size = ",
                   count * ccl_dtype.size(),
                   " is above scaleout SYCL threshold = ",
                   ccl::global_data::env().sycl_broadcast_scaleout_threshold,
-                  " or sycl::esimd mode is enabled, or other conditions not met -- falling back");
+                  " or other conditions not met -- falling back");
         done = false;
         return ev;
+    }
+
+    // Scatter-AllGather when the selector picks it: ENABLE=1 and (FORCE=1 or size >= THRESHOLD).
+    const auto tune = ccl::sycl_policy_resolver::scaleout_resolver{
+        ccl::sycl_policy::policy_query(ccl_coll_broadcast, count, ccl_dtype,
+            r2r_comm->size(), global_comm->size(), use_recording_path(q))
+            .with_p2p_comm(p2p_comm.get())
+    }.broadcast();
+
+    if (tune.algo() == ccl::sycl_policy::scaleout_algo::scatter_allgather) {
+        // FORCE applies only with ENABLE=1, as in the C++ selector; a JSON policy
+        // can pick scatter_allgather with ENABLE=0.
+        const auto& env = ccl::global_data::env();
+        const bool force_sag = env.sycl_broadcast_scatter_allgather_enable == 1 &&
+                               env.sycl_broadcast_scatter_allgather_force;
+        const bool sag_preconditions =
+            is_arc_card(ccl::ze::get_device_family(global_stream->get_ze_device())) &&
+            p2p_comm->size() >= 2 && r2r_comm->size() >= 2;
+        if (!sag_preconditions) {
+            if (force_sag) {
+                CCL_THROW(
+                    "forced broadcast scatter-allgather cannot run: requires ARC GPU and both p2p/r2r communicator sizes >= 2");
+            }
+        }
+        else {
+            bool sr_done = false;
+            ccl::event sr_ev = broadcast_scaleout_scatter_allgather(q,
+                                                                    send_buf,
+                                                                    recv_buf,
+                                                                    count,
+                                                                    dtype,
+                                                                    root,
+                                                                    global_comm,
+                                                                    p2p_comm,
+                                                                    r2r_comm,
+                                                                    global_stream,
+                                                                    deps,
+                                                                    sr_done);
+            if (sr_done) {
+                done = true;
+                return sr_ev;
+            }
+            if (force_sag) {
+                CCL_THROW("forced broadcast scatter-allgather returned not-done");
+            }
+            // else: fall through to the default chunked broadcast below
+        }
     }
 
     LOG_DEBUG("broadcast_sycl multi-node count: ", count);
@@ -153,10 +283,9 @@ ccl::event broadcast_sycl_multi_node(sycl::queue& q,
 
     // copy to recv_buf or not
     const bool inplace = send_buf == recv_buf;
-    // what node from global ranks contains the root
-    const int root_node_idx = root / node_comm->size();
-    // project global root rank to node_comm rank idx
-    const int root_rank_in_node_comm = root - root_node_idx * node_comm->size();
+    // Project the global root into the r2r and p2p communicator rank spaces.
+    const int root_rank_in_r2r_comm = root / p2p_comm->size();
+    const int root_rank_in_p2p_comm = root % p2p_comm->size();
 
     // chunking buffer size computation
     // host buffer is used in direct algorithm
@@ -187,51 +316,52 @@ ccl::event broadcast_sycl_multi_node(sycl::queue& q,
                   nchunks,
                   " - broadcast_scaleout_sycl");
 
-        // scale-out phase only bettween projected (global rank => node rank) root ranks
-        if (node_comm->rank() == root_rank_in_node_comm) {
+        // Scale-out runs only on the root rank from each p2p domain.
+        if (p2p_comm->rank() == root_rank_in_p2p_comm) {
             bool original_deps = (i == 0 && !evs.empty());
             ev = broadcast_scaleout_sycl(q,
                                          send_buf_ptr,
                                          recv_buf_ptr,
                                          iter_count,
                                          dtype,
-                                         root_node_idx,
-                                         r2r_comm,
+                                         root_rank_in_r2r_comm,
+                                         r2r_comm.get(),
                                          evs,
                                          original_deps,
                                          done);
 
             if (!done) {
-                LOG_INFO("broadcast_sycl scale-out phase was not done -- falling back");
+                LOG_DEBUG("broadcast_sycl scale-out phase was not done -- falling back");
                 // fallback
                 return ev;
             }
         }
 
         // scale-up phase, broadcast from new root
-        if (node_comm->size() > 1) {
+        if (p2p_comm->size() > 1) {
             // create a dependency with scale-out phase only for the ranks
             // that are actually participated in scale-out phase
-            if (node_comm->rank() == root_rank_in_node_comm) {
+            if (p2p_comm->rank() == root_rank_in_p2p_comm) {
                 evs.clear();
                 evs.push_back(std::move(ev));
             }
             // scale-up phase will be inplace
             send_buf_ptr = recv_buf_ptr;
 
-            ev = broadcast_sycl_single_node(q,
-                                            send_buf_ptr,
-                                            recv_buf_ptr,
-                                            iter_count,
-                                            dtype,
-                                            root_rank_in_node_comm,
-                                            node_comm,
-                                            global_stream,
-                                            evs,
-                                            done);
+            ev = broadcast_scaleup_sycl(q,
+                                        send_buf_ptr,
+                                        recv_buf_ptr,
+                                        iter_count,
+                                        dtype,
+                                        root_rank_in_p2p_comm,
+                                        global_comm,
+                                        p2p_comm,
+                                        global_stream,
+                                        evs,
+                                        done);
 
             if (!done) {
-                LOG_INFO("broadcast_sycl scale-up phase was not done -- falling back");
+                LOG_DEBUG("broadcast_sycl scale-up phase was not done -- falling back");
                 // fallback
                 return ev;
             }
@@ -265,20 +395,39 @@ ccl::event broadcast_sycl(sycl::queue q,
         return ccl::event::create_from_native(e);
     }
 
-    bool is_single_node = false;
-    if (ccl::global_data::env().backend == backend_mode::native) {
-        const ccl::topo_manager& topo_manager = global_comm->get_topo_manager();
-        is_single_node = topo_manager.is_single_node;
-    }
+    auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
+    auto p2p_level = ccl_p2p_domain::sycl_get_broadcast_p2p_level(
+        global_comm, count * ccl_dtype.size(), ccl::global_data::env().sycl_p2p_level_broadcast_threshold);
 
-    if (is_single_node && ccl::global_data::env().sycl_single_node_algorithm) {
-        LOG_DEBUG("is_single_node");
-        return broadcast_sycl_single_node(
-            q, send_buf, recv_buf, count, dtype, root, global_comm, global_stream, deps, done);
-    }
+    auto [p2p_comm, r2r_comm] = ccl_p2p_domain::get_p2p_comms(global_comm, p2p_level);
 
-    return broadcast_sycl_multi_node(
-        q, send_buf, recv_buf, count, dtype, root, global_comm, global_stream, deps, done);
+    // single p2p domain
+    if (r2r_comm->is_uniform && r2r_comm->size() == 1) {
+        LOG_DEBUG("is_single_domain");
+        return broadcast_scaleup_sycl(q,
+                                      send_buf,
+                                      recv_buf,
+                                      count,
+                                      dtype,
+                                      root,
+                                      global_comm,
+                                      p2p_comm,
+                                      global_stream,
+                                      deps,
+                                      done);
+    }
+    return broadcast_sycl_multi_domain(q,
+                                       send_buf,
+                                       recv_buf,
+                                       count,
+                                       dtype,
+                                       root,
+                                       global_comm,
+                                       p2p_comm,
+                                       r2r_comm,
+                                       global_stream,
+                                       deps,
+                                       done);
 }
 
 } // namespace v1

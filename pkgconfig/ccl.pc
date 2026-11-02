@@ -1,3 +1,4 @@
+prefix=${pcfiledir}/../../
 # Copyright 2016-2026 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-prefix=${pcfiledir}/../../
 exec_prefix=${prefix}
 libdir=${exec_prefix}/lib/
 includedir=${prefix}/include/
@@ -20,6 +20,6 @@ includedir=${prefix}/include/
 Name: oneAPI Collective Communications Library (oneCCL)
 Description: oneCCL provides an efficient implementation of communication patterns used in deep learning.
 URL: https://github.com/oneapi-src/oneCCL
-Version: 2022.1.2
+Version: 2022.3.0
 Libs: -L${libdir} -lccl -lsycl
 Cflags: -I${includedir}

@@ -189,12 +189,8 @@ struct AllReduce {
                         ll_pattern_data.process_update(
                             type, global_current_id, rank, peer_rank, n_steps);
                     }
-                    check_zero_buffers_gpu(ll_pattern_data,
-                                           it,
-                                           barrier_data,
-                                           ipcbuf0,
-                                           ipcbuf1,
-                                           tmp_buf_size);
+                    check_zero_buffers_gpu(
+                        ll_pattern_data, it, barrier_data, ipcbuf0, ipcbuf1, tmp_buf_size, type);
                     });
             });
 
@@ -278,7 +274,6 @@ struct AllReduce {
                     gOff,
                     loopSize);
 #endif
-
             const_cast<TransmitT*>(&transmit)->runAllreduce(
                 wireOff, iter, workLeft, workSizeData, gr);
         }
@@ -303,7 +298,8 @@ private:
     }
 
     static WorkSizeDataT calcWorkSize(T* input, T* output, size_t size, int NRanks) {
-        return WorkSizeDataT(NRanks, size, sizeof(T), TransmitT::splitType);
+        return WorkSizeDataT(NRanks, size, sizeof(T),
+                             TransmitT::splitType(TransmitColl::Allreduce));
     }
 
     // do not reorder items

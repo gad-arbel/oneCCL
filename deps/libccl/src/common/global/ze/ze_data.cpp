@@ -382,10 +382,15 @@ void global_data_desc::import_external_pointer(void* ptr, size_t size) {
 
     // TODO: maybe use this via SYCL's sycl_ext_oneapi_copy_optimize?
     ze_result_t res = zexDriverImportExternalPointer(ze_driver_handle, ptr, size);
-    if (res != ZE_RESULT_SUCCESS) {
-        LOG_INFO("zexDriverImportExternalPointer can not register the pointer with error: ",
-                 std::to_string(res));
-    }
+    // the GPU is never given access to this host memory, so failing here is the
+    // only way to report it: a staged collective fails much later as DEVICE_LOST
+    CCL_THROW_IF_NOT(res == ZE_RESULT_SUCCESS,
+                     "zexDriverImportExternalPointer can not register the pointer with error: ",
+                     std::to_string(res),
+                     ", ptr: ",
+                     ptr,
+                     ", size: ",
+                     size);
 }
 
 void global_data_desc::release_imported_pointer(void* ptr) {

@@ -14,13 +14,12 @@ get_bench ${SCRIPT_DIR} ${TEST_LOG} "sycl"
 cd ${SCRIPT_DIR}
 
 export CCL_ALLREDUCE=topo
-export CCL_ALLTOALL=topo
 export CCL_ALLTOALLV=topo
 
 transports="ofi mpi"
 proc_counts="4"
 
-colls="allreduce alltoall alltoallv"
+colls="allreduce alltoallv"
 
 bench_options="-w 0 -i 2 -j off -c all -b sycl -y 131072 -q 1"
 

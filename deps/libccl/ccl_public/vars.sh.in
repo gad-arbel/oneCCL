@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck shell=sh
 
-DEFAULT_BUNDLED_MPI="yes"
+DEFAULT_BUNDLED_MPI="no"
 
 get_script_path() (
     script="$1"
@@ -99,6 +99,10 @@ CPLUS_INCLUDE_PATH=$(prepend_path "${CCL_ROOT}/include" "${CPLUS_INCLUDE_PATH:-}
 CMAKE_PREFIX_PATH=$(prepend_path "${CCL_ROOT}/lib/cmake/oneCCL" "${CMAKE_PREFIX_PATH:-}"); export CMAKE_PREFIX_PATH
 LIBRARY_PATH=$(prepend_path "${CCL_ROOT}/lib" "${LIBRARY_PATH:-}"); export LIBRARY_PATH
 LD_LIBRARY_PATH=$(prepend_path "${CCL_ROOT}/lib" "${LD_LIBRARY_PATH:-}"); export LD_LIBRARY_PATH
+# A oneCCL v2 CPU-only build has its C++ API library, libccl.so.1, only in lib/ccl/cpu/lib
+if [ ! -e "${CCL_ROOT}/lib/libccl.so.1" ] && [ -e "${CCL_ROOT}/lib/ccl/cpu/lib/libccl.so.1" ]; then
+    LD_LIBRARY_PATH=$(prepend_path "${CCL_ROOT}/lib/ccl/cpu/lib" "${LD_LIBRARY_PATH:-}"); export LD_LIBRARY_PATH
+fi
 
 args=$*
 for arg in $args
@@ -119,7 +123,10 @@ if [ -z "${SETVARS_CALL:-}" ] ; then
         ccl_bundled_mpi="${DEFAULT_BUNDLED_MPI}"
     fi
 
-    if [ "$ccl_bundled_mpi" = "yes" ] ; then
+    # opt/mpi/bin/mpirun exists only in install trees of versions that bundled Intel MPI
+    if [ "$ccl_bundled_mpi" = "yes" ] && [ ! -x "${CCL_ROOT}/opt/mpi/bin/mpirun" ] ; then
+        echo ":: WARNING: oneCCL no longer bundles Intel MPI, ccl_bundled_mpi=yes is ignored"
+    elif [ "$ccl_bundled_mpi" = "yes" ] ; then
         export I_MPI_ROOT="${CCL_ROOT}/opt/mpi"
         C_INCLUDE_PATH=$(prepend_path "${I_MPI_ROOT}/include" "${C_INCLUDE_PATH:-}"); export C_INCLUDE_PATH
         CPLUS_INCLUDE_PATH=$(prepend_path "${I_MPI_ROOT}/include" "${CPLUS_INCLUDE_PATH:-}"); export CPLUS_INCLUDE_PATH

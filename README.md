@@ -25,6 +25,10 @@ To install Level Zero, refer to the instructions in [Intel(R) Graphics Compute R
 
 ## Installation
 
+oneCCL no longer bundles libfabric. It needs libfabric 1.10 or later at runtime, both for its default OFI transport and for the Intel(R) MPI Library, which loads libfabric itself. Install it from your Linux distribution, the Intel(R) MPI Library, or conda-forge. To select a specific copy, set `CCL_OFI_LIBRARY_PATH=<path>/libfabric.so.1` for oneCCL, and `I_MPI_OFI_LIBRARY` or `LD_LIBRARY_PATH` for the Intel(R) MPI Library.
+
+oneCCL no longer bundles the Intel(R) MPI Library. Its MPI transport loads `libmpi.so.12` at runtime. The library builds against a vendored Intel(R) MPI 2021.18.0 header, which fixes its Application Binary Interface (ABI). Use an external MPI with a matching ABI, such as the Intel(R) MPI Library or MPICH. The examples and tests link the external MPI and run under its `mpirun`. Install the Intel(R) MPI Library from oneAPI or from the `impi_rt` package. A build with `-DONECCL_TEST_USE_MPI=OFF` needs no MPI.
+
 ### Linux build:
 
 ```sh
@@ -101,6 +105,8 @@ make -j install
 
 ### Launching Example Application
 
+Source the environment of an external Intel(R) MPI Library first. See [Set Up an External MPI](deps/libccl/README.md#set-up-an-external-mpi) for details.
+
 Use the command:
 ```bash
 $ source <install_dir>/env/setvars.sh
@@ -111,7 +117,7 @@ $ CCL_LOG_LEVEL=info mpirun -n 2 <install_dir>/examples/sycl/sycl
 
 C API version of oneCCL introduced a new plugin based architecture. Running examples or tests might require adjusting `LD_LIBRARY_PATH`, so it points to at least one directory with correct plugin. It can be done using `vars.sh` script or manually like `export LD_LIBRARY_PATH=<build_dir>/plugins/legacy/:$LD_LIBRARY_PATH`, so test binaries linking to `libccl.so.2` through **RUNPATH** can still discover required plugin. 
 
-You can also use **CCL_PLUGIN** environment variable to set name of the plugin (`ONECCL_LEGACY`/`ONECCL_LEGACY_CPU`/`ONECCL_NULL`) or a whole path to a shared object implementing oneCCL plugin interface (`<build_dir>/plugins/legacy/libccl_legacy.so`).
+You can also use **CCL_PLUGIN** environment variable to set name of the plugin (`ONECCL_LEGACY`/`ONECCL_LEGACY_CPU`/`ONECCL_NULL`) or a whole path to a shared object implementing oneCCL plugin interface (`<build_dir>/plugins/legacy/libccl_legacy.so`). Without **CCL_PLUGIN**, oneCCL selects `ONECCL_LEGACY` on a node with a Level Zero GPU and `ONECCL_LEGACY_CPU` otherwise. It never selects `ONECCL_NULL` automatically, because that plugin does no communication.
 
 ## Governance
 
