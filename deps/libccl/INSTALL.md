@@ -29,6 +29,7 @@ You can also do the following during installation:
 - [Specify `SYCL` cross-platform abstraction level](#specify-sycl-cross-platform-abstraction-level)
 - [Specify the build type](#specify-the-build-type)
 - [Enable `make` verbose output](#enable-make-verbose-output)
+- [Configure ITT profiling support](#configure-itt-profiling-support)
 
 ## Specify installation directory
 
@@ -74,3 +75,27 @@ and linkage, modify `make` command as follows:
 ```
 make -j VERBOSE=1
 ```
+
+## Configure ITT profiling support
+
+ITT (Instrumentation and Tracing Technology) support is on by default.
+oneCCL builds it from the `deps/ittapi` submodule of the outer oneCCL repo.
+
+If you build `deps/libccl` inside the outer oneCCL v2 repo, initialize the
+submodule from the repo root:
+
+```
+git submodule update --init deps/ittapi
+```
+
+Or configure the outer build with `-DONECCL_ENABLE_ITT=OFF`.
+
+If you build `deps/libccl` standalone, no submodule exists to initialize.
+Pass the path to another ittapi source tree, for example a clone of
+https://github.com/intel/ittapi:
+
+```
+cmake .. -DITTAPI_DIR=/path/to/ittapi
+```
+
+To build without ITT, pass `-DENABLE_ITT=OFF`.

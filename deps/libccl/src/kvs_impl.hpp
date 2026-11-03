@@ -61,11 +61,11 @@ public:
 
     void set(const string_class& key, const vector_class<char>& data) override;
 
-    std::shared_ptr<internal_kvs> get() const;
+    std::shared_ptr<ikvs_wrapper> get() const;
 
 private:
     const std::string prefix = "USER_DATA";
-    std::shared_ptr<internal_kvs> inter_kvs;
+    std::shared_ptr<ikvs_wrapper> inter_kvs;
 };
 
 template <class T>

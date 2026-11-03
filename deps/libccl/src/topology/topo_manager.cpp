@@ -144,10 +144,14 @@ bool topo_manager::oversubscription_detected(const ze_rank_info_vec_t& ze_rank_i
     unique_device_uuids_count = unique_dev_uuids_count;
 
     if (unique_device_uuids_count < rank_info_vec.size()) {
-        LOG_DEBUG("unique_device_uuids_count: ",
-                  unique_device_uuids_count,
-                  ", comm_size: ",
-                  rank_info_vec.size());
+        // Keep this at INFO: a benchmark can return valid timing data after
+        // falling back from a topology/SYCL algorithm, while the requested
+        // algorithm (and its proxy rail) was never eligible to execute.
+        LOG_INFO("CCL_TOPO_OVERSUBSCRIPTION: ",
+                 unique_device_uuids_count,
+                 " unique device UUIDs for ",
+                 rank_info_vec.size(),
+                 " ranks");
         return true;
     }
     return false;
@@ -270,6 +274,18 @@ bool topo_manager::has_p2p_atomics() const {
 
 bool topo_manager::has_all_vertices_connected() const {
     return are_all_vertices_connected;
+}
+
+void topo_manager::set_p2p_access(bool val) {
+    is_p2p_access_enabled = val;
+}
+
+void topo_manager::set_p2p_atomics(bool val) {
+    is_p2p_atomics_enabled = val;
+}
+
+void topo_manager::set_all_vertices_connected(bool val) {
+    are_all_vertices_connected = val;
 }
 
 std::vector<ze_device_uuid_t> topo_manager::copy_dev_uuids(const rank_info_vec_t& info_vec) const {
@@ -414,7 +430,8 @@ bool topo_manager::build_fabric_connectivity_matrix(
     }
 
     auto driver = global_data::get().ze_data->drivers[0];
-    ze_driver_properties_t driver_props;
+    ze_driver_properties_t driver_props = { .stype = ZE_STRUCTURE_TYPE_DRIVER_PROPERTIES,
+                                            .pNext = nullptr };
     ZE_CALL(zeDriverGetProperties, (driver, &driver_props));
 
     if (comm->get_rank() == 0) {

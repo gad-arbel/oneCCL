@@ -1,7 +1,7 @@
 # oneAPI Collective Communications Library (oneCCL) <!-- omit in toc --> <img align="right" width="200" height="100" src="https://raw.githubusercontent.com/uxlfoundation/artwork/e98f1a7a3d305c582d02c5f532e41487b710d470/foundation/uxl-foundation-logo-horizontal-color.svg">
 
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/oneapi-src/oneCCL/badge)](https://scorecard.dev/viewer/?uri=github.com/oneapi-src/oneCCL)
-[Installation](#installation)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Usage](#usage)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Release Notes](https://www.intel.com/content/www/us/en/developer/articles/release-notes/oneapi-collective-communication-library-ccl-release-notes.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](https://oneapi-src.github.io/oneCCL/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[How to Contribute](CONTRIBUTING.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[License](LICENSE)
+[Installation](#installation)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Usage](#usage)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Release Notes](https://www.intel.com/content/www/us/en/developer/articles/release-notes/oneapi-collective-communication-library-ccl-release-notes.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](https://oneapi-src.github.io/oneCCL/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[How to Contribute](../../CONTRIBUTING.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[License](LICENSE)
 
 oneAPI Collective Communications Library (oneCCL) provides an efficient implementation of communication patterns used in deep learning.
 
@@ -17,7 +17,7 @@ oneCCL is governed by the [UXL Foundation](http://www.uxlfoundation.org) and is 
 - [Installation](#installation)
 - [Usage](#usage)
   - [Launching Example Application](#launching-example-application)
-    - [Using external MPI](#using-external-mpi)
+    - [Set Up an External MPI](#set-up-an-external-mpi)
   - [Setting workers affinity](#setting-workers-affinity)
     - [Automatic setup](#automatic-setup)
     - [Explicit setup](#explicit-setup)
@@ -34,7 +34,7 @@ oneCCL is governed by the [UXL Foundation](http://www.uxlfoundation.org) and is 
 
 ## Prerequisites 
 
-See [System Requirements](https://www.intel.com/content/www/us/en/developer/articles/system-requirements/oneapi-collective-communication-library-system-requirements.html) to learn about hardware and software requirements before getting started with oneCCL.
+See [System Requirements](https://www.intel.com/content/www/us/en/developer/articles/system-requirements/oneapi-collective-communication-library-system-requirements.html) to learn about hardware and software requirements before getting started with oneCCL. oneCCL no longer bundles libfabric. It needs libfabric 1.10 or later at runtime, both for its default OFI transport and for the Intel(R) MPI Library, which loads libfabric itself. Install it from your Linux distribution, the Intel(R) MPI Library, or conda-forge. To select a specific copy, set `CCL_OFI_LIBRARY_PATH=<path>/libfabric.so.1` for oneCCL, and `I_MPI_OFI_LIBRARY` or `LD_LIBRARY_PATH` for the Intel(R) MPI Library. oneCCL no longer bundles the Intel(R) MPI Library. Its MPI transport loads `libmpi.so.12` at runtime. The library builds against a vendored Intel(R) MPI 2021.18.0 header, which fixes its Application Binary Interface (ABI). Use an external MPI with a matching ABI, such as the Intel(R) MPI Library or MPICH. The examples and tests link the external MPI and run under its `mpirun`. Install the Intel(R) MPI Library from oneAPI or from the `impi_rt` package. A build with `-DENABLE_MPI_TESTS=OFF` needs no MPI.
 
 ## Installation
 
@@ -50,17 +50,11 @@ $ source <install_dir>/env/setvars.sh
 $ mpirun -n 2 <install_dir>/examples/benchmark/benchmark
 ```
 
-#### Use External mpi
+#### Set Up an External MPI
 
-In the vars.sh file, the `ccl-bundled-mpi` flag can have values "yes" or "no" to control whether bundled Intel MPI should be used or not. Current default value is "yes", which means that oneCCL temporarily overrides the mpi implementation in use.
+Source the environment of an external Intel(R) MPI Library before `setvars.sh` or `vars.sh`. That puts `mpirun` and `libmpi.so.12` on `PATH` and `LD_LIBRARY_PATH`.
 
-In order to suppress the behavior and use user-supplied or system-default mpi, use the following command *instead* of sourcing `setvars.sh`:
-
-```bash
-$ source <install_dir>/env/vars.sh --ccl-bundled-mpi=no
-```
-
-The mpi implementation will not be overridden. In this case, you need to ensure that the system finds all required mpi-related binaries.
+The `ccl-bundled-mpi` flag of `vars.sh` defaults to "no". With "yes", `vars.sh` uses `<install_dir>/opt/mpi` only if an install tree from an older version still has it. Otherwise it prints a warning and keeps the MPI in use. This "no" default is for the `ccl_public` distribution's `vars.sh`. A full oneCCL v2 package install uses a separate `vars.sh` with its own default.
 
 ### Set Workers Affinity
 
@@ -160,7 +154,7 @@ Support for the legacy C++ API shall remain in the release until future notice. 
 
 ## Contribute <!-- omit in toc -->
 
-See [CONTRIBUTING](CONTRIBUTING.md) for more information.
+See [CONTRIBUTING](../../CONTRIBUTING.md) for more information.
 
 ## License <!-- omit in toc -->
 

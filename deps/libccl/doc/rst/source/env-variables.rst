@@ -1592,20 +1592,31 @@ CCL_KVS_MODE
    * - <cpulist>
      - Description
    * - ``pmi``
-     - PMI transport (default) 
-       
+     - PMI transport (default)
+
+   * - ``occp``
+     - OCCP bootstrap. The unique id returned by ``onecclGetUniqueId`` /
+       ``ccl::create_main_kvs()`` carries the address of an OCCP server that is started on the fly,
+       and every rank reports to it once instead of exchanging data rank by rank.
+
    * - ``mpi``
-     - MPI transport  
+     - MPI transport
 
    * - ``pmix_ofi``
      - Enable PMIx operations (put/get/fence/commit) in the OFI transport path, bypassing the default KVS layer.
 
    * - ``pmix_ofi_shm``
-     - An optimized variant of ``pmix_ofi`` that uses shared memory transfers for intra-node (scale-up) communication while retaining PMIx put/get/fence for scale-out. 
+     - An optimized variant of ``pmix_ofi`` that uses shared memory transfers for intra-node (scale-up) communication while retaining PMIx put/get/fence for scale-out.
 
 **Description**
 
-Set the ``CCL_KVS_MODE`` environment variable to choose the key-value store mechanism used during communicator creation. For the MPI-based transport (``CCL_ATL_TRANSPORT=mpi``), use ``mpi``. For large-scale runs with the OFI transport and PMIx (``CCL_ATL_TRANSPORT=ofi`` and ``CCL_PROCESS_LAUNCHER=pmix``), we recommend using ``pmix_ofi`` or ``pmix_ofi_shm``. The ``pmix_ofi`` modes bypass the default KVS layer in favor of the PMIx operations (put/get/fence/commit) and can yield performance benefits, especially at scale. 
+Set the ``CCL_KVS_MODE`` environment variable to choose the key-value store mechanism used during communicator creation. For the MPI-based transport (``CCL_ATL_TRANSPORT=mpi``), use ``mpi``. For large-scale runs with the OFI transport and PMIx (``CCL_ATL_TRANSPORT=ofi`` and ``CCL_PROCESS_LAUNCHER=pmix``), we recommend using ``pmix_ofi`` or ``pmix_ofi_shm``. The ``pmix_ofi`` modes bypass the default KVS layer in favor of the PMIx operations (put/get/fence/commit) and can yield performance benefits, especially at scale.
+
+``occp`` is opt-in and applies only to communicators created from a unique id. Three rules follow from that:
+
+* A job that gets its ranks from the launcher only (``ccl::create_communicator()`` without a kvs) mints no unique id and keeps using ``pmi``, even with ``CCL_KVS_MODE=occp``.
+* ``occp`` requires the OFI transport, so it is switched to ``pmi`` on any other transport.
+* ``ccl::kvs::get()`` and ``ccl::kvs::set()`` are not available under ``occp``, because the OCCP bootstrap is not a key-value store. Keep the ``pmi`` default to use ``ccl::kvs`` that way.
 
 ATL
 ###

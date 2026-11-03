@@ -25,75 +25,51 @@
 #endif //#if defined(CCL_ENABLE_ZE) || defined(CCL_ENABLE_SYCL)
 
 #include "common/global/global.hpp"
+#include "coll/algorithms/utils/sycl_policy.hpp"  // ccl::sycl_policy::scaleout_algo
 #include "coll/selection/selection.hpp"
 
 // dispatching between SYCL path and Scheduler path
 bool can_use_sycl_kernels(const ccl_selector_param& param);
 
-// scale-up attributes used for various purposes
-struct sycl_coll_scaleup_attr {
-    bool wait_on_deps{ false };
-    bool force_use_tmp{ false };
-};
+using sycl_scaleout_tune_attr = ccl::sycl_policy::sycl_scaleout_tune_attr;
 
-// scale-out collective tuning parameters
-enum class allreduce_scaleout_algo { direct, rabenseifner, ring };
-enum class reduce_scatter_scaleout_algo { direct, ring };
-enum class allgatherv_scaleout_algo { direct, ring };
-enum class alltoall_scaleout_algo {
-    direct,
-    pairwise,
-    gdr_only_pairwise,
-    scatter,
-    numa_gdr_only,
-    numa_gdr_split,
-    fallback
-};
 
-struct sycl_allreduce_tune_attr {
-    allreduce_scaleout_algo algo{ allreduce_scaleout_algo::direct };
-    size_t pipeline_chunk_size{ 2 * 1024 * 1024 };
-};
+class sycl_scaleout_selector {
+public:
+    sycl_scaleout_selector(size_t size,
+                           size_t comm_size,
+                           ccl_datatype dtype,
+                           bool is_recording) noexcept
+        : size(size), comm_size(comm_size), dtype(dtype), is_recording(is_recording) {}
 
-struct sycl_reduce_scatter_tune_attr {
-    reduce_scatter_scaleout_algo algo{ reduce_scatter_scaleout_algo::direct };
-    size_t pipeline_chunk_size{ 2 * 1024 * 1024 };
-};
+    sycl_scaleout_tune_attr allreduce()      const;
+    sycl_scaleout_tune_attr reduce_scatter() const;
+    sycl_scaleout_tune_attr allgatherv()     const;
+    sycl_scaleout_tune_attr alltoall()       const;
+    sycl_scaleout_tune_attr scatter()        const;
+    sycl_scaleout_tune_attr broadcast()      const;
+    sycl_scaleout_tune_attr reduce()         const;
 
-struct sycl_allgatherv_tune_attr {
-    allgatherv_scaleout_algo algo{ allgatherv_scaleout_algo::direct };
-    size_t pipeline_chunk_size{ 2 * 1024 * 1024 };
-};
-
-struct sycl_alltoall_tune_attr {
-    alltoall_scaleout_algo algo{ alltoall_scaleout_algo::direct };
-};
-
-// alleduce
-size_t allreduce_select_chunk_size(allreduce_scaleout_algo algo, size_t size, size_t comm_size);
-sycl_allreduce_tune_attr allreduce_select_tune_attr(size_t size,
-                                                    size_t comm_size,
-                                                    ccl_datatype ccl_dtype,
-                                                    bool is_recording);
-
-// reduce-scatter
-sycl_reduce_scatter_tune_attr reduce_scatter_select_tune_attr(size_t size,
-                                                              size_t comm_size,
-                                                              ccl_datatype ccl_dtype,
-                                                              bool is_recording);
-size_t reduce_scatter_select_chunk_size(reduce_scatter_scaleout_algo algo,
+    static size_t allreduce_chunk_size(ccl::sycl_policy::scaleout_algo algo,
+                                       size_t size,
+                                       size_t comm_size);
+    static size_t reduce_scatter_chunk_size(ccl::sycl_policy::scaleout_algo algo,
+                                            size_t size,
+                                            size_t comm_size);
+    static size_t allgatherv_chunk_size(ccl::sycl_policy::scaleout_algo algo,
                                         size_t size,
                                         size_t comm_size);
 
-// allgatherv
-sycl_allgatherv_tune_attr allgatherv_select_tune_attr(size_t size,
-                                                      size_t comm_size,
-                                                      ccl_datatype ccl_dtype,
-                                                      bool is_recording);
+    size_t size;
+    size_t comm_size;
+    ccl_datatype dtype;
+    bool is_recording;
+};
 
-size_t allgatherv_select_chunk_size(allgatherv_scaleout_algo algo, size_t size, size_t comm_size);
-
-// alltoall
-sycl_alltoall_tune_attr alltoall_select_tune_attr(size_t size,
-                                                  size_t comm_size,
-                                                  ccl_datatype ccl_dtype);
+// Per-message-size chunk sizes for the CCL_SYCL_<COLL>_SIMPLE_CHUNK_SIZE envs,
+// parsed with the same "<value>:<lo>-<hi>;..." syntax as CCL_SYCL_ALLREDUCE_LL.
+// Values are chunk sizes in bytes; 0 (or an empty spec) disables chunking.
+using simple_chunk_size_table_t = ccl_selection_table_t<size_t>;
+simple_chunk_size_table_t parse_simple_chunk_size_spec(const char* env_name,
+                                                       const std::string& spec);
+size_t select_simple_chunk_size(const simple_chunk_size_table_t& table, size_t msg_bytes);

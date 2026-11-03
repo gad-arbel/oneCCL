@@ -16,6 +16,8 @@
 
 #include "coll/algorithms/alltoall/sycl/alltoall_large_sycl_impl.hpp"
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
+#include "coll/algorithms/utils/sycl_selection.hpp"
+#include "coll/selection/policy/policy_env.hpp"
 
 ccl::event alltoall_large(const void* send_buf,
                           void* recv_buf,
@@ -23,6 +25,7 @@ ccl::event alltoall_large(const void* send_buf,
                           std::vector<size_t>& offsets,
                           ccl::datatype dtype,
                           ccl_comm* comm,
+                          const std::shared_ptr<ccl_comm> p2p_comm,
                           ccl_stream* global_stream,
                           const ccl::vector_class<ccl::event>& deps) {
     LOG_DEBUG("invoking alltoall_large");
@@ -33,13 +36,25 @@ ccl::event alltoall_large(const void* send_buf,
     const size_t dsize = ccl::global_data::get().dtypes->get(dtype).size();
 
     bool is_arc = is_arc_card(ccl::global_data::get().ze_data->devices[0].family);
-    CCL_THROW_IF_NOT(!ccl::global_data::env().sycl_copy_engine || is_arc,
+    static const simple_chunk_size_table_t simple_chunk_sizes =
+        parse_simple_chunk_size_spec(CCL_SYCL_ALLTOALL_SIMPLE_CHUNK_SIZE,
+                                     ccl::global_data::env().sycl_alltoall_simple_chunk_size);
+    // ARC does chunking as needed unless the simple-path spec overrides it
+    // the policy knob `simple_chunk_size`, when set for this call, replaces the spec
+    const size_t chunk_size =
+        ccl::selection::call_env().sycl_alltoall_simple_chunk_size_override
+            ? ccl::selection::call_env().sycl_alltoall_simple_chunk_size_override
+            : !simple_chunk_sizes.empty()
+                  ? select_simple_chunk_size(simple_chunk_sizes, count * dsize)
+                  : (is_arc ? ccl::global_data::env().sycl_alltoall_chunking_threshold : 0);
+    CCL_THROW_IF_NOT(!ccl::selection::call_env().sycl_copy_engine || is_arc,
                      "alltoall using copy engines not supported");
 
     // no constraints on rank reordering - performance should not be affected
     // end-to-end transfers are performed
     if (comm->is_multi_thread_instance() == true) {
-        LOG_DEBUG("|MT|: invoking alltoall_large");
+        // LOG_DEBUG("|MT|: invoking alltoall_large");
+        CCL_THROW("simple protocol with SPMD is not supported");
     }
     else {
         LOG_DEBUG("invoking alltoall_large");
@@ -47,7 +62,7 @@ ccl::event alltoall_large(const void* send_buf,
 
     auto lambda = [&]<typename T>() {
         return alltoall_large_impl<T>(
-            send_buf, recv_buf, count, offsets, dtype, comm, global_stream, deps);
+            send_buf, recv_buf, count, offsets, dtype, comm, p2p_comm, global_stream, deps, chunk_size);
     };
     return invoke_collective(lambda, dtype);
 }

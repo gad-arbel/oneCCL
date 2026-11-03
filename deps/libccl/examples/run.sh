@@ -54,6 +54,30 @@ declare -i total_skipped=0
 declare -i log_idx=0
 declare -i total_tests=0
 
+# Per-test time limits in seconds. A hung test is killed after its limit instead of holding
+# the node until the Slurm job limit.
+# KILL_AFTER is the grace period, in seconds, between SIGTERM and SIGKILL.
+# Set them in the environment to override.
+EXAMPLE_TIMEOUT=${EXAMPLE_TIMEOUT:-120}
+BENCHMARK_TIMEOUT_GPU=${BENCHMARK_TIMEOUT_GPU:-300}
+BENCHMARK_TIMEOUT_CPU=${BENCHMARK_TIMEOUT_CPU:-3600}
+KILL_AFTER=${KILL_AFTER:-60}
+TIMEOUT_MARKER="test timed out after"
+
+# check_test judges a test by its log, so a test killed by timeout (exit code 124, or 137
+# when it ignored SIGTERM) must leave a line in it: the marker that check_test looks for.
+report_timeout()
+{
+    local rc=$1
+    local test_log=$2
+    local limit=$3
+
+    if [ ${rc} -eq 124 ] || [ ${rc} -eq 137 ]
+    then
+        echo "Error: ${TIMEOUT_MARKER} ${limit}s" | tee -a ${test_log}
+    fi
+}
+
 check_test()
 {
     local test_log=$1
@@ -75,10 +99,12 @@ check_test()
     test_passed=`grep -E -c -i "${passed_pattern}" ${test_log}`
     test_failed=`grep -E -i "${failed_pattern}" ${test_log} | grep -Evc "${exclude_pattern}"`
     test_skipped=`grep -E -c -i "${skipped_pattern}" ${test_log}`
+    test_timed_out=`grep -c "${TIMEOUT_MARKER}" ${test_log}`
 
     total_tests=$((total_tests + 1))
     result=""
-    if ([ ${test_passed} -eq 0 ] || [ ${test_skipped} -eq 0 ]) && [ ${test_failed} -ne 0 ]
+    # A timed-out test fails even if its log also matches the passed and skipped patterns.
+    if [ ${test_timed_out} -ne 0 ] || { ([ ${test_passed} -eq 0 ] || [ ${test_skipped} -eq 0 ]) && [ ${test_failed} -ne 0 ]; }
     then
         echo "Error: example $test_file testing failed"
         echo "See log ${test_log} for details"
@@ -176,6 +202,13 @@ check_environment()
             echo "Error: MPI not found."
             exit 1
         fi
+    fi
+
+    which timeout >/dev/null 2>&1
+    if [[ $? != 0 ]]
+    then
+        echo "Error: timeout not found."
+        exit 1
     fi
 
     if [[ -z "${CCL_ROOT}" ]]
@@ -305,6 +338,14 @@ run_benchmark()
     fi
     options="${options} --buf_count ${buf_count} --iters ${iter_count} ${extra_options}"
 
+    local test_timeout=${BENCHMARK_TIMEOUT_GPU}
+    local cmd_rc
+    # The host backend runs the CPU workload, so it gets the CPU limit in any mode.
+    if [[ ${MODE} = "cpu" || ${backend} = "host" ]]
+    then
+        test_timeout=${BENCHMARK_TIMEOUT_CPU}
+    fi
+
     for usm in $usm_list;
     do
         echo "usm: " $usm
@@ -321,25 +362,28 @@ run_benchmark()
 
         if [ `echo $ccl_bench_env | grep -c CCL_LOG_LEVEL` -ne 1 ]
         then
-            cmd=`echo $ccl_bench_env mpiexec.hydra -n $n -ppn $ppn -l ./$example ${final_options}`
+            cmd=`echo $ccl_bench_env timeout --kill-after=${KILL_AFTER} ${test_timeout} mpiexec.hydra -n $n -ppn $ppn -l ./$example ${final_options}`
             echo "Running: $cmd"
-            eval $cmd 2>&1 | tee ${test_log}
+            eval $cmd 2>&1 | tee ${test_log}; cmd_rc=${PIPESTATUS[0]}
+            report_timeout ${cmd_rc} ${test_log} ${test_timeout}
             check_test ${test_log} ${example}
         else
             log_debug_test_log="${test_log}.${n}_ranks_ppn_${ppn}"
             echo "output for run with CCL_LOG_LEVEL=debug and ${n} ranks has been redirected to log file ${log_debug_test_log}"
-            cmd=`echo $ccl_bench_env mpiexec.hydra -n $n -ppn $ppn -l ./$example ${final_options}`
+            cmd=`echo $ccl_bench_env timeout --kill-after=${KILL_AFTER} ${test_timeout} mpiexec.hydra -n $n -ppn $ppn -l ./$example ${final_options}`
             echo "Running: $cmd"
-            eval $cmd > ${log_debug_test_log} 2>&1
+            eval $cmd > ${log_debug_test_log} 2>&1; cmd_rc=$?
+            report_timeout ${cmd_rc} ${log_debug_test_log} ${test_timeout}
             check_test ${log_debug_test_log} ${example}
 
             if [ "${transport}" == "ofi" ] && [ "${ppn}" == "1" ];
             then
                 log_debug_test_log="${test_log}.${n}_rank"
                 echo "output for run with CCL_LOG_LEVEL=debug and 1 rank has been redirected to log file ${log_debug_test_log}"
-                cmd=`echo $ccl_bench_env mpiexec.hydra -n $n -ppn $ppn -l ./$example ${final_options}`
+                cmd=`echo $ccl_bench_env timeout --kill-after=${KILL_AFTER} ${test_timeout} mpiexec.hydra -n $n -ppn $ppn -l ./$example ${final_options}`
                 echo "Running: $cmd"
-                eval $cmd > ${log_debug_test_log} 2>&1
+                eval $cmd > ${log_debug_test_log} 2>&1; cmd_rc=$?
+                report_timeout ${cmd_rc} ${log_debug_test_log} ${test_timeout}
                 check_test ${log_debug_test_log} ${example}
             fi
         fi
@@ -367,11 +411,13 @@ run_example()
 
     log_idx=${log_idx}+1
     local test_log="$LOGS_DIR/$dir_name/run_${dir_name}_${transport}_${example}_${log_idx}.log"
+    local cmd_rc
     mkdir -p $(dirname "${test_log}")
 
-    cmd=`echo $ccl_extra_env mpiexec.hydra -n $n -ppn $ppn -l ./$example $arg`
+    cmd=`echo $ccl_extra_env timeout --kill-after=${KILL_AFTER} ${EXAMPLE_TIMEOUT} mpiexec.hydra -n $n -ppn $ppn -l ./$example $arg`
     echo "Running $cmd"
-    eval $cmd 2>&1 | tee ${test_log}
+    eval $cmd 2>&1 | tee ${test_log}; cmd_rc=${PIPESTATUS[0]}
+    report_timeout ${cmd_rc} ${test_log} ${EXAMPLE_TIMEOUT}
     check_test ${test_log} ${example}
 }
 
@@ -660,6 +706,8 @@ run()
                                 do
                                     if [[ "${example}" == "sycl_allgatherv_usm_comm_split" || \
                                           "${example}" == "sycl_reduce_scatter_usm_comm_split" || \
+                                          "${example}" == "sycl_scatter_usm_comm_split" || \
+                                          "${example}" == "sycl_gather_usm_comm_split" || \
                                           "${example}" == "sycl_allreduce_usm_comm_split" ]] && [[ "${n}" != 4 ]]; then
                                         continue
                                     fi
@@ -700,6 +748,8 @@ run()
                     else
                         if [[ "${example}" == "sycl_allgatherv_usm_comm_split" || \
                               "${example}" == "sycl_reduce_scatter_usm_comm_split" || \
+                              "${example}" == "sycl_scatter_usm_comm_split" || \
+                              "${example}" == "sycl_gather_usm_comm_split" || \
                               "${example}" == "sycl_allreduce_usm_comm_split" ]] && [[ "${n}" != 4 ]]; then
                             continue
                         fi

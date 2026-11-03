@@ -39,7 +39,8 @@ enum class device_family {
     family5,
     family6,
     family7,
-    family8
+    family8,
+    family9
 };
 
 std::string to_string(device_family family);
@@ -47,6 +48,10 @@ std::string to_string(device_family family);
 } // namespace ccl
 
 std::string to_string(const stream_type& type);
+
+#ifdef CCL_ENABLE_SYCL
+struct pinned_copy_queue;
+#endif // CCL_ENABLE_SYCL
 
 class alignas(CACHELINE_SIZE) ccl_stream : public stream_selector {
 public:
@@ -73,6 +78,13 @@ public:
     ze_device_handle_t get_ze_device() const;
     ze_context_handle_t get_ze_context() const;
 #endif // CCL_ENABLE_ZE
+
+    // This stream's queue for the CRI self copy, null until get_last_copy_engine_queue() makes
+    // it.
+    std::shared_ptr<pinned_copy_queue> self_copy_queue;
+
+    // CE/EU pipeline queue, made on first use by plan_ce_eu_pipeline()
+    std::shared_ptr<pinned_copy_queue> ce_pipeline_queue;
 #endif // CCL_ENBALE_SYCL
 
     static std::unique_ptr<ccl_stream> create(stream_native_t& native_stream,

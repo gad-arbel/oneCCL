@@ -7,10 +7,12 @@
     The existing C++ API will remain the default API for the 2021.17 release and can be found `here <../index.html>`_.
 ```
 
-Alongside introduction of new API for oneCCL we introduced a concept of oneCCL plugins. The plugin interface was designed to provide dynamic selection of backends for different hardware platforms. Currently oneCCL provides two plugins - `onecclLegacy` and `onecclLegacyCpu`, which are based on `libccl.so.1.0` and provide the same functional capabilities. On startup oneCCL will load the most appropriate plugin unless user specifies [`CCL_PLUGIN`](project:./env.md#ccl-plugin) environment variable to override it.
+Alongside introduction of new API for oneCCL we introduced a concept of oneCCL plugins. The plugin interface was designed to provide dynamic selection of backends for different hardware platforms. Currently oneCCL provides two plugins - `onecclLegacy` and `onecclLegacyCpu`, which are based on `libccl.so.1.0` and provide the same functional capabilities. On startup oneCCL will load the most appropriate plugin unless user specifies [`CCL_PLUGIN`](project:./env.md#ccl-plugin) environment variable to override it. oneCCL also provides the `onecclNull` plugin, which does no communication. Only `CCL_PLUGIN=ONECCL_NULL` selects it.
+
+Each thread selects its plugin on its first oneCCL call. oneCCL loads each plugin, asks it to score the platform, and selects the plugin with the highest positive score. It unloads the other plugins. The two legacy plugins load different builds of `libccl.so.1` with the same name, so they cannot be loaded together.
 
 ## Plugins and their features
- * `onecclLegacy` - supports both CPU and GPU collectives, selected by default if `libsycl.so.8` is available on the platform. The plugin will select CPU or GPU backend on following conditions:
+ * `onecclLegacy` - supports both CPU and GPU collectives, selected by default if SYCL finds a Level Zero GPU. Without one, oneCCL selects `onecclLegacyCPU`. The plugin will select CPU or GPU backend on following conditions:
    * Operations such as the `onecclAllreduce` collective take as argument a `void *stream`. When the collective uses GPU buffers, the `stream` should be a pointer to a SYCL queue. 
    * If the collective uses a host buffer, the `stream` can be a pointer to a SYCL queue or `NULL`. When the `stream` is a SYCL queue, oneCCL will use the stream to submit the new collective after the operations previously submitted to the SYCL queue, even if the collective itself executes in the host. When the `stream` is `NULL`, the collective executes right away in a blocking mode. 
  * `onecclLegacyCPU` - The `stream` argument should be `NULL`, but in any case, the implementation will ignore the value of the argument. 

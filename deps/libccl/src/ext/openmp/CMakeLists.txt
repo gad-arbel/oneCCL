@@ -6,6 +6,7 @@ if(NOT TARGET ccl)
 endif()
 
 target_include_directories(ccl_openmp PUBLIC ${SRC_INCLUDE_DIRS})
+target_include_directories(ccl_openmp PRIVATE ${SRC_PRIVATE_INCLUDE_DIRS})
 target_link_libraries(ccl_openmp PUBLIC OpenMP::OpenMP_CXX ccl)
 
 set_target_properties(ccl_openmp PROPERTIES VERSION 0)

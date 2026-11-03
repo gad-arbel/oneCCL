@@ -148,8 +148,13 @@ struct Send {
                             ll_pattern_data.process_update(
                                 type, global_current_id, my_rank, peer_rank, n_steps);
                         }
-                        check_zero_buffers_gpu(
-                            ll_pattern_data, it, barrier_data, ipcbuf0, ipcbuf1, tmp_buf_size);
+                        check_zero_buffers_gpu(ll_pattern_data,
+                                               it,
+                                               barrier_data,
+                                               ipcbuf0,
+                                               ipcbuf1,
+                                               tmp_buf_size,
+                                               type);
                     });
             });
 

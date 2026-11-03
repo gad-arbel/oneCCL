@@ -16,6 +16,7 @@ if (${CMAKE_PROJECT_NAME} STREQUAL ${PROJECT_NAME})
     set(COMMON_CMAKE_DIR ${PROJECT_SOURCE_DIR}/../../cmake)
     include(${COMMON_CMAKE_DIR}/helpers.cmake)
     define_compute_backend()
+    find_package(MPI REQUIRED)
 endif()
 
 if (NOT PV_ENVIRONMENT)
@@ -26,25 +27,19 @@ endif()
 
 set(EXAMPLES_INC_DIRS ${EXAMPLES_DIR}/include)
 message(STATUS "EXAMPLES_INC_DIRS: ${EXAMPLES_INC_DIRS}")
-message(STATUS "EXAMPLES_LIB_DIRS: ${EXAMPLES_LIB_DIRS}")
 include_directories(${EXAMPLES_INC_DIRS})
-link_directories(${EXAMPLES_LIB_DIRS})
 
 set(REG_TESTS_DIR ${PROJECT_SOURCE_DIR})
 set(REG_TESTS_INC_DIR ${REG_TESTS_DIR}/include)
 message(STATUS "REG_TESTS_INC_DIR: ${REG_TESTS_INC_DIR}")
 include_directories(${REG_TESTS_INC_DIR})
 
-if (DEFINED ENV{I_MPI_ROOT})
-    set(I_MPI_ROOT "$ENV{I_MPI_ROOT}")
-endif()
-
 if (DEFINED ENV{CCL_ROOT})
     set(CCL_ROOT "$ENV{CCL_ROOT}")
 endif()
 message(STATUS "CCL_ROOT: ${CCL_ROOT}")
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if (${CMAKE_VERSION} VERSION_LESS 3.1)
@@ -73,4 +68,10 @@ if ("${COMPUTE_BACKEND}" STREQUAL "dpcpp")
     add_subdirectory(sycl)
     add_subdirectory(sycl/pt2pt)
     add_subdirectory(sycl/inference)
+    # internal tests use internal headers and are only available when
+    # building as part of the main oneCCL tree; guard on ccl-static as
+    # an indicator that this build context is available.
+    if (TARGET ccl-static)
+        add_subdirectory(sycl/internal_tests)
+    endif()
 endif()

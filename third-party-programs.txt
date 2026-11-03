@@ -1,5 +1,5 @@
 Intel(R) oneAPI Collective Communications Library (oneCCL) 
-2022.1.0 Third Party Programs File
+2022.3.0 Third Party Programs File
 
 This file is the "third-party-programs.txt" file specified in the associated 
 Intel end user license agreement for the Intel software you are licensing.
@@ -465,6 +465,47 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+The file hwloc/base64.c (compiled into libhwloc) additionally carries the
+following ISC-licensed notice and IBM permission notice from OpenBSD:
+
+Copyright (c) 1996 by Internet Software Consortium.
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND INTERNET SOFTWARE CONSORTIUM DISCLAIMS
+ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL INTERNET SOFTWARE
+CONSORTIUM BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS
+ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS
+SOFTWARE.
+
+Portions Copyright (c) 1995 by International Business Machines, Inc.
+
+International Business Machines, Inc. (hereinafter called IBM) grants
+permission under its copyrights to use, copy, modify, and distribute this
+Software with or without fee, provided that the above copyright notice and
+all paragraphs of this notice appear in all copies, and that the name of IBM
+not be used in connection with the marketing of any product incorporating
+the Software or modifications thereof, without specific, written prior
+permission.
+
+To the extent it has a right to do so, IBM grants an immunity from suit
+under its patents, if any, for the use, sale or manufacture of products to
+the extent that such products are used for performing Domain Name System
+dynamic updates in TCP/IP networks by means of the Software.  No immunity is
+granted for any product per se or for any other function of any product.
+
+THE SOFTWARE IS PROVIDED "AS IS", AND IBM DISCLAIMS ALL WARRANTIES,
+INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+PARTICULAR PURPOSE.  IN NO EVENT SHALL IBM BE LIABLE FOR ANY SPECIAL,
+DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER ARISING
+OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE, EVEN
+IF IBM IS APPRISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
 -------------------------------------------------------------------------------
 
 6. Googletest
@@ -599,9 +640,11 @@ Copyright (c) 2010-2011 Alex Brick <bricka@ccs.neu.edu>.  All rights reserved.
 Copyright (c) 2012      The University of Wisconsin-La Crosse. All rights
                         reserved.
 Copyright (c) 2013-2019 Intel, Inc. All rights reserved.
+Copyright (c) 2020-2023 Nanook Consulting. All rights reserved
 Copyright (c) 2011-2014 NVIDIA Corporation.  All rights reserved.
-Copyright (c) 2019      Amazon.com, Inc. or its affiliates.  All Rights
+Copyright (c) 2019-2023 Amazon.com, Inc. or its affiliates.  All Rights
                         reserved.
+Copyright (c) 2022-2023 Triad National Security, LLC. All rights reserved
 
 $COPYRIGHT$
 

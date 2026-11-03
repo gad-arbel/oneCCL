@@ -33,6 +33,7 @@
 
 class ccl_datatype_storage;
 class ccl_executor;
+class ccl_proxy_service;
 class ccl_sched_cache;
 class ccl_parallelizer;
 class ccl_fusion_manager;
@@ -95,6 +96,8 @@ public:
 
 #if defined(CCL_ENABLE_ZE) && defined(CCL_ENABLE_SYCL)
     std::unique_ptr<ze::global_data_desc> ze_data;
+    std::string ze_init_error;
+    std::unique_ptr<ccl_proxy_service> proxy_service;
 #endif // CCL_ENABLE_ZE && CCL_ENABLE_SYCL
 
     static thread_local bool is_worker_thread;

@@ -43,7 +43,7 @@ packed_struct rank_info_t {
 };
 
 packed_struct ofi_endpoint_t {
-    uint8_t data[64] = {}; // Example EFI configuration data, size is fixed
+    uint8_t data[256] = {}; // OFI endpoint name, size is fixed and must hold FI_NAME_MAX bytes
 };
 
 using ranks_t = std::vector<rank_t>;

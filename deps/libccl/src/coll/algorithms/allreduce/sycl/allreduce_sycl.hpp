@@ -19,26 +19,6 @@
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
 #include "coll/algorithms/utils/sycl_selection.hpp"
 
-#define SYCL_ALLREDUCE_FUNCTIONS(MSGSIZE) \
-    void init_allreduce_##MSGSIZE(ccl::datatype dtype, \
-                                  sycl::queue& queue, \
-                                  ccl_comm* comm, \
-                                  ccl_stream* stream, \
-                                  uint32_t rank_in, \
-                                  uint32_t world_in); \
-    ccl::event run_allreduce_##MSGSIZE(ccl::datatype dtype, \
-                                       sycl::queue& q, \
-                                       const void* in_buf, \
-                                       void* out_buf, \
-                                       size_t count, \
-                                       ccl::reduction reduction, \
-                                       const ccl::vector_class<ccl::event>& deps, \
-                                       bool& done);
-
-SYCL_ALLREDUCE_FUNCTIONS(small)
-SYCL_ALLREDUCE_FUNCTIONS(medium)
-SYCL_ALLREDUCE_FUNCTIONS(large)
-
 namespace ccl {
 
 namespace v1 {
@@ -64,6 +44,7 @@ ccl::event allreduce_small(const void* send_buf,
                            ccl::datatype dtype,
                            ccl::reduction reduction,
                            ccl_comm* comm,
+                           std::shared_ptr<ccl_comm> p2p_comm,
                            ccl_stream* global_stream,
                            const ccl::vector_class<ccl::event>& deps);
 
@@ -73,6 +54,7 @@ ccl::event allreduce_large(const void* send_buf,
                            ccl::datatype dtype,
                            ccl::reduction reduction,
                            ccl_comm* comm,
+                           const std::shared_ptr<ccl_comm> p2p_comm,
                            ccl_stream* global_stream,
                            const ccl::vector_class<ccl::event>& deps);
 
@@ -84,6 +66,7 @@ ccl::event allreduce_ll(const void* src,
                         ccl::datatype dtype,
                         ccl::reduction reduction,
                         ccl_comm* comm,
+                        const std::shared_ptr<ccl_comm> p2p_comm,
                         ccl_stream* global_stream,
                         bool& done);
 
@@ -96,6 +79,7 @@ ccl::event allreduce_scaleout_sycl(sycl::queue& q,
                                    ccl_comm* comm,
                                    const ccl::vector_class<ccl::event>& deps,
                                    bool original_deps,
-                                   sycl_allreduce_tune_attr tune_attr,
+                                   sycl_scaleout_tune_attr tune_attr,
                                    bool& done,
-                                   bool is_cpu_buffers = false);
+                                   bool is_cpu_buffers = false,
+                                   bool is_remainder_chunk = false);

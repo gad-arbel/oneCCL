@@ -105,16 +105,29 @@ static bool parse_size(const char *value, size_t *out) {
     return true;
 }
 
+// DPC++ by default requires a kernel range to fit in a signed int, so the
+// data kernels below launch at most this many work-items and each work-item
+// strides over the remaining elements.
+static constexpr size_t max_work_items = static_cast<size_t>(1) << 30;
+
+static size_t data_kernel_range(size_t count) {
+    return std::min(count, max_work_items);
+}
+
 // SYCL kernel to initialize input data
 template <typename T>
 static testResult_t oneccl_init_data_kernel(sycl::queue *queue, T *data,
                                             const size_t count, int rank) {
+    size_t const stride = data_kernel_range(count);
     // NOLINTBEGIN
     SYCLCHECK(queue
                   ->submit([&](sycl::handler &cgh) {
                       cgh.parallel_for(
-                          sycl::range<1>(count),
-                          [=](sycl::id<1> i) { data[i] = (T)(rank + 1); });
+                          sycl::range<1>(stride), [=](sycl::id<1> id) {
+                              for (size_t i = id[0]; i < count; i += stride) {
+                                  data[i] = (T)(rank + 1);
+                              }
+                          });
                   })
                   .wait());
     // NOLINTEND
@@ -145,12 +158,16 @@ oneccl_init_data_reduce_kernel(sycl::queue *queue, T *data, const size_t count,
         expected = static_cast<T>(0);
     }
 
+    size_t const stride = data_kernel_range(count);
     // NOLINTBEGIN
     SYCLCHECK(queue
                   ->submit([&](sycl::handler &cgh) {
                       cgh.parallel_for(
-                          sycl::range<1>(count),
-                          [=](sycl::id<1> i) { data[i] = expected; });
+                          sycl::range<1>(stride), [=](sycl::id<1> id) {
+                              for (size_t i = id[0]; i < count; i += stride) {
+                                  data[i] = expected;
+                              }
+                          });
                   })
                   .wait());
     // NOLINTEND
@@ -165,18 +182,22 @@ static testResult_t oneccl_check_data_kernel(sycl::queue *queue, T *recvbuff,
     auto *d_wrong_elts = sycl::malloc_device<int64_t>(1, *queue);
     SYCLCHECK(queue->memset(d_wrong_elts, 0, sizeof(int64_t)).wait());
 
+    size_t const stride = data_kernel_range(count);
     // NOLINTBEGIN
     SYCLCHECK(
         queue
             ->submit([&](sycl::handler &cgh) {
-                cgh.parallel_for(sycl::range<1>(count), [=](sycl::id<1> i) {
-                    if (recvbuff[i] != expected[i]) {
-                        // Create atomic_ref inside the kernel from the raw
-                        // pointer
-                        sycl::atomic_ref<int64_t, sycl::memory_order::relaxed,
-                                         sycl::memory_scope::device>
-                            atomic_wrong(*d_wrong_elts);
-                        atomic_wrong.fetch_add(1);
+                cgh.parallel_for(sycl::range<1>(stride), [=](sycl::id<1> id) {
+                    for (size_t i = id[0]; i < count; i += stride) {
+                        if (recvbuff[i] != expected[i]) {
+                            // Create atomic_ref inside the kernel from the raw
+                            // pointer
+                            sycl::atomic_ref<int64_t,
+                                             sycl::memory_order::relaxed,
+                                             sycl::memory_scope::device>
+                                atomic_wrong(*d_wrong_elts);
+                            atomic_wrong.fetch_add(1);
+                        }
                     }
                 });
             })
@@ -465,13 +486,15 @@ static void oneccl_allreduce(struct threadArgs *args, T *value, int average) {
 static testResult_t oneccl_check_correctness(struct threadArgs *args,
                                              onecclDataType_t type,
                                              onecclRedOp_t /*operation*/,
-                                             int /*root*/, int in_place,
+                                             int root, int in_place,
                                              int64_t *wrongElts) {
     size_t const count = args->expectedBytes / word_size(type);
 
     auto *wrong_per_gpu = new int64_t[args->nGpus];
     bool isReduceScatter =
         (args->collTest && strcmp(args->collTest->name, "ReduceScatter") == 0);
+    bool isScatter =
+        (args->collTest && strcmp(args->collTest->name, "Scatter") == 0);
     size_t recvcount = args->expectedBytes / word_size(type);
 
     for (int i = 0; i < args->nGpus; i++) {
@@ -488,6 +511,11 @@ static testResult_t oneccl_check_correctness(struct threadArgs *args,
             } else {
                 data = args->recvbuffs[i];
             }
+        } else if (isScatter && in_place && rank == root) {
+            // in-place scatter result for the root aliases into its own block
+            // of the send buffer (recv == send + root*count)
+            size_t offBytes = (size_t)root * recvcount * word_size(type);
+            data = (char *)args->sendbuffs[i] + offBytes;
         } else {
             // other collectives: existing semantics
             data = in_place ? (void *)args->recvbuffs[i] : args->recvbuffs[i];
@@ -536,6 +564,11 @@ static testResult_t oneccl_start_coll(struct threadArgs *args,
                                       int in_place, int /*iter*/) {
     size_t const count = args->nbytes / word_size(type);
 
+    if (args->collTest == nullptr) {
+        fprintf(stderr, "ERROR: args->collTest is null.\n");
+        return testInternalError;
+    }
+
     if (args->nGpus > 1) {
         fprintf(stderr, "ERROR: Multiple GPUs per process are not currently "
                         "supported. Please use nGpus=1.\n");
@@ -545,14 +578,21 @@ static testResult_t oneccl_start_coll(struct threadArgs *args,
     if (args->nGpus > 1) {
         ONECCLCHECK(onecclGroupStart());
     }
+    bool isScatter = (strcmp(args->collTest->name, "Scatter") == 0);
     for (int i = 0; i < args->nGpus; i++) {
         int rank =
             ((args->proc * args->nThreads + args->thread) * args->nGpus + i);
         void *recv_buff = args->recvbuffs[i];
         void *send_buff = args->sendbuffs[i];
-        TESTCHECK(args->collTest->runColl(
-            (in_place ? recv_buff : send_buff), recv_buff, count, type,
-            operation, root, rank, args->comms[i], args->queues[i]));
+        // Scatter's large buffer is the send side (count*nranks) and only the
+        // root is ever in-place, aliasing its recv into sendbuff. Every other
+        // collective models in-place as recv==send.
+        void *coll_send = (in_place && !isScatter) ? recv_buff : send_buff;
+        void *coll_recv =
+            (in_place && isScatter && rank == root) ? send_buff : recv_buff;
+        TESTCHECK(args->collTest->runColl(coll_send, coll_recv, count, type,
+                                          operation, root, rank, args->comms[i],
+                                          args->queues[i]));
     }
     if (args->nGpus > 1) {
         ONECCLCHECK(onecclGroupEnd());
@@ -679,7 +719,16 @@ testResult_t timeTest(struct threadArgs *args, onecclDataType_t type,
     for (int iter = 0; iter < warmup_iters; iter++) {
         TESTCHECK(oneccl_start_coll(args, type, operation, root, 0, iter));
     }
+    // Touch the in-place path once here so that any one-time library message it
+    // triggers (e.g. an in-place fallback warning) is emitted before the table
+    // rather than in the middle of a result row.
+    if (args->runInplace == 1) {
+        TESTCHECK(oneccl_start_coll(args, type, operation, root, 1, 0));
+    }
     TESTCHECK(oneccl_complete_coll(args));
+
+    // Make sure warm-up output from every rank is out before the table starts.
+    barrier(args);
 
     if (!header_printed) {
         print_benchmark_headers(run_inplace);
@@ -840,8 +889,8 @@ static testResult_t discover_sycl_platform(sycl::platform *backend_platform) {
 static void print_benchmark_headers(int run_inplace) {
     PRINT("#\n");
     if (run_inplace != 0) {
-        PRINT("# %10s  %12s  %8s  %6s  %6s                 out-of-place        "
-              "                         in-place         \n",
+        PRINT("# %10s  %12s  %8s  %6s  %6s                 out-of-place"
+              "                    in-place\n",
               "", "", "", "", "");
         PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s %6s  %7s  %6s  %6s "
               "%6s\n",
@@ -906,7 +955,8 @@ static void launch_and_wait_threads(struct testThread *threads, int n_threads) {
         if (thread_idx > 0) {
             oneccl_thread_launch(threads + thread_idx);
         } else {
-            threads[thread_idx].func(&threads[thread_idx].args);
+            threads[thread_idx].ret =
+                threads[thread_idx].func(&threads[thread_idx].args);
         }
     }
 
@@ -1039,6 +1089,21 @@ static testResult_t oneccl_run() {
                            bw_count, local_rank, total_procs, proc);
 
     launch_and_wait_threads(threads, n_threads);
+
+    // A failed thread stops before reporting its results, so the summary
+    // below would print as a pass. Peer ranks may also be blocked in a
+    // collective the failed rank never joins, so abort the whole job.
+    for (int thread_idx = 0; thread_idx < n_threads; thread_idx++) {
+        if (threads[thread_idx].ret != testSuccess) {
+            fprintf(stderr,
+                    "%s: process %d thread %d failed with error %d, aborting\n",
+                    hostname, proc, thread_idx, threads[thread_idx].ret);
+#ifdef MPI_SUPPORT
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+#endif
+            return threads[thread_idx].ret;
+        }
+    }
 
     aggregate_thread_results(bandwidth, bw_count, errors, n_threads);
 #ifdef MPI_SUPPORT
@@ -1233,7 +1298,9 @@ int main(int argc, char *argv[]) {
     }
 
 #ifdef MPI_SUPPORT
-    MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, nullptr);
+    int mpi_thread_provided = 0;
+    MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE,
+                    &mpi_thread_provided);
 #endif
     TESTCHECK(oneccl_run());
     return 0;

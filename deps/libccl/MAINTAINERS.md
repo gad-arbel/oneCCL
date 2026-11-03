@@ -38,7 +38,7 @@ a Contributor by bringing value in one of the following ways:
 Responsibilities:
 
 - Follow the [Code of Conduct](CODE_OF_CONDUCT.md).
-- Follow the project [contributing guidelines](CONTRIBUTING.md).
+- Follow the project [contributing guidelines](../../CONTRIBUTING.md).
 
 Contributors open to long-term cooperation are encouraged
 to contact [oneccl.maintainers@intel.com](mailto:oneccl.maintainers@intel.com).

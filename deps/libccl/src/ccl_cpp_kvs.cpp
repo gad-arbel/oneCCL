@@ -27,22 +27,51 @@
 #include "common/global/global.hpp"
 
 #include "kvs_impl.hpp"
+#include "atl/util/pm/pmi_resizable_rt/pmi_resizable/kvs/occp_kvs.h"
 #ifdef CCL_ENABLE_STUB_BACKEND
 #include "stub_kvs_impl.hpp"
 #endif // CCL_ENABLE_STUB_BACKEND
 
 namespace ccl {
+
+namespace {
+
+/* Selects the kvs implementation behind ccl::kvs.
+ *
+ * When an address is minted (addr == nullptr) CCL_KVS_MODE decides, except that
+ * kvs_attr_id::ip_port pins the server to a fixed endpoint, which only
+ * internal_kvs implements.
+ *
+ * When an existing address is attached to, the address itself decides, so a rank
+ * whose CCL_KVS_MODE disagrees with the id it was given still joins the right
+ * bootstrap channel.
+ */
+std::shared_ptr<ikvs_wrapper> create_kvs_backend(const kvs_attr& attr, const char* addr) {
+    bool use_occp = (addr != nullptr)
+                        ? occp_kvs::is_occp_address(addr)
+                        : (ccl::global_data::env().kvs_init_mode == ccl::kvs_mode::occp &&
+                           !attr.is_valid<kvs_attr_id::ip_port>());
+    if (use_occp) {
+        return std::make_shared<occp_kvs>();
+    }
+
+    auto kvs = std::make_shared<internal_kvs>();
+    if (attr.is_valid<kvs_attr_id::ip_port>()) {
+        kvs->set_server_address(attr.get<kvs_attr_id::ip_port>());
+    }
+
+    return kvs;
+}
+
+} // namespace
+
 base_kvs_impl::base_kvs_impl(const kvs::address_type& addr) : addr(addr) {}
 
 native_kvs_impl::native_kvs_impl(const kvs_attr& attr) : base_kvs_impl() {
     CCL_THROW_IF_NOT(ccl::global_data::env().backend == backend_mode::native,
                      "incorrect non-native backend is used");
 
-    inter_kvs.reset(new internal_kvs());
-    if (attr.is_valid<kvs_attr_id::ip_port>()) {
-        std::string server_address = attr.get<kvs_attr_id::ip_port>();
-        inter_kvs->set_server_address(server_address);
-    }
+    inter_kvs = create_kvs_backend(attr, nullptr);
 
     inter_kvs->kvs_main_server_address_reserve(get_addr().data());
     inter_kvs->kvs_init(get_addr().data());
@@ -53,11 +82,7 @@ native_kvs_impl::native_kvs_impl(const kvs::address_type& addr, const kvs_attr& 
     CCL_THROW_IF_NOT(ccl::global_data::env().backend == backend_mode::native,
                      "incorrect non-native backend is used");
 
-    inter_kvs.reset(new internal_kvs());
-    if (attr.is_valid<kvs_attr_id::ip_port>()) {
-        std::string server_address = attr.get<kvs_attr_id::ip_port>();
-        inter_kvs->set_server_address(server_address);
-    }
+    inter_kvs = create_kvs_backend(attr, get_addr().data());
 
     inter_kvs->kvs_init(get_addr().data());
 }
@@ -83,7 +108,7 @@ void native_kvs_impl::set(const string_class& key, const vector_class<char>& dat
     inter_kvs->kvs_set_value(prefix.c_str(), key.c_str(), data.data());
 }
 
-std::shared_ptr<internal_kvs> native_kvs_impl::get() const {
+std::shared_ptr<ikvs_wrapper> native_kvs_impl::get() const {
     return inter_kvs;
 }
 
@@ -135,6 +160,11 @@ CCL_API const base_kvs_impl& kvs::get_impl() {
 }
 
 std::atomic<int> kvs::id_counter{ 0 };
+
+int CCL_API kvs::allocate_id() {
+    return id_counter++;
+}
+
 CCL_API kvs::kvs(const kvs_attr& attr) : pimpl(get_kvs_impl(attr)), id(id_counter++) {}
 
 CCL_API kvs::~kvs() {}

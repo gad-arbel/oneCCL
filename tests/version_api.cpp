@@ -16,9 +16,21 @@
 
 #include "oneapi/ccl.h"
 #include "oneapi/ccl/v2/types.h"
+#include <cstdlib>
 #include <gtest/gtest.h>
 
-TEST(OneCCLVersionTest, GetVersionReturnsCorrectVersionCode) {
+#ifdef _WIN32
+// Keep an existing value unless overwrite is set, as POSIX setenv() does
+#define setenv(x, y, z) ((z) != 0 || getenv(x) == nullptr ? _putenv_s(x, y) : 0)
+#endif
+
+class OneCCLVersionTest : public ::testing::Test {
+  protected:
+    // The null plugin is only used when selected explicitly
+    void SetUp() override { setenv("CCL_PLUGIN", "ONECCL_NULL", 0); }
+};
+
+TEST_F(OneCCLVersionTest, GetVersionReturnsCorrectVersionCode) {
     int version = -1;
     ASSERT_EQ(onecclGetVersion(&version), onecclSuccess);
     EXPECT_EQ(version,
@@ -26,7 +38,7 @@ TEST(OneCCLVersionTest, GetVersionReturnsCorrectVersionCode) {
 }
 
 // Test onecclExtractVersionComponents
-TEST(OneCCLVersionTest, ExtractVersionComponentsReturnsCorrectValues) {
+TEST_F(OneCCLVersionTest, ExtractVersionComponentsReturnsCorrectValues) {
     int const version_code =
         ONECCL_VERSION(ONECCL_MAJOR, ONECCL_MINOR, ONECCL_PATCH);
     int major = -1;
@@ -41,7 +53,7 @@ TEST(OneCCLVersionTest, ExtractVersionComponentsReturnsCorrectValues) {
 }
 
 // Test onecclExtractVersionComponents with random version code
-TEST(OneCCLVersionTest, ExtractVersionComponentsRandomVersion) {
+TEST_F(OneCCLVersionTest, ExtractVersionComponentsRandomVersion) {
     int major = -1;
     int minor = -1;
     int patch = -1;
