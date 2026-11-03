@@ -40,6 +40,19 @@ void env_parser::env_2_atl_transport(
     env_2_enum(CCL_ATL_TRANSPORT, atl_transport_names, atl_transport);
 }
 
+void env_parser::warn_about_unused_policy_overrides() const {
+    for (const auto& [name, value] : policy_overrides) {
+        if (policy_seen.count(name) == 0) {
+            LOG_WARN_ROOT("selection policy: global_config.",
+                          name,
+                          "=",
+                          value,
+                          " ignored: not settable from global_config (unknown, read directly "
+                          "from the environment, or read before the policy is loaded)");
+        }
+    }
+}
+
 void env_parser::warn_about_unused_var() const {
     for (char** s = environ; *s; ++s) {
         auto const env_key_and_value = std::string(*s);

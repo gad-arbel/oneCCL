@@ -50,7 +50,8 @@ public:
         std::memset(m_lifecycle, 0, sizeof(ccl_kernel_lifecycle));
 
         // Command ring: device memory for optimal device polling + GDR mmap for host access
-        m_ring = static_cast<ccl_cmd_ring*>(sycl::aligned_alloc_device(CACHELINE_SIZE, sizeof(ccl_cmd_ring), q));
+        m_ring = static_cast<ccl_cmd_ring*>(
+            sycl::aligned_alloc_device(CACHELINE_SIZE, sizeof(ccl_cmd_ring), q));
         if (!m_ring) {
             sycl::free(m_lifecycle, q);
             m_lifecycle = nullptr;
@@ -66,7 +67,7 @@ public:
         try {
             auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
             m_ring_host = static_cast<ccl_cmd_ring*>(ccl::ze::ze_ipc_mmap_device_allocation(
-                ze_ctx, m_ring, sizeof(ccl_cmd_ring)));
+                ze_ctx, m_ring, sizeof(ccl_cmd_ring), &m_map_base, &m_map_size));
         }
         catch (const std::exception& e) {
             sycl::free(m_ring, q);
@@ -80,14 +81,15 @@ public:
         m_completions = static_cast<ccl_cmd_ring_completions*>(
             sycl::aligned_alloc_host(CACHELINE_SIZE, sizeof(ccl_cmd_ring_completions), q));
         if (!m_completions) {
-            ccl::ze::ze_ipc_munmap_device_allocation(m_ring_host, sizeof(ccl_cmd_ring));
+            ccl::ze::ze_ipc_munmap_device_allocation(m_map_base, m_map_size);
+            m_map_base = nullptr;
+            m_map_size = 0;
             m_ring_host = nullptr;
             sycl::free(m_ring, q);
             m_ring = nullptr;
             sycl::free(m_lifecycle, q);
             m_lifecycle = nullptr;
-            throw std::runtime_error(
-                "Failed to allocate ccl_cmd_ring_completions in host memory");
+            throw std::runtime_error("Failed to allocate ccl_cmd_ring_completions in host memory");
         }
         ccl_cmd_ring_completions::init_completions(m_completions);
 
@@ -127,7 +129,9 @@ public:
 
         // Unmap the GDR-backed host pointer before freeing device memory
         if (m_ring_host) {
-            ccl::ze::ze_ipc_munmap_device_allocation(m_ring_host, sizeof(ccl_cmd_ring));
+            ccl::ze::ze_ipc_munmap_device_allocation(m_map_base, m_map_size);
+            m_map_base = nullptr;
+            m_map_size = 0;
             m_ring_host = nullptr;
         }
 
@@ -164,9 +168,11 @@ public:
 
 private:
     ccl_kernel_lifecycle* m_lifecycle = nullptr;
-    ccl_cmd_ring* m_ring = nullptr;                     // device memory pointer
-    ccl_cmd_ring* m_ring_host = nullptr;                // GDR-backed host-mapped pointer
-    ccl_cmd_ring_completions* m_completions = nullptr;  // host memory completions
+    ccl_cmd_ring* m_ring = nullptr; // device memory pointer
+    ccl_cmd_ring* m_ring_host = nullptr; // GDR-backed host-mapped pointer
+    void* m_map_base = nullptr; // base of that mapping, for munmap
+    size_t m_map_size = 0;
+    ccl_cmd_ring_completions* m_completions = nullptr; // host memory completions
     ccl_cmd_ring_producer m_producer;
-    uint32_t m_gen = 0;                                 // generation counter (1-based)
+    uint32_t m_gen = 0; // generation counter (1-based)
 };

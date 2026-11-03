@@ -324,13 +324,10 @@ void inline copy_kernel(void *dst_ptr, const void *src_ptr, size_t idx) {
 #endif
 }
 
+// Copy one element at an explicit index, so a caller spreading its work over several
+// independent work-groups can index by the group-local id.
 template <typename T, int vec_size>
-void inline copy(void *dst_ptr,
-                 const void *src_ptr,
-                 const size_t count,
-                 const size_t offset,
-                 const sycl::nd_item<1> it) {
-    const size_t idx = it.get_global_linear_id() + offset;
+void inline copy_at(void *dst_ptr, const void *src_ptr, const size_t count, const size_t idx) {
     const size_t packed_count = count / vec_size;
 
     if (idx < packed_count) {
@@ -343,6 +340,15 @@ void inline copy(void *dst_ptr,
             copy_kernel<T>(dst_ptr, src_ptr, new_idx);
         }
     }
+}
+
+template <typename T, int vec_size>
+void inline copy(void *dst_ptr,
+                 const void *src_ptr,
+                 const size_t count,
+                 const size_t offset,
+                 const sycl::nd_item<1> it) {
+    copy_at<T, vec_size>(dst_ptr, src_ptr, count, it.get_global_linear_id() + offset);
 }
 
 // Single vec_size variant (used by send_simple/recv_simple)

@@ -43,6 +43,15 @@ typedef enum onecclPluginCall {
 } onecclPluginCall_t;
 
 // Typedef for the only plugin entrypoint
+//
+// Without CCL_PLUGIN, libccl.so.2 dlopen()s each bundled plugin, calls its
+// ONECCL_PLUGIN_INIT and ONECCL_PLUGIN_PLATFORM_SCORE, and selects the one
+// with the highest score. It dlclose()s every other plugin, with no finalize
+// call: a plugin must not leave behind anything that outlives its library.
+// A score of 0 or less means the plugin is never selected automatically.
+// Selection holds a lock: INIT and PLATFORM_SCORE must not wait for another
+// thread that calls the oneCCL API, or the process deadlocks. A call on the
+// same thread fails with onecclError.
 typedef void *(*onecclPluginEntrypoint_t)(onecclPluginCall_t call_type);
 
 // Typedefs for plugin calls

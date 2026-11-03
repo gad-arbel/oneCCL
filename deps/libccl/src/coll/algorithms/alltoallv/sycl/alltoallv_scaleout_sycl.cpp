@@ -23,6 +23,8 @@
 #include "coll/algorithms/alltoallv/sycl/alltoallv_pairwise.hpp"
 #endif // defined(CCL_ENABLE_ZE) || defined(CCL_ENABLE_SYCL)
 
+#include "proxy/proxy.hpp"
+
 sycl::event alltoallv_scaleout_sycl_simple_blocking(sycl::queue& q,
                                                     const void* send_buf,
                                                     const ccl::vector_class<size_t>& send_counts,
@@ -77,17 +79,28 @@ sycl::event alltoallv_scaleout_sycl_simple_blocking(sycl::queue& q,
         }
     }
 
+    size_t total_recv_count = std::accumulate(recv_counts.begin(), recv_counts.end(), 0ul);
+
     if (options.copy_to_host) {
-        // MPI standard explicitly prohibits IN_PLACE mode for Alltoallv
-        // because there is no guaranteed relationship between send and
-        // receive layouts. So we need one more tmp_buf for this case.
         size_t total_send_count = std::accumulate(send_counts.begin(), send_counts.end(), 0ul);
-        scaleout_send_buf = comm->get_scaleout_host_buf();
-        scaleout_recv_buf = (char*)scaleout_send_buf + total_send_count * ccl_dtype.size();
-        copy_e = q.submit([=](sycl::handler& h) {
-            h.memcpy(scaleout_send_buf, send_buf, total_send_count * ccl_dtype.size());
-        });
-        copy_e.wait();
+        if (total_send_count > 0) {
+            // MPI standard explicitly prohibits IN_PLACE mode for Alltoallv
+            // because there is no guaranteed relationship between send and
+            // receive layouts. So we need one more tmp_buf for this case.
+            scaleout_send_buf = comm->get_scaleout_host_buf();
+            scaleout_recv_buf = (char*)scaleout_send_buf + total_send_count * ccl_dtype.size();
+            copy_e = q.submit([=](sycl::handler& h) {
+                h.memcpy(scaleout_send_buf, send_buf, total_send_count * ccl_dtype.size());
+            });
+            copy_e.wait();
+        }
+        else if (total_recv_count > 0) {
+            // no send is expected, only recv
+            scaleout_recv_buf = comm->get_scaleout_host_buf();
+            // just any valid buf ptr different from recv_buf ptr
+            // send is not going to be used anyway
+            scaleout_send_buf = (char*)scaleout_recv_buf + 1;
+        }
     }
     else if (!options.is_cpu_buffers) {
         if (!check_mpi_supports_rdma()) {
@@ -117,8 +130,7 @@ sycl::event alltoallv_scaleout_sycl_simple_blocking(sycl::queue& q,
         // The operation was probably blocking, since it finished really quickly
     }
 
-    if (options.copy_to_host) {
-        size_t total_recv_count = std::accumulate(recv_counts.begin(), recv_counts.end(), 0ul);
+    if (options.copy_to_host && total_recv_count > 0) {
         op_end = q.memcpy(recv_buf, scaleout_recv_buf, total_recv_count * ccl_dtype.size());
         op_end.wait();
     }
@@ -181,21 +193,33 @@ sycl::event alltoallv_scaleout_sycl_simple_nonblocking(sycl::queue& q,
         }
     }
 
+    size_t total_recv_count = std::accumulate(recv_counts.begin(), recv_counts.end(), 0ul);
+
     if (options.copy_to_host) {
-        // MPI standard explicitly prohibits IN_PLACE mode for Alltoallv
-        // because there is no guaranteed relationship between send and
-        // receive layouts. Requesting 2 buffers exceeds the GPU memory
-        // limits so we need to be sure that tmp buffer is big enough to
-        // contain data for both send and recv buffers
         size_t total_send_count = std::accumulate(send_counts.begin(), send_counts.end(), 0ul);
-        scaleout_send_buf = comm->get_scaleout_host_buf();
-        scaleout_recv_buf = (char*)scaleout_send_buf + total_send_count * ccl_dtype.size();
-        copy_e = q.submit([=](sycl::handler& h) {
-            h.depends_on(dep_events);
-            h.memcpy(scaleout_send_buf, send_buf, total_send_count * ccl_dtype.size());
-        });
-        dep_events.clear();
-        dep_events.push_back(std::move(copy_e));
+        if (total_send_count > 0) {
+            // MPI standard explicitly prohibits IN_PLACE mode for Alltoallv
+            // because there is no guaranteed relationship between send and
+            // receive layouts. Requesting 2 buffers exceeds the GPU memory
+            // limits so we need to be sure that tmp buffer is big enough to
+            // contain data for both send and recv buffers.
+            // If any of the buffers is nullptr, MPI/OFI completes alltoallv
+            // call immediately despite other buffers and counts being non-zero.
+            // In this case the buffer with zero-counts should be assigned to
+            // some valid and not null buffer pointer.
+            scaleout_send_buf = comm->get_scaleout_host_buf();
+            scaleout_recv_buf = (char*)scaleout_send_buf + total_send_count * ccl_dtype.size();
+            copy_e = q.submit([=](sycl::handler& h) {
+                h.depends_on(dep_events);
+                h.memcpy(scaleout_send_buf, send_buf, total_send_count * ccl_dtype.size());
+            });
+            dep_events.clear();
+            dep_events.push_back(std::move(copy_e));
+        }
+        else if (total_recv_count > 0) {
+            scaleout_recv_buf = comm->get_scaleout_host_buf();
+            scaleout_send_buf = (char*)scaleout_recv_buf + 1;
+        }
     }
     else if (!options.is_cpu_buffers) {
         if (!check_mpi_supports_rdma()) {
@@ -222,8 +246,7 @@ sycl::event alltoallv_scaleout_sycl_simple_nonblocking(sycl::queue& q,
         atl_comm->check_wait_throw(ep_idx, req);
     });
 
-    if (options.copy_to_host) {
-        size_t total_recv_count = std::accumulate(recv_counts.begin(), recv_counts.end(), 0ul);
+    if (options.copy_to_host && total_recv_count > 0) {
         op_end = q.submit([=](sycl::handler& h) {
             h.depends_on(op_end);
             h.memcpy(recv_buf, scaleout_recv_buf, total_recv_count * ccl_dtype.size());
@@ -250,14 +273,14 @@ ccl::event alltoallv_scaleout_sycl(sycl::queue& q,
                                    const alltoallv_ctx& options,
                                    bool& done) {
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
-    sycl_scaleout_algo algo = tune_attr.algo();
+    ccl::sycl_policy::scaleout_algo algo = tune_attr.algo();
 
     sycl::event ev;
     ccl::event e;
     done = false;
 
     switch (algo) {
-        case ccl::sycl_policy::algorithm::direct: {
+        case ccl::sycl_policy::scaleout_algo::direct: {
 #ifdef CCL_ENABLE_ITT
             ccl::profile::itt::task_begin("alltoallv_scaleout_sycl_simple",
                                           "send_size",
@@ -283,7 +306,23 @@ ccl::event alltoallv_scaleout_sycl(sycl::queue& q,
 #endif // CCL_ENABLE_ITT
             return ccl::event::create_from_native(ev);
         }
-        case ccl::sycl_policy::algorithm::scatter:
+        case ccl::sycl_policy::scaleout_algo::scatter: {
+            // when the proxy service is enabled, run the exchange on the proxy thread;
+            // a service that failed to start leaves the non-proxy implementation
+            const bool use_proxy = ccl::global_data::env().sycl_enable_alltoall_scaleout_proxy &&
+                                   ccl::global_data::get().proxy_service->is_started();
+#ifdef CCL_ENABLE_ITT
+            ccl::profile::itt::task_begin(
+                use_proxy ? "alltoallv_sycl_scatter_rdma proxy" : "alltoallv_sycl_scatter_rdma",
+                "send_size",
+                options.max_count * ccl_dtype.size());
+#endif // CCL_ENABLE_ITT
+            LOG_DEBUG("|CCL_SYCL| alltoallv scaleout selects scatter kernel, count:",
+                      options.max_count,
+                      " datatype: ",
+                      dtype,
+                      " use_proxy: ",
+                      use_proxy);
             e = alltoallv_sycl_scatter_rdma(q,
                                             send_buf,
                                             send_counts,
@@ -295,10 +334,15 @@ ccl::event alltoallv_scaleout_sycl(sycl::queue& q,
                                             comm,
                                             global_stream,
                                             deps,
+                                            use_proxy,
                                             options,
                                             done);
+#ifdef CCL_ENABLE_ITT
+            ccl::profile::itt::task_end();
+#endif // CCL_ENABLE_ITT
             return e;
-        case ccl::sycl_policy::algorithm::gdr_only_pairwise:
+        }
+        case ccl::sycl_policy::scaleout_algo::gdr_only_pairwise:
             e = alltoallv_sycl_global_pairwise_rdma(q,
                                                     send_buf,
                                                     send_counts,
@@ -313,7 +357,7 @@ ccl::event alltoallv_scaleout_sycl(sycl::queue& q,
                                                     options,
                                                     done);
             return e;
-        case ccl::sycl_policy::algorithm::fallback:
+        case ccl::sycl_policy::scaleout_algo::non_sycl:
         default: done = false; return e;
     }
 }

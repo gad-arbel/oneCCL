@@ -16,6 +16,7 @@
 
 
 #include <chrono>
+#include <mpi.h>
 #include <oneapi/ccl.hpp>
 #include <sycl/sycl.hpp>
 
@@ -152,6 +153,17 @@ static std::vector<sycl::device> select_devices() {
     }
 
     return devices;
+}
+
+// inline, not static: graph_mt_integration.cpp never calls it, and an unused
+// static function fails its build under -Wall -Werror
+inline int get_local_rank() {
+    MPI_Comm local_comm;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &local_comm);
+    int local_rank = 0;
+    MPI_Comm_rank(local_comm, &local_rank);
+    MPI_Comm_free(&local_comm);
+    return local_rank;
 }
 
 static uint64_t get_microseconds() {

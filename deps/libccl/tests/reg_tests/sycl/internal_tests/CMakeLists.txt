@@ -16,9 +16,11 @@ set(INTERNAL_TEST_INCLUDE_DIRS
     ${PROJECT_SOURCE_DIR}/../../src/occp/protocol
     ${LEVEL_ZERO_INCLUDE_DIR}
     ${LIBFABRIC_INCLUDE_DIR}
-    ${HWLOC_INCLUDE_DIR}
-    ${ITT_INCLUDE_DIR})
+    ${HWLOC_INCLUDE_DIR})
 
+if (ENABLE_ITT)
+    list(APPEND INTERNAL_TEST_INCLUDE_DIRS ${ITT_INCLUDE_DIR})
+endif()
 if (ENABLE_DRM)
     list(APPEND INTERNAL_TEST_INCLUDE_DIRS ${DRM_INCLUDE_DIR})
 endif()
@@ -79,8 +81,7 @@ foreach(src ${sources})
     # RUN_ALL_TESTS, ::testing::Environment, etc.); the test provides its own
     # main() so gtest_main is not linked.
     target_link_libraries(${executable} PRIVATE ccl gtest)
-    target_link_libraries(${executable} PUBLIC -L${I_MPI_ROOT}/lib/release/)
-    target_link_libraries(${executable} PUBLIC mpi)
+    target_link_libraries(${executable} PUBLIC MPI::MPI_CXX)
     target_link_libraries(${executable} PUBLIC ${COMPUTE_BACKEND_TARGET_NAME})
     # Bake the project's own libccl.so location into the binary so it wins
     # over any system-installed libccl at runtime. The top-level CMakeLists

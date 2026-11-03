@@ -222,14 +222,14 @@ ccl::event alltoall_scaleout_sycl(sycl::queue& q,
                                   bool original_deps,
                                   sycl_scaleout_tune_attr tune_attr,
                                   bool& done) {
-    sycl_scaleout_algo algo = tune_attr.algo();
+    ccl::sycl_policy::scaleout_algo algo = tune_attr.algo();
     ccl::event e;
     sycl::event ev;
     done = false;
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
 
     switch (algo) {
-        case ccl::sycl_policy::algorithm::direct: {
+        case ccl::sycl_policy::scaleout_algo::direct: {
             auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
             bool copy_to_host = ccl::global_data::env().sycl_enable_direct_gpu_rdma ? false : true;
             ze_device_handle_t ze_dev =
@@ -274,7 +274,7 @@ ccl::event alltoall_scaleout_sycl(sycl::queue& q,
 #endif // CCL_ENABLE_ITT
             return ccl::event::create_from_native(ev);
         }
-        case ccl::sycl_policy::algorithm::scatter: {
+        case ccl::sycl_policy::scaleout_algo::scatter: {
             // when the proxy service is enabled, run the exchange on the proxy thread;
             // a service that failed to start leaves the non-proxy implementation
             const bool use_proxy = ccl::global_data::env().sycl_enable_alltoall_scaleout_proxy &&
@@ -298,11 +298,11 @@ ccl::event alltoall_scaleout_sycl(sycl::queue& q,
 #endif // CCL_ENABLE_ITT
             return e;
         }
-        case ccl::sycl_policy::algorithm::gdr_only_pairwise:
+        case ccl::sycl_policy::scaleout_algo::gdr_only_pairwise:
             e = alltoall_sycl_global_pairwise_rdma(
                 q, send_buf, recv_buf, count, dtype, comm, global_stream, deps, done);
             return e;
-        case ccl::sycl_policy::algorithm::numa_gdr_split:
+        case ccl::sycl_policy::scaleout_algo::numa_gdr_split:
             e = alltoall_sycl_numa_pairwise_rdma_oneshot_split(q,
                                                                send_buf,
                                                                recv_buf,
@@ -314,7 +314,7 @@ ccl::event alltoall_scaleout_sycl(sycl::queue& q,
                                                                true /* batch_node */,
                                                                done);
             return e;
-        case ccl::sycl_policy::algorithm::fallback:
+        case ccl::sycl_policy::scaleout_algo::non_sycl:
         default: done = false; return e;
     }
 }

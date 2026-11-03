@@ -18,26 +18,6 @@
 
 #include "coll/algorithms/utils/sycl_selection.hpp"
 
-#define SYCL_REDUCE_SCATTER_FUNCTIONS(MSGSIZE) \
-    void init_reduce_scatter_##MSGSIZE(ccl::datatype dtype, \
-                                       sycl::queue& queue, \
-                                       ccl_comm* comm, \
-                                       ccl_stream* stream, \
-                                       uint32_t rank_in, \
-                                       uint32_t world_in); \
-    ccl::event run_reduce_scatter_##MSGSIZE(ccl::datatype dtype, \
-                                            sycl::queue& q, \
-                                            const void* send_buf, \
-                                            void* rev_buf, \
-                                            size_t recv_count, \
-                                            ccl::reduction reduction, \
-                                            const ccl::vector_class<ccl::event>& deps, \
-                                            bool& done);
-
-SYCL_REDUCE_SCATTER_FUNCTIONS(small)
-SYCL_REDUCE_SCATTER_FUNCTIONS(medium)
-SYCL_REDUCE_SCATTER_FUNCTIONS(large)
-
 namespace ccl {
 namespace v1 {
 
@@ -48,7 +28,7 @@ ccl::event reduce_scatter_scaleup_sycl(sycl::queue& q,
                                        datatype dtype,
                                        reduction reduction,
                                        ccl_comm* comm,
-                                       const std::shared_ptr<ccl_comm> p2p_domain_comm,
+                                       const std::shared_ptr<ccl_comm> p2p_comm,
                                        ccl_stream* global_stream,
                                        const vector_class<event>& deps,
                                        bool& done,

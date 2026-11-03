@@ -34,9 +34,12 @@
 // Include algorithm headers that define proxy_ wrapper functions
 #include "coll/algorithms/allreduce/sycl/allreduce_direct.hpp"
 #include "coll/algorithms/allreduce/sycl/allreduce_ring.hpp"
+#include "coll/algorithms/allreduce/sycl/allreduce_rabenseifner.hpp"
+#include "coll/algorithms/broadcast/sycl/broadcast_sycl.hpp"
 #include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_ring.hpp"
 #include "coll/algorithms/allgatherv/sycl/allgatherv_ring.hpp"
 #include "coll/algorithms/alltoall/sycl/alltoall_sycl.hpp"
+#include "coll/algorithms/alltoallv/sycl/alltoallv_sycl.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -57,12 +60,18 @@ void init_proxy_algo_table() {
         ccl::proxy_allreduce_ring;
     proxy_algo_upcall[static_cast<size_t>(ccl_proxy_op_type::allreduce_direct)] =
         proxy_allreduce_direct;
+    proxy_algo_upcall[static_cast<size_t>(ccl_proxy_op_type::allreduce_rabenseifner)] =
+        ccl::proxy_allreduce_rabenseifner;
+    proxy_algo_upcall[static_cast<size_t>(ccl_proxy_op_type::broadcast_direct)] =
+        proxy_broadcast_direct;
     proxy_algo_upcall[static_cast<size_t>(ccl_proxy_op_type::reduce_scatter_ring)] =
         ccl::proxy_reduce_scatter_ring;
     proxy_algo_upcall[static_cast<size_t>(ccl_proxy_op_type::allgatherv_ring)] =
         ccl::proxy_allgatherv_ring;
     proxy_algo_upcall[static_cast<size_t>(ccl_proxy_op_type::alltoall_pairwise)] =
         proxy_alltoall_pairwise;
+    proxy_algo_upcall[static_cast<size_t>(ccl_proxy_op_type::alltoallv_pairwise)] =
+        proxy_alltoallv_pairwise;
 
     // To add a new algorithm:
     // 1. Add new operation type to ccl_proxy_op_type enum in proxy_types.hpp
@@ -91,6 +100,8 @@ public:
         // Wait until the kernel for THIS generation is alive on the device.
         // A stale started_gen from a prior op cannot satisfy this (wrap-safe
         // >= compare), so we never start the algorithm before our kernel runs.
+        // On the proxy thread this returns at once: poll_host_op() hands an op
+        // out only after its kernel has started.
         ccl_kernel_lifecycle::wait_kernel_start(m_lifecycle, m_generation);
     }
 

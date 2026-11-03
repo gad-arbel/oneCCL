@@ -176,6 +176,7 @@ void global_data::reset_resize_independent_objects() {
     algorithm_selector.reset();
     hwloc_wrapper.reset();
     metrics_profiler.reset();
+    timestamp_manager.reset();
 }
 
 void global_data::getenv_local_coord(const char* local_proc_idx_env_name,

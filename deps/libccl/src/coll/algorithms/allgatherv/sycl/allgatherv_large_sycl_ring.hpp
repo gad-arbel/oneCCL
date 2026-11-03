@@ -17,6 +17,7 @@
 #pragma once
 #include "oneapi/ccl.hpp"
 #include "common/global/global.hpp"
+#include "coll/selection/policy/policy_env.hpp"
 #include "coll/algorithms/utils/sycl_barrier.hpp"
 #include "coll/algorithms/utils/sycl_ptrs.hpp"
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
@@ -143,7 +144,8 @@ sycl::event allgatherv_large_su_ring_chunking_no_ipc(sycl::queue& q,
 
     const bool is_cpu_barrier = ccl::global_data::env().sycl_ccl_barrier;
 
-    const bool use_full_vector = can_use_full_vector(send_buf, recv_buf, send_count, dsize);
+    const bool use_full_vector = can_use_full_vector(send_buf, recv_buf, send_count, dsize) &&
+                                 offsets_aligned(recv_buf, offsets);
     constexpr int full_vec_size = get_num_elements<T, 16, true>();
     constexpr int partial_vec_size = get_num_elements<T, 16, false>();
     const int vec_size = use_full_vector ? full_vec_size : partial_vec_size;
@@ -157,12 +159,17 @@ sycl::event allgatherv_large_su_ring_chunking_no_ipc(sycl::queue& q,
     const size_t kernel_size = ((kernel_threads + work_group_size - 1) / work_group_size) * work_group_size;
     sycl::nd_range<1> nd_range(kernel_size, work_group_size);
 
-    const bool use_memcpy = ccl::global_data::env().sycl_copy_engine;
+    const bool use_memcpy = ccl::selection::call_env().sycl_copy_engine;
 
     int right = (rank + 1) % world;
 
     const int pipeline_size = world;
-    size_t chunk_size = ccl::global_data::env().sycl_tmp_buf_size / pipeline_size;
+    // whole vectors, so every slot stays aligned
+    size_t chunk_size = get_simple_ring_segment_size(
+        CCL_SYCL_ALLGATHERV_SIMPLE_RING_SEGMENT_SIZE,
+        ccl::selection::call_env().sycl_allgatherv_simple_ring_segment_size,
+        pipeline_size,
+        large_tmp_buf_align);
     std::array<void*, ARC_MAX_NUM> work_bufs;
     std::array<void*, ARC_MAX_NUM> remote_work_bufs;
     work_bufs[0] = get_large_tmp_buf(0, comm);
@@ -270,7 +277,8 @@ sycl::event allgatherv_large_su_ring_chunking_single_kernel(sycl::queue& q,
 
     const bool is_cpu_barrier = ccl::global_data::env().sycl_ccl_barrier;
 
-    const bool use_full_vector = can_use_full_vector(send_buf, recv_buf, send_count, dsize);
+    const bool use_full_vector = can_use_full_vector(send_buf, recv_buf, send_count, dsize) &&
+                                 offsets_aligned(recv_buf, offsets);
     constexpr int full_vec_size = get_num_elements<T, 16, true>();
     constexpr int partial_vec_size = get_num_elements<T, 16, false>();
     const int vec_size = use_full_vector ? full_vec_size : partial_vec_size;
@@ -445,7 +453,8 @@ sycl::event allgatherv_large_su_ring_chunking(sycl::queue& q,
                                               const std::shared_ptr<ccl_comm> p2p_comm,
                                               ccl_stream* global_stream,
                                               bool in_place,
-                                              sycl_ptrs_type& sycl_ptrs) {
+                                              sycl_ptrs_type& sycl_ptrs,
+                                              bool skip_self_copy) {
     sycl::event e;
 
     int world = p2p_comm->size();
@@ -457,7 +466,8 @@ sycl::event allgatherv_large_su_ring_chunking(sycl::queue& q,
 
     const bool is_cpu_barrier = ccl::global_data::env().sycl_ccl_barrier;
 
-    bool use_full_vector = can_use_full_vector(send_buf, recv_buf, send_count, dsize);
+    bool use_full_vector = can_use_full_vector(send_buf, recv_buf, send_count, dsize) &&
+                           offsets_aligned(recv_buf, offsets);
     constexpr int full_vec_size = get_num_elements<T, 16, true>();
     constexpr int partial_vec_size = get_num_elements<T, 16, false>();
     const int vec_size = use_full_vector ? full_vec_size : partial_vec_size;
@@ -472,7 +482,7 @@ sycl::event allgatherv_large_su_ring_chunking(sycl::queue& q,
     sycl::nd_range<1> nd_range(kernel_size, work_group_size);
 
     bool is_recording = use_recording_path(q);
-    const bool use_memcpy = ccl::global_data::env().sycl_copy_engine;
+    const bool use_memcpy = ccl::selection::call_env().sycl_copy_engine;
 
     int right = (rank + 1) % world;
     T* peer_recv = (T*)(sycl_ptrs.node_ptrs_wr[right]);
@@ -488,7 +498,9 @@ sycl::event allgatherv_large_su_ring_chunking(sycl::queue& q,
             }
             else {
                 // on BMG, this two memcpy can not overlap
-                q.memcpy((char*)recv_buf + offsets[rank], send_buf, send_size);
+                if (!skip_self_copy) {
+                    q.memcpy((char*)recv_buf + offsets[rank], send_buf, send_size);
+                }
                 q.memcpy(dst, send_buf, send_size);
             }
         }
@@ -522,6 +534,7 @@ template <typename T>
 sycl::event allgatherv_large_su_ring(sycl::queue& q,
                                      const void* send_buf,
                                      size_t send_count,
+                                     size_t block_count,
                                      void* recv_buf,
                                      const ccl::vector_class<size_t>& recv_counts,
                                      const ccl::vector_class<size_t>& offsets,
@@ -543,8 +556,15 @@ sycl::event allgatherv_large_su_ring(sycl::queue& q,
     bool in_place = ccl::is_allgatherv_inplace(
         send_buf, send_count, recv_buf, recv_counts.data(), offsets.data(), dsize, rank, world);
     // when use_tmp is true, large temp buffer is used
-    size_t chunk_size = use_tmp ? ccl::global_data::env().sycl_tmp_buf_size / world
-                                : ccl::global_data::env().sycl_allgatherv_chunking_threshold;
+    size_t chunk_size = ccl::global_data::env().sycl_allgatherv_chunking_threshold;
+    if (use_tmp) {
+        // whole vectors, so every slot stays aligned
+        chunk_size = get_simple_ring_segment_size(
+            CCL_SYCL_ALLGATHERV_SIMPLE_RING_SEGMENT_SIZE,
+            ccl::selection::call_env().sycl_allgatherv_simple_ring_segment_size,
+            world,
+            large_tmp_buf_align);
+    }
     size_t max_pack_count;
     if (chunk_size == 0 || send_count * ccl_dtype.size() <= chunk_size) {
         max_pack_count = send_count;
@@ -560,12 +580,41 @@ sycl::event allgatherv_large_su_ring(sycl::queue& q,
     int nchunks = (send_count + max_pack_count - 1) / max_pack_count;
 
     const bool use_single_kernel = ccl::global_data::env().sycl_simple_single_kernel;
-    const bool use_memcpy = ccl::global_data::env().sycl_copy_engine;
+    const bool use_memcpy = ccl::selection::call_env().sycl_copy_engine;
 
     const bool is_cpu_barrier = ccl::global_data::env().sycl_ccl_barrier;
     std::vector<sycl::event> dep_events = get_sycl_events(deps);
 
-    invoke_barrier(p2p_comm, q, dep_events, is_cpu_barrier);
+    sycl::event barrier_event = invoke_barrier(p2p_comm, q, dep_events, is_cpu_barrier);
+
+    // CRI: the out-of-place self copy runs on its own copy engine, next to the remote copies on q.
+    // Only allgatherv_large_su_ring_chunking can skip its own self copy; the tmp buffer and
+    // throttled rings copy this rank's block themselves, so a fallback reason keeps the queue off.
+    std::optional<sycl::queue> self_copy_q;
+    if (use_memcpy && !in_place) {
+        const char* fallback_reason = use_tmp ? "tmp_buf_path" : nullptr;
+#ifdef CCL_ENABLE_SYCL_RATE_LIMITER
+        if (!fallback_reason) {
+            fallback_reason = "rate_limiter";
+        }
+#endif
+        // send_count is the chunk when the call is chunked; block_count is the full per-rank count
+        self_copy_q =
+            get_self_copy_queue(global_stream,
+                                "allgather",
+                                block_count * dsize,
+                                ccl::selection::call_env().sycl_allgatherv_self_copy_threshold,
+                                fallback_reason);
+    }
+    sycl::event self_copy_event;
+    if (self_copy_q) {
+        // whole send buffer at once; the ring never reads or writes this rank's recv chunk
+        size_t self_offset = offsets.empty() ? rank * send_count * dsize : offsets[rank];
+        self_copy_event = self_copy_q->submit([&](sycl::handler& h) {
+            h.depends_on(barrier_event);
+            h.memcpy((char*)recv_buf + self_offset, send_buf, send_count * dsize);
+        });
+    }
 
     size_t send_offset = 0;
     int slot = 0;
@@ -629,7 +678,8 @@ sycl::event allgatherv_large_su_ring(sycl::queue& q,
                                                      p2p_comm,
                                                      global_stream,
                                                      in_place,
-                                                     sycl_ptrs);
+                                                     sycl_ptrs,
+                                                     self_copy_q.has_value());
 #endif
         }
         send_offset += pack_count;
@@ -637,6 +687,9 @@ sycl::event allgatherv_large_su_ring(sycl::queue& q,
 
     {
         std::vector<sycl::event> evts;
+        if (self_copy_q) {
+            evts.push_back(self_copy_event);
+        }
         e = submit_wait_on_events(q, evts);
     }
 

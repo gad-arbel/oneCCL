@@ -7,16 +7,16 @@ TEST_LOG="${BASENAME}.log"
 
 source ${ROOT_DIR}/utils.sh
 
+make_common_actions ${SCRIPT_DIR} ${TEST_LOG} "sycl"
+
+# Only the package's own setvars.sh may provide the environment checked below,
+# so drop what the caller set up once the install under test is known.
+ccl_install_dir="${CCL_ROOT}"
 unset CCL_ROOT
 unset I_MPI_ROOT
 unset FI_PROVIDER_PATH
 
-pushd ${WORKSPACE} > /dev/null
-mkdir -p build && cd build
-cmake .. -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCOMPUTE_BACKEND=dpcpp > ${TEST_LOG} 2>&1
-make -j install >> ${TEST_LOG} 2>&1
-popd > /dev/null
-source ${WORKSPACE}/build/_install/env/setvars.sh
+source "${ccl_install_dir}/env/setvars.sh"
 check_ccl
 check_impi
 
@@ -24,6 +24,7 @@ echo "CCL_ROOT: " $CCL_ROOT >> ${TEST_LOG}
 echo "I_MPI_ROOT: " $I_MPI_ROOT >> ${TEST_LOG}
 echo "FI_PROVIDER_PATH: " $FI_PROVIDER_PATH >> ${TEST_LOG}
 
+proc_counts="4"
 transports="ofi mpi"
 ofi_provs="$(get_default_prov)"
 for proc_count in ${proc_counts}
@@ -34,8 +35,8 @@ do
         do
             cmd=" CCL_ATL_TRANSPORT=${transport}"
             cmd+=" FI_PROVIDER=${ofi_prov}"
-            cmd+=" mpiexec -l -n 4 -ppn 2"
-            cmd+=" ${WORKSPACE}/build/_install/examples/benchmark/benchmark >> ${TEST_LOG} 2>&1"
+            cmd+=" mpiexec -l -n ${proc_count} -ppn 2"
+            cmd+=" ${SCRIPT_DIR}/benchmark >> ${TEST_LOG} 2>&1"
             run_cmd "${cmd}"
             check_log ${TEST_LOG}
         done
@@ -45,4 +46,3 @@ done
 rm ${TEST_LOG}
 
 echo "Pass"
-

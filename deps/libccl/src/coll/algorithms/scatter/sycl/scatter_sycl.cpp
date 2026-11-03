@@ -18,6 +18,7 @@
 #include "coll/algorithms/scatter/sycl/scatter_sycl.hpp"
 #include "coll/algorithms/scatter/sycl/scatter_small_sycl.hpp"
 #include "coll/algorithms/scatter/sycl/scatter_large_sycl.hpp"
+#include "coll/algorithms/utils/sycl_policy_resolver_scaleout.hpp"
 #include "coll/algorithms/utils/sycl_policy_resolver_scaleup.hpp"
 #include "coll/algorithms/utils/barrier_data.hpp"  // use_recording_path
 
@@ -70,10 +71,11 @@ event scatter_scaleup_default(const void* send_buf,
                               const std::shared_ptr<ccl_comm>& p2p_comm,
                               ccl_stream* global_stream,
                               const vector_class<event>& deps,
-                              sycl_scaleup_options coll_attr) {
+                              sycl_scaleup_options coll_attr,
+                              ccl::sycl_policy::scaleup_algo algo) {
     auto ccl_dtype = global_data::get().dtypes->get(dtype);
     event e;
-    if (count * ccl_dtype.size() <= ccl::global_data::env().sycl_scatter_small_threshold) {
+    if (algo == ccl::sycl_policy::scaleup_algo::small) {
 #ifdef CCL_ENABLE_ITT
         ccl::profile::itt::task_begin(
             "scatter_small", "send_size", count * ccl_dtype.size(), comm->unique_id());
@@ -128,16 +130,15 @@ event scatter_sycl_single_domain(sycl::queue& q,
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     const auto tune = ccl::sycl_policy_resolver::scaleup_resolver{
         ccl::sycl_policy::policy_query(
-            ccl_coll_scatter, count * ccl_dtype.size(), ccl_dtype,
+            ccl_coll_scatter, count, ccl_dtype,
             /*r2r_size=*/0, comm->size(), use_recording_path(q))
             .with_comm(comm)
             .with_p2p_comm(p2p_comm.get())
             .with_stream(global_stream)
     }.scatter();
-    (void)tune;  // scatter has no arc/LL split today; resolver always returns default_kernel
 
     return scatter_scaleup_default(send_buf, recv_buf, count, dtype, root, comm, p2p_comm,
-                                   global_stream, deps, coll_attr);
+                                   global_stream, deps, coll_attr, tune.algo);
 }
 
 // -----------------------------------------------------------------------------
@@ -309,18 +310,18 @@ bool compute_use_rdma(sycl::queue& q) {
 } // namespace
 
 // -----------------------------------------------------------------------------
-// Multi-node scatter — small-msg path (device scratch)
+// Multi-node scatter — direct path (device scratch)
 // -----------------------------------------------------------------------------
-event scatter_sycl_multi_node_small_msg(sycl::queue& q,
-                                        const void* send_buf,
-                                        void* recv_buf,
-                                        size_t count,
-                                        datatype dtype,
-                                        int root,
-                                        ccl_comm* global_comm,
-                                        ccl_stream* global_stream,
-                                        const vector_class<event>& deps,
-                                        bool& done) {
+event scatter_sycl_multi_node_direct(sycl::queue& q,
+                                     const void* send_buf,
+                                     void* recv_buf,
+                                     size_t count,
+                                     datatype dtype,
+                                     int root,
+                                     ccl_comm* global_comm,
+                                     ccl_stream* global_stream,
+                                     const vector_class<event>& deps,
+                                     bool& done) {
     // "scaleout first, then scaleup". Exploits
     // the node-major numbering — root's send_buf already has each
     // node's node_size*count payload laid out contiguously, so no pack
@@ -329,7 +330,7 @@ event scatter_sycl_multi_node_small_msg(sycl::queue& q,
     // Phase 1 (r2r_comm[root_local_idx] scatter, root=layout.r2r_root)
     // Phase 2 (node_comm scatter, root=layout.root_local_idx)
     // No chunking. If per-node slab exceeds one device scratch slot
-    // the path falls back so the large-msg pack path can chunk it.
+    // the path falls back so the chunked pack path can chunk it.
 
     done = true;
     event ev;
@@ -350,11 +351,11 @@ event scatter_sycl_multi_node_small_msg(sycl::queue& q,
         static_cast<size_t>(layout.r2r_size) * node_slab_bytes;
 
     if (node_slab_bytes > scaleout_dev_buf_size) {
-        LOG_INFO("scatter_sycl multi-node small: node slab (",
-                 node_slab_bytes,
-                 " B) exceeds device scratch slot (",
-                 scaleout_dev_buf_size,
-                 " B) -- falling back to large path");
+        LOG_DEBUG("scatter_sycl multi-node direct: node slab (",
+                  node_slab_bytes,
+                  " B) exceeds device scratch slot (",
+                  scaleout_dev_buf_size,
+                  " B) -- falling back to large path");
         done = false;
         return ev;
     }
@@ -367,11 +368,11 @@ event scatter_sycl_multi_node_small_msg(sycl::queue& q,
     const bool copy_to_host = !use_rdma;
 
     if (copy_to_host && host_slab_bytes > scaleout_host_buf_size) {
-        LOG_INFO("scatter_sycl multi-node small: host slab (",
-                 host_slab_bytes,
-                 " B) exceeds host scratch slot (",
-                 scaleout_host_buf_size,
-                 " B) -- falling back to large path");
+        LOG_DEBUG("scatter_sycl multi-node direct: host slab (",
+                  host_slab_bytes,
+                  " B) exceeds host scratch slot (",
+                  scaleout_host_buf_size,
+                  " B) -- falling back to large path");
         done = false;
         return ev;
     }
@@ -421,7 +422,7 @@ event scatter_sycl_multi_node_small_msg(sycl::queue& q,
             /*is_cpu_buffers=*/false,
             /*aux_buf=*/scratch_host);
         if (!sub_done) {
-            LOG_INFO("scatter_sycl multi-node small: r2r scaleout not done -- fallback");
+            LOG_DEBUG("scatter_sycl multi-node direct: r2r scaleout not done -- fallback");
             done = false;
             release_scratch();
             return scaleout_e;
@@ -452,7 +453,7 @@ event scatter_sycl_multi_node_small_msg(sycl::queue& q,
                                                scaleup_deps,
                                                sub_done);
     if (!sub_done) {
-        LOG_INFO("scatter_sycl multi-node small: node_comm scaleup not done -- fallback");
+        LOG_DEBUG("scatter_sycl multi-node direct: node_comm scaleup not done -- fallback");
         done = false;
         release_scratch();
         return scaleup_e;
@@ -468,10 +469,10 @@ event scatter_sycl_multi_node_small_msg(sycl::queue& q,
 }
 
 // -----------------------------------------------------------------------------
-// Multi-node scatter — large-msg path (pack + chunked, optional overlap)
+// Multi-node scatter — two-phase path (pack + chunked r2r, optional overlap)
 // -----------------------------------------------------------------------------
 
-event scatter_sycl_multi_node_large_msg(sycl::queue& q,
+event scatter_sycl_multi_node_two_phase(sycl::queue& q,
                                         const void* send_buf,
                                         void* recv_buf,
                                         size_t count,
@@ -518,9 +519,9 @@ event scatter_sycl_multi_node_large_msg(sycl::queue& q,
             ? count
             : std::min(count, buf_cap / per_element_slab_bytes);
     if (max_chunk_count == 0) {
-        LOG_INFO("scatter_sycl multi-node large: scratch slot (",
-                 buf_cap,
-                 " B) too small for one packed element per rank -- falling back");
+        LOG_DEBUG("scatter_sycl multi-node two-phase: scratch slot (",
+                  buf_cap,
+                  " B) too small for one packed element per rank -- falling back");
         done = false;
         return ev;
     }
@@ -632,7 +633,8 @@ event scatter_sycl_multi_node_large_msg(sycl::queue& q,
                 scaleup_deps,
                 sub_done);
             if (!sub_done) {
-                LOG_INFO("scatter_sycl multi-node large: scaleup single-node not done -- fallback");
+                LOG_DEBUG("scatter_sycl multi-node two-phase: scaleup single-node not done "
+                          "-- fallback");
                 done = false;
                 release_all();
                 return scaleup_e;
@@ -668,7 +670,7 @@ event scatter_sycl_multi_node_large_msg(sycl::queue& q,
             /*is_cpu_buffers=*/false,
             /*aux_buf=*/slot.host_aux);
         if (!sub_done) {
-            LOG_INFO("scatter_sycl multi-node large: r2r scaleout not done -- fallback");
+            LOG_DEBUG("scatter_sycl multi-node two-phase: r2r scaleout not done -- fallback");
             done = false;
             release_all();
             return scaleout_e;
@@ -741,13 +743,19 @@ event scatter_sycl_multi_node(sycl::queue& q,
         return ev;
     }
 
-    if (bytes <= ccl::global_data::env().sycl_scatter_scaleout_small_threshold) {
+    const auto tune = ccl::sycl_policy_resolver::scaleout_resolver{
+        ccl::sycl_policy::policy_query(ccl_coll_scatter, count, ccl_dtype,
+            global_comm->get_r2r_comm()->size(), global_comm->size(), use_recording_path(q))
+            .with_p2p_level(global_comm->get_r2r_comm()->get_p2p_level())
+    }.scatter();
+
+    if (tune.algo() == ccl::sycl_policy::scaleout_algo::direct) {
 #ifdef CCL_ENABLE_ITT
         ccl::profile::itt::task_begin(
-            "scatter_multi_node_small", "send_size", bytes, global_comm->unique_id());
+            "scatter_multi_node_direct", "send_size", bytes, global_comm->unique_id());
 #endif // CCL_ENABLE_ITT
-        LOG_DEBUG("scatter_sycl multi-node small path, count=", count);
-        auto e = scatter_sycl_multi_node_small_msg(
+        LOG_DEBUG("scatter_sycl multi-node direct path, count=", count);
+        auto e = scatter_sycl_multi_node_direct(
             q, send_buf, recv_buf, count, dtype, root, global_comm, global_stream, deps, done);
 #ifdef CCL_ENABLE_ITT
         ccl::profile::itt::task_end();
@@ -757,10 +765,10 @@ event scatter_sycl_multi_node(sycl::queue& q,
 
 #ifdef CCL_ENABLE_ITT
     ccl::profile::itt::task_begin(
-        "scatter_multi_node_large", "send_size", bytes, global_comm->unique_id());
+        "scatter_multi_node_two_phase", "send_size", bytes, global_comm->unique_id());
 #endif // CCL_ENABLE_ITT
-    LOG_DEBUG("scatter_sycl multi-node large path, count=", count);
-    auto e = scatter_sycl_multi_node_large_msg(
+    LOG_DEBUG("scatter_sycl multi-node two-phase path, count=", count);
+    auto e = scatter_sycl_multi_node_two_phase(
         q, send_buf, recv_buf, count, dtype, root, global_comm, global_stream, deps, done);
 #ifdef CCL_ENABLE_ITT
     ccl::profile::itt::task_end();

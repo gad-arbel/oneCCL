@@ -24,6 +24,7 @@
 #include "oneapi/ccl.h"
 #include "oneapi/ccl/v2/types.h"
 
+#include <algorithm>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
@@ -31,11 +32,14 @@
 #include <cstring>
 #include <map>
 #include <mutex>
-#include <set>
-#include <shared_mutex>
+#include <optional>
 #include <string>
-#include <unordered_map>
+#include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 
 namespace {
 thread_local struct onecclThreadContext {
@@ -44,11 +48,66 @@ thread_local struct onecclThreadContext {
     onecclPlugin_t plugin;
 } thread_context;
 
-std::shared_mutex plugin_lock;
-std::unordered_map<std::string, dl_handle> library_cache;
+// Serializes plugin loading and unloading across threads, so a plugin that is
+// released by one init attempt is not unloaded under another one, and the
+// conflict checks see a stable set of loaded libraries
+std::mutex plugin_load_mutex;
+// Number of dlopen() references held on each plugin type, by the plugins
+// selected by all threads and by the init attempt in progress. Guarded by
+// plugin_load_mutex.
+std::map<onecclPluginType_t, int> plugin_ref_counts;
+// Caller holds plugin_load_mutex
+void plugin_refcount_inc(onecclPluginType_t type) { plugin_ref_counts[type]++; }
+// Caller holds plugin_load_mutex
+void plugin_refcount_dec(onecclPluginType_t type) noexcept {
+    auto const refs = plugin_ref_counts.find(type);
+    if (refs != plugin_ref_counts.end()) {
+        refs->second--;
+    }
+}
 // Why plugins could not be used in the current init attempt, reported if no
 // plugin is selected
 thread_local std::string plugin_load_errors;
+// Whether libccl.so.1 was loaded before the first init attempt (e.g. linked
+// by the application). Taken once, so a copy that a released plugin left
+// behind does not count as preloaded in later attempts. Guarded by
+// plugin_load_mutex.
+std::optional<bool> libccl_v1_preloaded;
+
+// Plugins the current init attempt opened and then released, which may have
+// left their libccl.so.1 loaded
+thread_local std::vector<onecclPluginType_t> plugins_with_stale_libccl;
+
+bool may_have_stale_libccl(onecclPluginType_t type) {
+    return std::find(plugins_with_stale_libccl.begin(),
+                     plugins_with_stale_libccl.end(),
+                     type) != plugins_with_stale_libccl.end();
+}
+// Set while the thread selects its plugin, to catch plugin code that calls
+// back into the API on the same thread. A call from another thread that the
+// plugin waits for still deadlocks.
+thread_local bool selecting_plugin = false;
+
+#ifndef _WIN32
+// fork() waits for a selection in progress: a child forked during one would
+// find plugin_load_mutex held by a thread it does not have. The selecting
+// thread itself already holds it.
+void lock_plugin_selection_for_fork() {
+    if (!selecting_plugin) {
+        plugin_load_mutex.lock();
+    }
+}
+
+void unlock_plugin_selection_after_fork() {
+    if (!selecting_plugin) {
+        plugin_load_mutex.unlock();
+    }
+}
+
+[[maybe_unused]] const int kForkHandlers = pthread_atfork(
+    lock_plugin_selection_for_fork, unlock_plugin_selection_after_fork,
+    unlock_plugin_selection_after_fork);
+#endif
 
 // This a map is storing possible names for plugins used by oneCCL,
 // The name `libexternal_Soneccl_Slibccl_Ulegacy` was added to support
@@ -115,20 +174,6 @@ onecclResult_t __safe_call_impl(const char *func_name, Func &&func,
 #define BUILD_SYSTEM_PROCESSOR "unknown"
 #endif
 
-// Read-write access to plugin structures
-template <typename Func, typename... Args>
-onecclResult_t plugin_write(Func func, Args &&...args) {
-    std::scoped_lock const lock(plugin_lock);
-    return func(std::forward<Args>(args)...);
-}
-
-// Read-only access to plugin structures
-template <typename Func, typename... Args>
-onecclResult_t plugin_read(Func func, Args &&...args) {
-    std::shared_lock<std::shared_mutex> const lock(plugin_lock);
-    return func(std::forward<Args>(args)...);
-}
-
 std::string to_string(onecclPluginType_t type) {
     switch (type) {
     case onecclPluginAny:
@@ -144,38 +189,75 @@ std::string to_string(onecclPluginType_t type) {
     }
 }
 
-onecclResult_t load_plugin(onecclPlugin_t *plugin, const std::string &path) {
-    if (plugin == nullptr) {
+struct onecclLoadedPlugin;
+void release_plugin(onecclLoadedPlugin *loaded) noexcept;
+
+// A plugin loaded by one init attempt. It owns one dlopen() reference to the
+// library and gives it back when destroyed, also when an exception unwinds
+// the attempt. select_plugin() moves the reference to the selecting thread,
+// which keeps it for the lifetime of the process. Move-only, so the reference
+// has one owner. Destroy only while holding plugin_load_mutex.
+struct onecclLoadedPlugin {
+    onecclPlugin_t plugin{};
+    dl_handle handle = nullptr;
+    onecclPluginType_t type = onecclPluginAny;
+
+    onecclLoadedPlugin() = default;
+    onecclLoadedPlugin(const onecclLoadedPlugin &) = delete;
+    onecclLoadedPlugin &operator=(const onecclLoadedPlugin &) = delete;
+    onecclLoadedPlugin(onecclLoadedPlugin &&other) noexcept {
+        *this = std::move(other);
+    }
+    onecclLoadedPlugin &operator=(onecclLoadedPlugin &&other) noexcept {
+        if (this != &other) {
+            release_plugin(this);
+            plugin = other.plugin;
+            handle = std::exchange(other.handle, nullptr);
+            type = other.type;
+        }
+        return *this;
+    }
+    ~onecclLoadedPlugin() { release_plugin(this); }
+};
+
+// Drop the reference taken by load_plugin(); the loader unloads the library
+// (and its dependencies such as libccl.so.1) once no thread holds it.
+// Caller holds plugin_load_mutex.
+void release_plugin(onecclLoadedPlugin *loaded) noexcept {
+    if (loaded->handle == nullptr) {
+        return;
+    }
+    plugin_refcount_dec(loaded->type);
+    dlclose(std::exchange(loaded->handle, nullptr));
+    // Cannot throw: init_library() reserves room for every plugin type
+    if (!may_have_stale_libccl(loaded->type)) {
+        plugins_with_stale_libccl.push_back(loaded->type);
+    }
+    loaded->plugin = {};
+    loaded->type = onecclPluginAny;
+}
+
+// Caller holds plugin_load_mutex
+onecclResult_t load_plugin(onecclLoadedPlugin *loaded, const std::string &path,
+                           onecclPluginType_t type) {
+    if (loaded == nullptr) {
         return onecclInvalidArgument;
     }
 
-    dl_handle handle = nullptr;
-    {
-        // Attempt to read from the library cache using the path as the key
-        std::shared_lock<std::shared_mutex> const lock(plugin_lock);
-        auto cached_library = library_cache.find(path);
-        if (cached_library != library_cache.end()) {
-            handle = cached_library->second;
-        }
-    }
-
+    // Each call takes its own reference, so releasing it cannot unload a
+    // library another thread still uses
+    dl_handle handle = dlopen(path.c_str(), RTLD_LAZY);
     if (handle == nullptr) {
-        {
-            std::scoped_lock const lock(plugin_lock);
-            handle = dlopen(path.c_str(), RTLD_LAZY);
-            if (handle == nullptr) {
-                const char *error = dlerror();
-                ONECCL_INFO("Cannot open plugin library: %s", error);
-                plugin_load_errors += "\n  dlopen(" + path + "): ";
-                plugin_load_errors +=
-                    error != nullptr ? error : "unknown error";
-                return onecclError;
-            }
-            ONECCL_INFO("Loaded plugin library: %s", path.c_str());
-            // Cache the loaded library
-            library_cache[path] = handle;
-        }
+        const char *error = dlerror();
+        ONECCL_INFO("Cannot open plugin library: %s", error);
+        plugin_load_errors += "\n  dlopen(" + path + "): ";
+        plugin_load_errors += error != nullptr ? error : "unknown error";
+        return onecclError;
     }
+    ONECCL_INFO("Loaded plugin library: %s", path.c_str());
+    plugin_refcount_inc(type);
+    loaded->handle = handle;
+    loaded->type = type;
 
     dlerror(); // Clear any existing error
 
@@ -189,22 +271,23 @@ onecclResult_t load_plugin(onecclPlugin_t *plugin, const std::string &path) {
                      dlsym_error);
         plugin_load_errors +=
             "\n  dlsym(" + path + ", " + symbol + "): " + dlsym_error;
+        release_plugin(loaded);
         return onecclError;
     }
 
-    plugin->call = plugin_call;
+    loaded->plugin.call = plugin_call;
 
-    auto plugin_init_fn = reinterpret_cast<onecclPluginCallInit_t>(
-        plugin->call(ONECCL_PLUGIN_INIT));
-    if (plugin_init_fn != nullptr) {
-        onecclResult_t const result = plugin_init_fn();
-        if (result != onecclSuccess) {
-            plugin_load_errors += "\n  " + path + ": plugin init failed";
-        }
-        return result;
+    // The entrypoint lookup runs plugin code too, so it can throw
+    onecclResult_t const result = SAFE_CALL([&] {
+        auto plugin_init_fn = reinterpret_cast<onecclPluginCallInit_t>(
+            loaded->plugin.call(ONECCL_PLUGIN_INIT));
+        return plugin_init_fn != nullptr ? plugin_init_fn() : onecclSuccess;
+    });
+    if (result != onecclSuccess) {
+        plugin_load_errors += "\n  plugin init failed: " + path;
+        release_plugin(loaded);
     }
-
-    return onecclSuccess;
+    return result;
 }
 
 // Directory of libccl.so.2 itself (with a trailing slash), or empty
@@ -223,25 +306,92 @@ std::string get_library_dir() {
     return {};
 }
 
+// Whether a library of the name is loaded in the process
+bool library_is_loaded_in_process(const char *name) {
+#ifdef _WIN32
+    return false; // Cannot tell
+#else
+    dl_handle handle = dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
+    if (handle == nullptr) {
+        return false;
+    }
+    dlclose(handle); // Drop the reference RTLD_NOLOAD took
+    return true;
+#endif
+}
+
 // Prefer the plugin installed next to libccl.so.2, so the plugin matches this
 // libccl.so.2 no matter how it was found; if it is missing or dlopen fails,
 // use the loader search. A plugin the process already loaded (e.g. linked by
 // the application) wins, so no second copy with separate state is opened.
-onecclResult_t load_bundled_plugin(onecclPlugin_t *plugin,
-                                   const std::string &name) {
+onecclResult_t load_bundled_plugin(onecclLoadedPlugin *loaded,
+                                   const std::string &name,
+                                   onecclPluginType_t type) {
 #ifndef _WIN32
-    if (void *const loaded = dlopen(name.c_str(), RTLD_LAZY | RTLD_NOLOAD)) {
-        dlclose(loaded);
-        return load_plugin(plugin, name);
+    if (library_is_loaded_in_process(name.c_str())) {
+        return load_plugin(loaded, name, type);
     }
     static const std::string library_dir = get_library_dir();
     std::string const sibling = library_dir + name;
-    if (!library_dir.empty() && access(sibling.c_str(), F_OK) == 0 &&
-        load_plugin(plugin, sibling) == onecclSuccess) {
-        return onecclSuccess;
+    if (!library_dir.empty() && access(sibling.c_str(), F_OK) == 0) {
+        if (load_plugin(loaded, sibling, type) == onecclSuccess) {
+            return onecclSuccess;
+        }
+        onecclResult_t const result = load_plugin(loaded, name, type);
+        if (result == onecclSuccess) {
+            ONECCL_WARN("Could not use plugin %s; loaded %s from the library "
+                        "search path instead, which may be a different oneCCL "
+                        "build",
+                        sibling.c_str(), name.c_str());
+        }
+        return result;
     }
 #endif
-    return load_plugin(plugin, name);
+    return load_plugin(loaded, name, type);
+}
+
+// Make the plugin the one used by the calling thread. The thread keeps the
+// reference to the library for the lifetime of the process.
+void select_plugin(onecclLoadedPlugin &&loaded) {
+    ONECCL_INFO("Selected plugin: %s", to_string(loaded.type).c_str());
+    thread_context.plugin = loaded.plugin;
+    thread_context.plugin_type = loaded.type;
+    thread_context.init_done = true;
+    loaded.handle = nullptr; // Kept by the thread, not released
+}
+
+// Whether a library of the plugin is loaded in the process
+bool plugin_is_loaded_in_process(onecclPluginType_t type) {
+    for (const auto &path : kPluginPaths.at(type)) {
+        if (library_is_loaded_in_process(path.c_str())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether a plugin of the type cannot be loaded now: a plugin that needs
+// libccl.so.1 by the same soname is loaded, so this one would bind to that
+// one's copy. Caller holds plugin_load_mutex.
+bool plugin_conflicts(onecclPluginType_t type) {
+    static const std::map<onecclPluginType_t, onecclPluginType_t> kConflicts = {
+        {onecclLegacy, onecclLegacyCPU}, {onecclLegacyCPU, onecclLegacy}};
+    auto const conflict = kConflicts.find(type);
+    if (conflict == kConflicts.end()) {
+        return false;
+    }
+    onecclPluginType_t const other = conflict->second;
+    // Loaded by this attempt, selected by a thread, or loaded by the
+    // application and so kept after its release
+    auto const refs = plugin_ref_counts.find(other);
+    if ((refs != plugin_ref_counts.end() && refs->second > 0) ||
+        plugin_is_loaded_in_process(other)) {
+        return true;
+    }
+    // Released by this attempt, but its libccl.so.1 stayed
+    return may_have_stale_libccl(other) &&
+           !libccl_v1_preloaded.value_or(false) &&
+           library_is_loaded_in_process("libccl.so.1");
 }
 
 onecclResult_t init_library_with_override(const char *ccl_plugin) {
@@ -252,11 +402,11 @@ onecclResult_t init_library_with_override(const char *ccl_plugin) {
     for (const auto &[type, paths] : kPluginPaths) {
         if (plugin_str == to_string(type)) {
             for (const auto &path : paths) {
+                onecclLoadedPlugin loaded;
                 onecclResult_t const result =
-                    load_bundled_plugin(&thread_context.plugin, path);
+                    load_bundled_plugin(&loaded, path, type);
                 if (result == onecclSuccess) {
-                    thread_context.plugin_type = type;
-                    thread_context.init_done = true;
+                    select_plugin(std::move(loaded));
                     return onecclSuccess;
                 }
             }
@@ -267,11 +417,11 @@ onecclResult_t init_library_with_override(const char *ccl_plugin) {
     // Check if it's a direct file path
     if (plugin_str.front() == '/' &&
         plugin_str.find("..") == std::string::npos) {
+        onecclLoadedPlugin loaded;
         onecclResult_t const result =
-            load_plugin(&thread_context.plugin, plugin_str);
+            load_plugin(&loaded, plugin_str, onecclUserBackend);
         if (result == onecclSuccess) {
-            thread_context.plugin_type = onecclUserBackend;
-            thread_context.init_done = true;
+            select_plugin(std::move(loaded));
             return onecclSuccess;
         }
     }
@@ -281,46 +431,63 @@ onecclResult_t init_library_with_override(const char *ccl_plugin) {
     return onecclError;
 }
 
+// Platform score of the plugin, or none if it cannot give one. A plugin that
+// throws here, e.g. as it finds no device, is only not selected: logged at
+// info level, not as an error.
+std::optional<int> platform_score(const onecclLoadedPlugin &candidate) {
+    std::string const name = to_string(candidate.type);
+    try {
+        auto platform_score_func =
+            reinterpret_cast<onecclPluginCallPlatformScore_t>(
+                candidate.plugin.call(ONECCL_PLUGIN_PLATFORM_SCORE));
+        if (platform_score_func == nullptr) {
+            ONECCL_ERROR(
+                "Plugin does not provide function to evaluate platform!");
+            plugin_load_errors +=
+                "\n  " + name + ": no platform evaluation function";
+            return std::nullopt;
+        }
+        int score = INT_MIN;
+        if (platform_score_func(&score) != onecclSuccess) {
+            ONECCL_INFO("Failed to evaluate plugin score!");
+            plugin_load_errors +=
+                "\n  " + name + ": platform evaluation failed";
+            return std::nullopt;
+        }
+        return score;
+    } catch (const std::exception &ex) {
+        ONECCL_INFO("Platform evaluation of %s threw: %s", name.c_str(),
+                    ex.what());
+        plugin_load_errors +=
+            "\n  " + name + ": platform evaluation threw: " + ex.what();
+    } catch (...) {
+        ONECCL_INFO("Platform evaluation of %s threw", name.c_str());
+        plugin_load_errors += "\n  " + name + ": platform evaluation threw";
+    }
+    return std::nullopt;
+}
+
 onecclResult_t init_library_without_override() {
     ONECCL_INFO("Proceeding without CCL_PLUGIN override.");
     int best_platform_score = INT_MIN;
-
-    std::set<onecclPluginType_t> loaded_plugins;
-    std::unordered_map<onecclPluginType_t, std::vector<onecclPluginType_t>>
-        conflicts_map = {{onecclLegacy, {onecclLegacyCPU}},
-                         {onecclLegacyCPU, {onecclLegacy}}};
+    onecclLoadedPlugin best;
 
     for (const auto &[type, paths] : kPluginPaths) {
-
-        auto conflicts_with = conflicts_map.find(type);
-
-        if (conflicts_with != conflicts_map.end()) {
-            bool conflict_found = false;
-            for (auto conflicting_plugin : conflicts_with->second) {
-                if (loaded_plugins.find(conflicting_plugin) !=
-                    loaded_plugins.end()) {
-                    conflict_found = true;
-                    break;
-                }
-            }
-
-            if (conflict_found) {
-                // We already loaded a plugin that is conflicting with plugin of
-                // `type`, so we cannot load this one now.
-                ONECCL_INFO("Failed to load plugin type: %s due to conflicts "
-                            "with previously loaded plugins.",
-                            to_string(type).c_str());
-                plugin_load_errors +=
-                    "\n  " + to_string(type) +
-                    ": skipped, conflicts with a loaded plugin";
-                continue;
-            }
+        if (plugin_conflicts(type)) {
+            // We already loaded a plugin that is conflicting with plugin of
+            // `type`, so we cannot load this one now.
+            ONECCL_INFO("Failed to load plugin type: %s due to conflicts "
+                        "with previously loaded plugins.",
+                        to_string(type).c_str());
+            plugin_load_errors += "\n  " + to_string(type) +
+                                  ": skipped, conflicts with a loaded plugin";
+            continue;
         }
 
-        onecclPlugin plugin;
+        onecclLoadedPlugin candidate;
         onecclResult_t result = onecclError;
         for (const auto &path : paths) {
-            result = load_bundled_plugin(&plugin, path);
+            result = load_bundled_plugin(&candidate, path, type);
             if (result == onecclSuccess) {
                 break; // Successfully loaded, no need to try other paths
             }
@@ -331,52 +498,36 @@ onecclResult_t init_library_without_override() {
             continue;
         }
 
-        loaded_plugins.insert(type); // Record that plugin of the type is loaded
-
-        auto platform_score_func =
-            reinterpret_cast<onecclPluginCallPlatformScore_t>(
-                plugin.call(ONECCL_PLUGIN_PLATFORM_SCORE));
-        if (platform_score_func == nullptr) {
-            ONECCL_ERROR(
-                "Plugin does not provide function to evaluate platform!");
-            plugin_load_errors +=
-                "\n  " + to_string(type) + ": no platform evaluation function";
-            continue;
+        std::optional<int> const score = platform_score(candidate);
+        if (score.has_value()) {
+            ONECCL_INFO("Platform score for %s: %d", to_string(type).c_str(),
+                        *score);
+            if (*score <= 0) {
+                plugin_load_errors += "\n  " + to_string(type) +
+                                      ": platform score " +
+                                      std::to_string(*score);
+            }
         }
 
-        int platform_score = INT_MIN;
-        result =
-            SAFE_CALL([&] { return platform_score_func(&platform_score); });
-        if (result != onecclSuccess) {
-            ONECCL_INFO("Failed to evaluate plugin score!");
-            plugin_load_errors +=
-                "\n  " + to_string(type) + ": platform evaluation failed";
-            continue;
-        }
-
-        ONECCL_INFO("Platform score for %s: %d", to_string(type).c_str(),
-                    platform_score);
-        if (platform_score <= 0) {
-            plugin_load_errors += "\n  " + to_string(type) +
-                                  ": platform score " +
-                                  std::to_string(platform_score);
-        }
-        if (platform_score > 0 && platform_score > best_platform_score) {
-            thread_context.plugin = plugin;
-            thread_context.plugin_type = type;
-            thread_context.init_done = true;
-
-            best_platform_score = platform_score;
+        if (score.has_value() && *score > 0 && *score > best_platform_score) {
+            best = std::move(candidate); // Releases the previous best
+            best_platform_score = *score;
+        } else {
+            // Not used: unload it and its libccl.so.1, so a conflicting
+            // plugin can still load. The SYCL runtime that scoring brought
+            // up stays loaded: it is marked NODELETE.
+            release_plugin(&candidate);
         }
     }
 
-    if (thread_context.plugin_type == onecclPluginAny) {
+    if (best.handle == nullptr) {
         ONECCL_ERROR("oneCCL could not be initialized! Could not load any "
                      "plugin. Please rerun with `CCL_LOG_LEVEL=info`.%s",
                      plugin_load_errors.c_str());
         return onecclError;
     }
 
+    select_plugin(std::move(best));
     return onecclSuccess;
 }
 
@@ -384,6 +535,11 @@ onecclResult_t init_library() {
     onecclDebugInit();
     if (thread_context.init_done) {
         return onecclSuccess;
+    }
+    // Waiting for plugin_load_mutex would deadlock: this thread holds it
+    if (selecting_plugin) {
+        ONECCL_ERROR("oneCCL API called by a plugin during plugin selection");
+        return onecclError;
     }
 
     ONECCL_INFO("\n  oneCCL V2 build info:\n"
@@ -402,14 +558,28 @@ onecclResult_t init_library() {
                 BUILD_SYSTEM_PROCESSOR);
 
     plugin_load_errors.clear();
+    plugins_with_stale_libccl.clear();
+    // release_plugin() records each type at most once, and must not allocate
+    plugins_with_stale_libccl.reserve(kPluginPaths.size() + 1);
 
-    // Try initializing with CCL_PLUGIN environment variable if set
-    const char *ccl2_plugin = utils_getenv("CCL_PLUGIN");
-    if (ccl2_plugin == nullptr || *ccl2_plugin == '\0') {
-        return init_library_without_override();
+    // Each thread selects its own plugin, one thread at a time
+    std::scoped_lock const lock(plugin_load_mutex);
+    selecting_plugin = true;
+    if (!libccl_v1_preloaded.has_value()) {
+        libccl_v1_preloaded = library_is_loaded_in_process("libccl.so.1");
     }
 
-    return init_library_with_override(ccl2_plugin);
+    // Try initializing with CCL_PLUGIN environment variable if set
+    // No exception may skip the reset of selecting_plugin
+    onecclResult_t const result = SAFE_CALL([] {
+        const char *ccl2_plugin = utils_getenv("CCL_PLUGIN");
+        return ccl2_plugin == nullptr || *ccl2_plugin == '\0'
+                   ? init_library_without_override()
+                   : init_library_with_override(ccl2_plugin);
+    });
+
+    selecting_plugin = false;
+    return result;
 }
 
 #define INIT_CCL                                                               \

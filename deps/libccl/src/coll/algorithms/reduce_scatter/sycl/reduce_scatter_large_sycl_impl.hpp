@@ -93,6 +93,7 @@ template <typename T, int vec_size>
 ccl::event reduce_scatter_large_read_ipc(const void *send_buf,
                                          void *recv_buf,
                                          size_t recv_count,
+                                         size_t send_stride,
                                          ccl::datatype dtype,
                                          ccl::reduction reduction,
                                          ccl_comm *comm,
@@ -116,7 +117,7 @@ ccl::event reduce_scatter_large_read_ipc(const void *send_buf,
     ccl_reduction_data reduction_op = make_reduction_operation(reduction);
 
     const int rank = node_comm->rank();
-    const size_t offset_rank = rank * recv_count * dsize;
+    const size_t offset_rank = rank * send_stride * dsize;
     std::array<void *, MAX_NODE_RANKS> src_ptrs;
     std::vector<sycl::event> dep_events = get_sycl_events(deps);
     sycl::event barrier_event, dep_event, work_event;
@@ -179,6 +180,7 @@ template <typename T, bool use_full_vector>
 ccl::event reduce_scatter_large_impl(const void *send_buf,
                                      void *recv_buf,
                                      size_t recv_count,
+                                     size_t send_stride,
                                      ccl::datatype dtype,
                                      ccl::reduction reduction,
                                      ccl_comm *comm,
@@ -210,7 +212,7 @@ ccl::event reduce_scatter_large_impl(const void *send_buf,
     if (is_single_gpu && !is_tmp_used) {
         constexpr int vec_size = get_num_elements<T, 8, use_full_vector>();
         return reduce_scatter_large_read_ipc<T, vec_size>(
-            send_buf, recv_buf, recv_count, dtype, reduction, comm, global_stream, sycl_ptrs, deps);
+            send_buf, recv_buf, recv_count, send_stride, dtype, reduction, comm, global_stream, sycl_ptrs, deps);
     }
 
     const bool is_cpu_barrier = ccl::global_data::env().sycl_ccl_barrier;
@@ -228,6 +230,7 @@ ccl::event reduce_scatter_large_impl(const void *send_buf,
     void *l_recv_ptr = recv_buf, *l_recv_ptr_prev = recv_buf;
 
     const size_t recv_bytes = recv_count * dsize;
+    const size_t send_stride_bytes = send_stride * dsize;
     const size_t chunk_size = get_tmp_buf_size_per_rank();
     const size_t rem_chunk_size = recv_bytes % chunk_size;
     const size_t num_chunks = recv_bytes / chunk_size + (rem_chunk_size != 0);
@@ -273,8 +276,8 @@ ccl::event reduce_scatter_large_impl(const void *send_buf,
 
             // offset is direct offset within send_buf and
             // offset_tmp is offset within tmp_buf where data is copied from send_buf
-            const size_t offset = global_rank * recv_bytes + chunk_offset;
-            const size_t offset_neigh = global_rank_neighbor * recv_bytes + chunk_offset;
+            const size_t offset = global_rank * send_stride_bytes + chunk_offset;
+            const size_t offset_neigh = global_rank_neighbor * send_stride_bytes + chunk_offset;
             const size_t offset_tmp = i * chunk_size;
             const size_t mdfi_offset_tmp = pipeline_index * pipeline_offset + offset_tmp;
 
@@ -486,6 +489,7 @@ ccl::event reduce_scatter_large_impl(const void *send_buf,
     template ccl::event reduce_scatter_large_impl<DT, B>(const void *send_buf, \
                                                          void *recv_buf, \
                                                          size_t recv_count, \
+                                                         size_t send_stride, \
                                                          ccl::datatype dtype, \
                                                          ccl::reduction reduction, \
                                                          ccl_comm *comm, \

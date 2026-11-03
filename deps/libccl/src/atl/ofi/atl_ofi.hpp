@@ -27,7 +27,6 @@
 #include "common/utils/spinlock.hpp"
 
 #include "occp/occp/occp_client.h"
-#include "occp/occp/occp_server.h"
 #include "occp/occp/types.h"
 
 class atl_ofi : public atl_base_transport {
@@ -221,7 +220,10 @@ public:
 
 private:
     atl_status_t progress_ep(atl_ep_t& ep);
-    void process_comps(atl_ep_t& ep, struct fi_cq_tagged_entry* entries, ssize_t ret);
+    void process_comps(atl_ep_t& ep,
+                       atl_ofi_prov_t* prov,
+                       struct fi_cq_tagged_entry* entries,
+                       ssize_t ret);
     atl_status_t prov_ep_handle_cq_err(atl_ofi_prov_ep_t* ep);
     atl_status_t open_providers(char* prov_env,
                                 const atl_proc_coord_t& coord,
@@ -248,11 +250,6 @@ private:
                               size_t named_ep_count,
                               int rank);
     // void shm_barrier(void* mem, int local_size);
-    std::unique_ptr<occp_server_t> occp_server_;
-    std::unique_ptr<occp_client_t> occp_client_;
-    sockaddr_t occp_srv_addr_;
-    uint16_t occp_srv_port_{ 20000 };
-    std::string occp_srv_ip_;
 
     atl_ofi_ctx_t ctx;
 
@@ -267,7 +264,7 @@ private:
 
         void clear();
         void get(atl_ep_t& ep, atl_ofi_prov_t* prov, void* buf, size_t bytes, fid_mr** mr);
-        void push(fid_mr* mr);
+        void push(atl_ofi_prov_t* prov, fid_mr* mr);
 
     private:
         size_t mr_key = 0;
@@ -288,7 +285,7 @@ private:
 
         void init(size_t instance_count, int ctx_enable_hmem);
         void get(atl_ep_t& ep, atl_ofi_prov_t* prov, void* buf, size_t bytes, fid_mr** mr);
-        void push(size_t idx, fid_mr* mr);
+        void push(size_t idx, atl_ofi_prov_t* prov, fid_mr* mr);
 
     private:
         int enable_hmem{ 0 };

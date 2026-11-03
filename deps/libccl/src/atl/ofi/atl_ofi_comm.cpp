@@ -17,6 +17,7 @@
 #include "atl/ofi/atl_ofi_comm.hpp"
 #include "atl/util/pm/pmi_resizable_rt/pmi_resizable_simple.h"
 #include "atl/util/pm/pmi_rt/pmi_simple.h"
+#include "atl/util/pm/pmi_occp.h"
 #include "atl/util/pm/pmi_resizable_rt/pmi_resizable/kvs/internal_kvs.h"
 #include "atl/util/pm/pmi_resizable_rt/pmi_resizable_simple_internal.h"
 #include "atl/ofi/atl_ofi.hpp"
@@ -89,8 +90,12 @@ atl_ofi_comm::atl_ofi_comm(std::shared_ptr<ikvs_wrapper> k) {
 atl_ofi_comm::atl_ofi_comm(int comm_size,
                            const std::vector<int>& ranks,
                            std::shared_ptr<ikvs_wrapper> k) {
+    std::shared_ptr<occp_kvs> occp_k;
     std::shared_ptr<internal_kvs> kvs;
-    if ((kvs = std::dynamic_pointer_cast<internal_kvs>(k)) != nullptr) {
+    if ((occp_k = std::dynamic_pointer_cast<occp_kvs>(k)) != nullptr) {
+        pmi = std::shared_ptr<ipmi>(new pmi_occp(comm_size, ranks, occp_k));
+    }
+    else if ((kvs = std::dynamic_pointer_cast<internal_kvs>(k)) != nullptr) {
         pmi = std::shared_ptr<ipmi>(new pmi_resizable_simple_internal(comm_size, ranks, kvs));
     }
     else {

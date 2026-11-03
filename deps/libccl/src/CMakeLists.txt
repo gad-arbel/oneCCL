@@ -93,6 +93,7 @@ if (CCL_ENABLE_SYCL AND CCL_ENABLE_ZE)
         coll/algorithms/broadcast/sycl/broadcast_sycl.cpp
         coll/algorithms/broadcast/sycl/broadcast_small_sycl.cpp
         coll/algorithms/broadcast/sycl/broadcast_large_sycl.cpp
+        coll/algorithms/broadcast/sycl/broadcast_large_ce.cpp
         coll/algorithms/broadcast/sycl/broadcast_scaleout_sycl.cpp
         coll/algorithms/broadcast/sycl/broadcast_scaleout_scatter_allgather.cpp
         coll/algorithms/broadcast/sycl/broadcast_pcie.cpp
@@ -101,6 +102,10 @@ if (CCL_ENABLE_SYCL AND CCL_ENABLE_ZE)
         coll/algorithms/scatter/sycl/scatter_small_sycl.cpp
         coll/algorithms/scatter/sycl/scatter_large_sycl.cpp
         coll/algorithms/scatter/sycl/scatter_scaleout_sycl.cpp
+
+        coll/algorithms/gather/sycl/gather_sycl.cpp
+        coll/algorithms/gather/sycl/gather_small_sycl.cpp
+        coll/algorithms/gather/sycl/gather_large_sycl.cpp
 
         coll/algorithms/barrier/sycl/barrier_sycl.cpp
 
@@ -115,12 +120,16 @@ if (CCL_ENABLE_SYCL AND CCL_ENABLE_ZE)
 
         coll/algorithms/utils/cb_events_data.cpp
         coll/algorithms/utils/sycl_coll_base.cpp
+        coll/algorithms/utils/sycl_ce_eu_pipeline.cpp
         coll/algorithms/utils/sycl_custom_preop.cpp
         coll/algorithms/utils/sycl_pipe_send.cpp
         coll/algorithms/utils/sycl_selection.cpp
+        coll/algorithms/utils/sycl_policy.cpp
         coll/algorithms/utils/sycl_policy_resolver_scaleup.cpp
         coll/algorithms/utils/sycl_policy_resolver_scaleout.cpp
+        coll/algorithms/utils/sycl_policy_resolver_json.cpp
         coll/selection/policy/selection_engine.cpp
+        coll/selection/policy/policy_knobs.cpp
         coll/algorithms/utils/p2p_domain.cpp
         coll/algorithms/utils/sycl_ll256.cpp
         coll/algorithms/utils/simple_ipc.cpp
@@ -132,6 +141,7 @@ if (CCL_ENABLE_SYCL AND CCL_ENABLE_ZE)
         proxy/proxy_func.cpp
         proxy/proxy_staging.cpp
         proxy/host_initiated/cmd_persistent_kernel.cpp
+        proxy/device_initiated/request_ring_host.cpp
     )
 
     # Per-dtype instantiation files matching the extern template
@@ -147,32 +157,25 @@ if (CCL_ENABLE_SYCL AND CCL_ENABLE_ZE)
         list(APPEND EXTENSIONS_SRC ${_coll_algo_sycl_inst})
     endif()
 
-    if (ENABLE_ESIMD)
-        list(APPEND EXTENSIONS_SRC
-            coll/algorithms/allgatherv/sycl/allgatherv_medium_sycl.cpp
-
-            coll/algorithms/allreduce/sycl/allreduce_medium_sycl.cpp
-            coll/algorithms/allreduce/sycl/allreduce_medium_sycl_fp16.cpp
-            coll/algorithms/allreduce/sycl/allreduce_medium_sycl_bf16.cpp
-            coll/algorithms/allreduce/sycl/allreduce_medium_sycl_fp32.cpp
-            coll/algorithms/allreduce/sycl/allreduce_medium_sycl_int32.cpp
-            coll/algorithms/allreduce/sycl/allreduce_large_sycl_fp16.cpp
-            coll/algorithms/allreduce/sycl/allreduce_large_sycl_bf16.cpp
-            coll/algorithms/allreduce/sycl/allreduce_large_sycl_fp32.cpp
-            coll/algorithms/allreduce/sycl/allreduce_large_sycl_int32.cpp
-
-            coll/algorithms/reduce_scatter/sycl/reduce_scatter_medium_sycl.cpp
-            coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_int32.cpp
-            coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_fp32.cpp
-            coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_fp16.cpp
-            coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_bf16.cpp
-        )
-    endif(ENABLE_ESIMD)
     if (ENABLE_UMF)
         list(APPEND EXTENSIONS_SRC
             umf/ipc.cpp
         )
     endif(ENABLE_UMF)
+
+    # The SYCL collective kernels move data and spin on peer flags through the
+    # inline vISA helpers in coll/algorithms/utils/{tvisa,protocol,transmit}.
+    # When that device code is built at -O0, the JIT gets "-g -ze-opt-disable"
+    # and on Arc IGC either fails to compile it or produces kernels that hang or
+    # return wrong data, so Debug builds are unusable there. Keep the collective
+    # TUs (and comm.cpp, which launches the barrier kernel) optimized; scheduler,
+    # transport and other host code stays at -O0 for debugging.
+    if (${CMAKE_BUILD_TYPE_CASE_INSENSITIVE} STREQUAL "debug" AND (CCL_ENABLE_ARCA OR CCL_ENABLE_ARCB))
+        set(_arc_debug_optimized_src ${EXTENSIONS_SRC})
+        list(FILTER _arc_debug_optimized_src INCLUDE REGEX "coll/algorithms/")
+        set_source_files_properties(${_arc_debug_optimized_src} comm/comm.cpp
+            PROPERTIES COMPILE_OPTIONS "-O1")
+    endif()
 endif(CCL_ENABLE_SYCL AND CCL_ENABLE_ZE)
 
 set(CCL_SRC
@@ -186,11 +189,13 @@ set(CCL_SRC
     atl/ofi/atl_ofi.cpp
     atl/ofi/atl_ofi_comm.cpp
     atl/ofi/atl_ofi_helper.cpp
+    atl/util/pm/pmi_occp.cpp
     atl/util/pm/pmi_resizable_rt/pmi_resizable_simple.cpp
     atl/util/pm/pmi_resizable_rt/pmi_resizable_simple_internal.cpp
     atl/util/pm/pmi_resizable_rt/pmi_resizable/kvs_keeper.cpp
     atl/util/pm/pmi_resizable_rt/pmi_resizable/kvs/internal_kvs.cpp
     atl/util/pm/pmi_resizable_rt/pmi_resizable/kvs/internal_kvs_server.cpp
+    atl/util/pm/pmi_resizable_rt/pmi_resizable/kvs/occp_kvs.cpp
     atl/util/pm/pmi_resizable_rt/pmi_resizable/kvs/users_kvs.cpp
     atl/util/pm/pmi_rt/pmi_simple.cpp
     atl/util/pm/pmi_rt/pmi/simple_pmi.c
@@ -259,6 +264,8 @@ set(CCL_SRC
     coll/selection/selector_gather.cpp
     coll/selection/selector_scatter.cpp
     coll/selection/selector_send.cpp
+
+    MT/shared_resource.cpp
 
     comm/atl_tag.cpp
     comm/mt_comm.cpp
@@ -396,7 +403,11 @@ if (USE_SECURITY_FLAGS)
 endif()
 
 if (ENABLE_LINKER_RUNPATH)
-    set(SRC_SHARED_LINKER_FLAGS "${SRC_SHARED_LINKER_FLAGS} -Wl,--enable-new-dtags -Wl,-rpath='$ORIGIN'")
+    set(SRC_LINKER_RUNPATH "$ORIGIN")
+    foreach(dir ${LINKER_RUNPATH_EXTRA_DIRS})
+        string(APPEND SRC_LINKER_RUNPATH ":$ORIGIN/${dir}")
+    endforeach()
+    set(SRC_SHARED_LINKER_FLAGS "${SRC_SHARED_LINKER_FLAGS} -Wl,--enable-new-dtags -Wl,-rpath='${SRC_LINKER_RUNPATH}'")
 endif()
 
 set(SRC_SHARED_LINKER_FLAGS "${SRC_SHARED_LINKER_FLAGS} -Wl,--version-script=${PROJECT_SOURCE_DIR}/ccl.map")
@@ -428,8 +439,12 @@ list(APPEND SRC_INCLUDE_DIRS
      ${PROJECT_SOURCE_DIR}/src/atl
      ${LEVEL_ZERO_INCLUDE_DIR}
      ${LIBFABRIC_INCLUDE_DIR}
-     ${HWLOC_INCLUDE_DIR}
-     ${ITT_INCLUDE_DIR})
+     ${HWLOC_INCLUDE_DIR})
+
+if (ENABLE_ITT)
+    list(APPEND SRC_INCLUDE_DIRS
+         ${ITT_INCLUDE_DIR})
+endif()
 
 if (ENABLE_DRM)
     list(APPEND SRC_SYSTEM_INCLUDE_DIRS
@@ -450,14 +465,21 @@ list(APPEND SRC_LINK_LIBS
      dl
      pthread
      ${EXTERNAL_LIBS}
-     ${HWLOC_LIB_DIR}/libhwloc.a
-     ${ITT_LIB_DIR}/libittnotify.a)
+     ${HWLOC_LIB_DIR}/libhwloc.a)
+
+if (ENABLE_ITT)
+    list(APPEND SRC_LINK_LIBS
+         ittnotify)
+endif()
 
 # MPI transport is always built; libccl dlopens libmpi.so.12 at runtime
-# and is never linked against it. mpi.h comes from the vendored deps/mpi/include.
+# and is never linked against it. mpi.h comes from MPI_INCLUDE_DIR, by
+# default the vendored deps/mpi/include. Keep it out of ccl's public
+# include dirs: a consumer linking an external MPI must see that MPI's
+# own mpi.h, not the vendored one.
 set(SRC_C_FLAGS "${SRC_C_FLAGS} -DCCL_ENABLE_MPI")
 set(SRC_CXX_FLAGS "${SRC_CXX_FLAGS} -DCCL_ENABLE_MPI")
-list(APPEND SRC_INCLUDE_DIRS ${MPI_INCLUDE_DIR})
+set(SRC_PRIVATE_INCLUDE_DIRS ${MPI_INCLUDE_DIR})
 
 link_directories(${SRC_LINK_DIRS})
 
@@ -468,7 +490,7 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${SRC_SHARED_LINKER_
 # special library that holds objects only
 add_library(ccl-objects OBJECT ${CCL_SRC})
 set_target_properties(ccl-objects PROPERTIES POSITION_INDEPENDENT_CODE 1)
-target_include_directories(ccl-objects PRIVATE ${SRC_INCLUDE_DIRS})
+target_include_directories(ccl-objects PRIVATE ${SRC_INCLUDE_DIRS} ${SRC_PRIVATE_INCLUDE_DIRS})
 target_include_directories(ccl-objects SYSTEM PRIVATE ${SRC_SYSTEM_INCLUDE_DIRS})
 
 if (COMPUTE_BACKEND_TARGET_NAME)
@@ -515,25 +537,5 @@ install(TARGETS ccl-static ARCHIVE DESTINATION ${CCL_INSTALL_LIB} OPTIONAL)
 # API headers
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/
         DESTINATION ${CCL_INSTALL_INCLUDE} FILES_MATCHING REGEX ".*\\.(h|hpp)$")
-
-if ("${LIBFABRIC_DIR}" STREQUAL "")
-    # internal libfabric is used, install it into package
-    install(DIRECTORY ${DEPS_DIR}/ofi/lib/
-            DESTINATION ${CMAKE_INSTALL_PREFIX}/opt/mpi/libfabric/lib)
-endif()
-
-if (BUNDLE_MPI)
-    file(GLOB mpi_bins "${DEPS_DIR}/mpi/bin/*")
-    install(PROGRAMS ${mpi_bins}
-            DESTINATION ${CMAKE_INSTALL_PREFIX}/opt/mpi/bin)
-    install(DIRECTORY ${DEPS_DIR}/mpi/include/
-            DESTINATION ${CMAKE_INSTALL_PREFIX}/opt/mpi/include)
-    install(DIRECTORY ${DEPS_DIR}/mpi/lib/
-           DESTINATION ${CMAKE_INSTALL_PREFIX}/opt/mpi/lib)
-    install(DIRECTORY ${DEPS_DIR}/mpi/opt/mpi/etc/
-            DESTINATION ${CMAKE_INSTALL_PREFIX}/opt/mpi/etc/)
-    install(DIRECTORY ${DEPS_DIR}/mpi/licensing/
-            DESTINATION ${CCL_INSTALL_LICENSE}/mpi/)
-endif()
 
 add_subdirectory(ext)

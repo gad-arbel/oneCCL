@@ -104,6 +104,31 @@ ccl::event alltoallv_scaleout_sycl(sycl::queue& q,
                                    const alltoallv_ctx& options,
                                    bool& done);
 
+// with use_proxy, the scale-out exchange runs on the proxy thread instead of in a
+// host_task on the caller's queue
+ccl::event alltoallv_sycl_numa_pairwise_rdma_oneshot(sycl::queue& q,
+                                                     const void* send_buf,
+                                                     const ccl::vector_class<size_t>& send_counts,
+                                                     const ccl::vector_class<size_t>& send_displs,
+                                                     void* recv_buf,
+                                                     const ccl::vector_class<size_t>& recv_counts,
+                                                     const ccl::vector_class<size_t>& recv_displs,
+                                                     ccl::datatype dtype,
+                                                     ccl_comm* comm,
+                                                     std::shared_ptr<ccl_comm> p2p_comm,
+                                                     std::shared_ptr<ccl_comm> r2r_comm,
+                                                     ccl_stream* global_stream,
+                                                     const ccl::vector_class<ccl::event>& deps,
+                                                     bool batch_mode,
+                                                     bool use_proxy,
+                                                     const alltoallv_ctx& options,
+                                                     bool& done);
+
+// Proxy-thread entry points declaration
+struct ccl_proxy_op;
+struct ccl_proxy_context;
+void proxy_alltoallv_pairwise(const ccl_proxy_op& op, ccl_proxy_context& ctx);
+
 sycl::event alltoallv_scaleout_sycl_simple_nonblocking(sycl::queue& q,
                                                        const void* send_buf,
                                                        const ccl::vector_class<size_t>& send_counts,

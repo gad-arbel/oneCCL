@@ -20,8 +20,30 @@
 #include "coll/algorithms/utils/sycl_policy_resolver_scaleup.hpp"
 #include "coll/algorithms/utils/sycl_policy_resolver_scaleout.hpp"
 #include "coll/algorithms/utils/barrier_data.hpp"  // use_recording_path
+#include "coll/algorithms/utils/sycl_selection.hpp"
 #include "coll/algorithms/utils/transmit/transmit.hpp"
+#include "coll/selection/selector_impl.hpp"
 #include "proxy/proxy.hpp"
+
+// Resolve which LL256 transmit kernel (ring/oneshot) to use for the SYCL
+// alltoall scale-up path. CCL_SYCL_ALLTOALL_LL picks one of "ring" / "oneshot"
+// per message-size range using the same "<algo>:<lo>-<hi>;..." syntax as
+// CCL_SYCL_ALLGATHERV_LL. When set to a single token, that algorithm is used
+// for all sizes. When explicitly cleared, defaults to ring.
+static std::string select_alltoall_scaleup_ll_algo(size_t bytes) {
+    const std::string& spec = ccl::global_data::env().sycl_alltoall_ll_algo;
+    if (spec.empty()) {
+        return "ring";
+    }
+
+    static ccl_selection_table_t<std::string> table = [&]() {
+        ccl_selection_table_t<std::string> t;
+        fill_table_from_str(spec, t);
+        return t;
+    }();
+
+    return ccl_algorithm_selector_base<std::string>::get_value_from_table(bytes, table);
+}
 
 namespace ccl {
 namespace v1 {
@@ -112,10 +134,38 @@ ccl::event alltoall_scaleup_arc_family(sycl::queue& q,
 #endif // CCL_ENABLE_ITT
             LOG_DEBUG("invoking alltoall LL256 kernel alltoall_ll, count:",
                       pack_count, " datatype: ", dtype);
-            e = alltoall_ll((char*)send_buf + send_offset * ccl_dtype.size(),
-                            (char*)recv_buf + send_offset * ccl_dtype.size(),
-                            pack_count, offsets, dtype, comm, p2p_comm,
-                            global_stream, deps, done);
+            // Resolve the LL transmit algorithm for this chunk size via
+            // CCL_SYCL_ALLTOALL_LL (ring/oneshot per byte range).
+            const size_t msg_bytes = pack_count * ccl_dtype.size();
+            const std::string ll_algo = select_alltoall_scaleup_ll_algo(msg_bytes);
+            // TODO temporary workaround - disable oneshot alltoall while recording
+            bool recording_wa =
+                ccl::global_data::env().sycl_oneshot_alltoall_wa && use_recording_path(q);
+            if (ll_algo == "oneshot" && msg_bytes < (size_t)ONESHOT_MAX_MSGSIZE && !recording_wa) {
+                // OneShot exchanges every per-peer chunk in a single barrier-free
+                // shot (minimum latency); hard-capped at ONESHOT_MAX_MSGSIZE,
+                // above which it falls back to ring.
+                LOG_DEBUG("AllToAll LL - using oneshot transmit");
+                e = alltoall_ll<OneShotTransmit>(
+                    (char*)send_buf + send_offset * ccl_dtype.size(),
+                    (char*)recv_buf + send_offset * ccl_dtype.size(),
+                    pack_count, offsets, dtype, comm, p2p_comm,
+                    global_stream, deps, done);
+            }
+            else if (ll_algo == "ring" || ll_algo == "oneshot") {
+                // Ring is the default, also used as fallback when oneshot
+                // exceeds ONESHOT_MAX_MSGSIZE.
+                LOG_DEBUG("AllToAll LL - using ring transmit");
+                e = alltoall_ll<RingTransmit>(
+                    (char*)send_buf + send_offset * ccl_dtype.size(),
+                    (char*)recv_buf + send_offset * ccl_dtype.size(),
+                    pack_count, offsets, dtype, comm, p2p_comm,
+                    global_stream, deps, done);
+            }
+            else {
+                LOG_ERROR("CCL_SYCL_ALLTOALL_LL must be ring or oneshot, got: ", ll_algo);
+                done = false;
+            }
             if (!done) break;
             send_offset += pack_count;
         }
@@ -160,40 +210,27 @@ ccl::event alltoall_scaleup_default(const void* send_buf,
                                 const std::shared_ptr<ccl_comm> p2p_comm,
                                 ccl_stream* global_stream,
                                 const ccl::vector_class<ccl::event>& deps,
-                                bool is_arc,
                                 bool& done) {
-    auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
-    size_t dt_sz = ccl_dtype.size();
     uint32_t world = p2p_comm->size();
     ccl::event e;
 
-    // ARC does chunking as needed
-    const size_t chunk_size =
-        is_arc ? ccl::global_data::env().sycl_alltoall_chunking_threshold : 0;
-    size_t max_pack_count;
-    size_t nchunks = calculate_chunking_pack_count(chunk_size, count, dt_sz, max_pack_count);
-    size_t offset = 0;
-    for (size_t iter = 0; iter < nchunks; iter++) {
-        size_t pack_count = (iter < nchunks - 1) ? max_pack_count : count - offset;
 #ifdef CCL_ENABLE_ITT
-        ccl::profile::itt::task_begin(
-            "alltoall_large", "send_size", pack_count * ccl_dtype.size(), comm->unique_id());
+    ccl::profile::itt::task_begin("alltoall_large",
+                                  "send_size",
+                                  count * ccl::global_data::get().dtypes->get(dtype).size(),
+                                  comm->unique_id());
 #endif // CCL_ENABLE_ITT
-        LOG_DEBUG("|CCL_SYCL| alltoall selects large kernel, count: ",
-                  pack_count, " datatype: ", dtype, "iter:", iter, "nchunks:", nchunks);
-        std::vector<size_t> scaleup_offsets(world);
-        for (size_t r = 0; r < world; r++) {
-            scaleup_offsets[r] = r * count + offset;
-        }
-        e = alltoall_large(send_buf, recv_buf, pack_count, scaleup_offsets, dtype,
-                           comm, p2p_comm, global_stream, deps);
-        LOG_DEBUG("|CCL_SYCL| alltoall selects large kernel, count: ",
-                  pack_count, " datatype: ", dtype, " done");
-#ifdef CCL_ENABLE_ITT
-        ccl::profile::itt::task_end();
-#endif // CCL_ENABLE_ITT
-        offset += pack_count;
+    LOG_DEBUG("|CCL_SYCL| alltoall selects large kernel, count: ", count, " datatype: ", dtype);
+    std::vector<size_t> scaleup_offsets(world);
+    for (size_t r = 0; r < world; r++) {
+        scaleup_offsets[r] = r * count;
     }
+    e = alltoall_large(send_buf, recv_buf, count, scaleup_offsets, dtype,
+                       comm, p2p_comm, global_stream, deps);
+    LOG_DEBUG("|CCL_SYCL| alltoall selects large kernel, count: ", count, " datatype: ", dtype, " done");
+#ifdef CCL_ENABLE_ITT
+    ccl::profile::itt::task_end();
+#endif // CCL_ENABLE_ITT
     return e;
 }
 
@@ -218,16 +255,15 @@ ccl::event alltoall_scaleup_sycl(sycl::queue& q,
     }
 
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
-    const size_t total_size = count * ccl_dtype.size();
     LOG_DEBUG("|CCL_SYCL| has_all_vertices_connected",
               comm->get_topo_manager().has_all_vertices_connected());
-    const bool is_arc = is_arc_card(ccl::global_data::get().ze_data->devices[0].family);
 
     const auto tune = ccl::sycl_policy_resolver::scaleup_resolver{
         ccl::sycl_policy::policy_query(
-            ccl_coll_alltoall, total_size, ccl_dtype,
+            ccl_coll_alltoall, count, ccl_dtype,
             /*r2r_size=*/0, comm->size(), use_recording_path(q))
             .with_comm(comm)
+            .with_p2p_comm(p2p_comm.get(), /*p2p_access_from_all=*/true)
             .with_stream(global_stream)
     }.alltoall();
 
@@ -239,15 +275,8 @@ ccl::event alltoall_scaleup_sycl(sycl::queue& q,
         if (!fell_through) return ev;
     }
 
-#ifdef CCL_ENABLE_ESIMD
-    if (ccl::global_data::env().sycl_esimd) {
-        LOG_WARN(
-            "|CCL_SYCL| sycl ESIMD requested for alltoall collective; ESIMD not supported, falling back to alltoall sycl implementation");
-    }
-#endif // CCL_ENABLE_ESIMD
-
     return alltoall_scaleup_default(send_buf, recv_buf, count, dtype, comm, p2p_comm,
-                                global_stream, deps, is_arc, done);
+                                global_stream, deps, done);
 }
 
 ccl::event alltoall_scaleout_only_sycl(sycl::queue& q,
@@ -262,8 +291,9 @@ ccl::event alltoall_scaleout_only_sycl(sycl::queue& q,
                                        bool& done) {
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     sycl_scaleout_tune_attr scaleout_tune_attr = ccl::sycl_policy_resolver::scaleout_resolver{
-        ccl::sycl_policy::policy_query(ccl_coll_alltoall, count * ccl_dtype.size(), ccl_dtype,
+        ccl::sycl_policy::policy_query(ccl_coll_alltoall, count, ccl_dtype,
             comm->size(), comm->size(), use_recording_path(q))
+            .with_p2p_level(r2r_comm->get_p2p_level())
     }.alltoall();
 
     LOG_DEBUG("alltoall scaleout only");

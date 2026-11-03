@@ -23,10 +23,28 @@
 #include "coll/algorithms/utils/consts.hpp"
 
 #define __LscFlushCache() \
-    { __asm__ __volatile__("lsc_fence.ugm.evict.gpu"); }
+    { __asm__ __volatile__("lsc_fence.ugm.evict.gpu" ::: "memory"); }
 
 struct sycl_ptrs_type {
     void *mdfi_ptr_rd{ nullptr }, *mdfi_ptr_wr{ nullptr };
-    std::array<void *, MAX_NODE_RANKS> xelink_ptrs_rd, xelink_ptrs_wr;
-    std::array<void *, MAX_NODE_RANKS> node_ptrs_rd, node_ptrs_wr;
+    std::array<void *, MAX_NODE_RANKS> xelink_ptrs_rd{}, xelink_ptrs_wr{};
+    std::array<void *, MAX_NODE_RANKS> node_ptrs_rd{}, node_ptrs_wr{};
 };
+
+// Peer pointers alias the exchanged buffers, so shifting them by a chunk's byte offset
+// lets one IPC exchange serve every chunk. Unset (null) entries stay null.
+inline sycl_ptrs_type offset_sycl_ptrs(const sycl_ptrs_type &ptrs, size_t rd_bytes, size_t wr_bytes) {
+    auto shift = [](void *p, size_t bytes) {
+        return p ? static_cast<void *>(static_cast<char *>(p) + bytes) : p;
+    };
+    sycl_ptrs_type out;
+    out.mdfi_ptr_rd = shift(ptrs.mdfi_ptr_rd, rd_bytes);
+    out.mdfi_ptr_wr = shift(ptrs.mdfi_ptr_wr, wr_bytes);
+    for (size_t i = 0; i < MAX_NODE_RANKS; i++) {
+        out.xelink_ptrs_rd[i] = shift(ptrs.xelink_ptrs_rd[i], rd_bytes);
+        out.xelink_ptrs_wr[i] = shift(ptrs.xelink_ptrs_wr[i], wr_bytes);
+        out.node_ptrs_rd[i] = shift(ptrs.node_ptrs_rd[i], rd_bytes);
+        out.node_ptrs_wr[i] = shift(ptrs.node_ptrs_wr[i], wr_bytes);
+    }
+    return out;
+}

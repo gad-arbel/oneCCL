@@ -37,6 +37,8 @@ ccl::event alltoallv_ll(const void *send_buf,
     sycl::event sycl_e;
     sycl::queue q = global_stream->get_native_stream();
     bool recording = use_recording_path(q);
+    CCL_THROW_IF_NOT(!(recording && comm->is_multi_thread_instance()),
+                     "|CCL_SYCL| Multi-threaded algos do not support sycl_graph recording");
     const int comm_size = p2p_comm->size();
     const int comm_rank = p2p_comm->rank();
 
@@ -79,7 +81,7 @@ ccl::event alltoallv_ll(const void *send_buf,
         sycl::event e;
 
         if (recording) {
-            e = AllToAllv<T, Proto, RingTransmit, true>::launch(
+            e = AllToAllv<T, Proto, RingTransmitV, true>::launch(
                 p2p_comm->get_pattern_data_gpu(),
                 NRanks,
                 (T *)send_buf,
@@ -103,7 +105,7 @@ ccl::event alltoallv_ll(const void *send_buf,
                 done);
         }
         else {
-            e = AllToAllv<T, Proto, RingTransmit, false>::launch(
+            e = AllToAllv<T, Proto, RingTransmitV, false>::launch(
                 p2p_comm->get_pattern_data(),
                 NRanks,
                 (T *)send_buf,

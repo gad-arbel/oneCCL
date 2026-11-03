@@ -31,6 +31,7 @@
 #include "common/global/global.hpp"
 
 #include "coll/algorithms/utils/sycl_reductions.hpp"
+#include "coll/algorithms/utils/host_task.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -104,12 +105,9 @@ sycl::event submit_and_launch_persistent_kernel(
     // regardless of the counter's magnitude.
     std::vector<sycl::event> kernel_deps;
     if (is_recording) {
-        sycl::event upload_plan_event = q.submit([&](sycl::handler& h) {
-            h.depends_on(dep_events);
-            h.host_task([=]() {
-                ccl_kernel_lifecycle::reset_kernel_start(lifecycle, gen);
-                ccl::global_data::get().proxy_service->submit(op);
-            });
+        sycl::event upload_plan_event = ccl_host_task(q, dep_events, [=]() {
+            ccl_kernel_lifecycle::reset_kernel_start(lifecycle, gen);
+            ccl::global_data::get().proxy_service->submit(op);
         });
         kernel_deps.push_back(upload_plan_event);
     }

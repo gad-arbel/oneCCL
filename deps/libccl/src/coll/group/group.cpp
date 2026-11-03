@@ -16,6 +16,7 @@
 
 #include "coll/coll_util.hpp"
 #include "coll/group/group.hpp"
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <thread>
@@ -24,11 +25,11 @@
 #include "comm/comm.hpp"
 #include "common/utils/utils.hpp"
 #ifdef CCL_ENABLE_SYCL
+#include "coll/algorithms/utils/host_task.hpp"
 #include "common/utils/sycl_utils.hpp"
 #include "coll/algorithms/utils/barrier_data.hpp"
 #include "sched/entry/ze/ze_primitives.hpp"
 #endif // CCL_ENABLE_SYCL
-#include "coll/algorithms/utils/host_task.hpp"
 
 thread_local bool group_impl::first_group_op = false;
 thread_local std::vector<group_impl::group_operation> group_impl::operation_storage;
@@ -109,17 +110,23 @@ static bool is_scale_up_pt2pt(const group_impl::group_operation& op) {
 #endif // CCL_ENABLE_SYCL
 }
 
-// collectives keep the user order, only scale-up pt2pt is moved to the tail and sorted
+// collectives keep the user order, only scale-up pt2pt is moved to the tail and sorted;
+// std::sort on indices instead of std::stable_partition/std::stable_sort, which libstdc++ 12
+// implements with the deprecated std::get_temporary_buffer (breaks -Werror with icpx 2026.2)
 static void sort_group_operations() {
     auto& ops = group_impl::operation_storage;
     if (ops.size() < 2) {
         return;
     }
-    auto tail =
-        std::stable_partition(ops.begin(), ops.end(), [](const group_impl::group_operation& op) {
-            return !is_scale_up_pt2pt(op);
-        });
-    if (tail == ops.end()) {
+    std::vector<size_t> idx(ops.size());
+    std::vector<bool> scale_up(ops.size());
+    bool any_scale_up = false;
+    for (size_t i = 0; i < ops.size(); ++i) {
+        idx[i] = i;
+        scale_up[i] = is_scale_up_pt2pt(ops[i]);
+        any_scale_up = any_scale_up || scale_up[i];
+    }
+    if (!any_scale_up) {
         return;
     }
     std::map<ccl_comm*, comm_order_key> keys;
@@ -130,22 +137,36 @@ static void sort_group_operations() {
         }
         return it->second;
     };
+    // one order of the (src, dst) edges, the same on all ranks: the first unfinished
+    // edge always has both ends ready, so blocking pt2pt cannot deadlock
     auto order_of = [](const group_impl::group_operation& op) {
         int src = (op.ctype == ccl_coll_send) ? op.comm->rank() : op.peer_rank;
         int dst = (op.ctype == ccl_coll_send) ? op.peer_rank : op.comm->rank();
-        return (src <= dst) ? 0 : 1;
+        return std::make_tuple(std::min(src, dst), std::max(src, dst), src > dst);
     };
-    std::stable_sort(
-        tail,
-        ops.end(),
-        [&](const group_impl::group_operation& a, const group_impl::group_operation& b) {
-            const comm_order_key& ka = key_of(a.comm);
-            const comm_order_key& kb = key_of(b.comm);
+    std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+        if (scale_up[a] != scale_up[b]) {
+            return !scale_up[a];
+        }
+        if (scale_up[a]) {
+            const comm_order_key& ka = key_of(ops[a].comm);
+            const comm_order_key& kb = key_of(ops[b].comm);
             if (ka != kb) {
                 return ka < kb;
             }
-            return order_of(a) < order_of(b);
-        });
+            if (order_of(ops[a]) != order_of(ops[b])) {
+                return order_of(ops[a]) < order_of(ops[b]);
+            }
+        }
+        // ties keep the user order, as the stable algorithms did
+        return a < b;
+    });
+    std::vector<group_impl::group_operation> sorted;
+    sorted.reserve(ops.size());
+    for (size_t i : idx) {
+        sorted.push_back(std::move(ops[i]));
+    }
+    ops = std::move(sorted);
 }
 
 void group_impl::end() {
@@ -239,27 +260,23 @@ void group_impl::end() {
     if (post_processing_array.size()) {
         LOG_DEBUG("there are post processing steps");
 #ifdef CCL_ENABLE_SYCL
-        sycl_queue
-            .submit([=](sycl::handler& h) {
-                h.host_task([=]() {
+        ccl_host_task(sycl_queue, {}, [=]() {
 #endif
-                    std::vector<atl_req_t> reqs(post_processing_array.size());
-                    bool init = true;
-                    while (true) {
-                        bool all_done = true;
-                        for (size_t i = 0; i < post_processing_array.size(); i++) {
-                            if (!post_processing_array[i](reqs[i], false, init)) {
-                                all_done = false;
-                            }
-                        }
-                        init = false;
-                        if (all_done)
-                            break;
+            std::vector<atl_req_t> reqs(post_processing_array.size());
+            bool init = true;
+            while (true) {
+                bool all_done = true;
+                for (size_t i = 0; i < post_processing_array.size(); i++) {
+                    if (!post_processing_array[i](reqs[i], false, init)) {
+                        all_done = false;
                     }
+                }
+                init = false;
+                if (all_done)
+                    break;
+            }
 #ifdef CCL_ENABLE_SYCL
-                });
-            })
-            .wait();
+        }).wait();
 #endif
     }
 
@@ -297,8 +314,11 @@ const std::vector<ccl::event>& group_impl::safe_deps(const std::vector<ccl::even
 
 #ifdef CCL_ENABLE_SYCL
 bool group_impl::use_group_scale_up(ccl_comm* comm, int peer_rank, ccl_stream* stream) {
-    // selected from data that both ranks have, so they select the same path
-    return !comm->is_multi_thread_instance() && comm->size() == 2 && peer_rank != comm->rank() &&
+    // all ranks of the comm must select the same path: the thread mode, backend and node
+    // check are the same on all ranks, the device family and recording state must match too
+    return !comm->is_multi_thread_instance() &&
+           ccl::global_data::env().backend == backend_mode::native &&
+           comm->get_topo_manager().is_single_node && peer_rank != comm->rank() &&
            ccl::ze::is_arc_card(ccl::ze::get_device_family(stream->get_ze_device())) &&
            !use_recording_path(stream);
 }

@@ -17,10 +17,12 @@
 #pragma once
 #include "oneapi/ccl.hpp"
 #include "common/global/global.hpp"
+#include "coll/selection/policy/policy_env.hpp"
 #include "coll/algorithms/utils/sycl_copy.hpp"
 #include "coll/algorithms/utils/sycl_reductions.hpp"
 #include "coll/algorithms/utils/sycl_ptrs.hpp"
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
+#include "coll/algorithms/utils/host_task.hpp"
 #include "coll/algorithms/allgatherv/sycl/allgatherv_large_sycl_ring.hpp"
 #include "allgather_large_ce.hpp"       // for allgather_large_copy_engine
 
@@ -122,7 +124,8 @@ ccl::event allgatherv_large_impl_ipc_ce(sycl::queue& q,
     else {
         LOG_DEBUG("allgatherv large copy engine write");
         const int my_global_rank = node_comm->rank();
-        const size_t my_offset_bytes = send_count * my_global_rank * dsize;
+        const size_t my_offset_bytes =
+            !offsets.empty() ? offsets[my_global_rank] : send_count * my_global_rank * dsize;
 
         // TODO: can we delete this barrier
         sycl::event barrier_event0 = invoke_barrier(node_comm, q, dep_events, is_cpu_barrier);
@@ -439,10 +442,7 @@ ccl::event allgatherv_large_impl_tmp(sycl::queue& q,
         // WA: directly connecting the output event of q_copy to gpu kernels
         // cause failure when MPI binding is used - I_MPI_PIN_PROCESSOR_LIST
         if (!copy_events.empty()) {
-            sycl::event e = q_use.submit([=](sycl::handler& h) {
-                h.depends_on(copy_events);
-                h.host_task([]() {});
-            });
+            sycl::event e = ccl_host_task(q_use, copy_events, []() {});
             work_events.push_back(e);
         }
 
@@ -510,6 +510,7 @@ template <typename T, bool use_full_vector>
 ccl::event allgatherv_large_impl(sycl::queue& q,
                                  const void* send_buf,
                                  size_t send_count,
+                                 size_t block_count,
                                  void* recv_buf,
                                  const ccl::vector_class<size_t>& recv_counts,
                                  const ccl::vector_class<size_t>& offsets,
@@ -546,7 +547,7 @@ ccl::event allgatherv_large_impl(sycl::queue& q,
         const bool is_arc = is_arc_card(ccl::ze::get_device_family(global_stream->get_ze_device()));
         if(!is_arc || is_tmp_used || q.get_backend() != sycl::backend::ext_oneapi_level_zero)
         {
-            LOG_ERROR("copy engine based allgatherv is only supported for ARC cards with level zero backend and without tmp buffer, disabling copy engine, fallback to default implementation");
+            LOG_WARN("copy engine based allgatherv is only supported for ARC cards with level zero backend and without tmp buffer, disabling copy engine, fallback to default implementation");
             use_copy_engine = false;
         }
         // allgather_large_copy_engine() is not P2P-domain aware: it derives its ring
@@ -563,18 +564,19 @@ ccl::event allgatherv_large_impl(sycl::queue& q,
 
     if(use_copy_engine)
     {
-        LOG_INFO("AllGather Large - using L0 copy engine");
+        LOG_DEBUG("AllGather Large - using L0 copy engine");
         e = allgather_large_copy_engine(
             q, send_buf, send_count, recv_buf, recv_counts, offsets, dtype, comm, global_stream, sycl_ptrs, deps);
         LOG_DEBUG("allgatherv selects large copy engine kernel: count: ", 
                     send_count, " datatype: ", dtype, " done");
     } 
     else if (is_arc_card(ccl::ze::get_device_family(global_stream->get_ze_device()))) {
-        LOG_INFO("AllGather Large - using L0 su ring kernel");
+        LOG_DEBUG("AllGather Large - using L0 su ring kernel");
         sycl::event kernel_event;
         kernel_event = allgatherv_large_su_ring<T>(q,
                                                    send_buf,
                                                    send_count,
+                                                   block_count,
                                                    recv_buf,
                                                    recv_counts,
                                                    offsets,
@@ -590,18 +592,18 @@ ccl::event allgatherv_large_impl(sycl::queue& q,
     }
 
     // TODO: copy engines currently does not support tmp buf
-    else if (ccl::global_data::env().sycl_copy_engine) {
-        LOG_INFO("AllGather Large - using IPC CE");
+    else if (ccl::selection::call_env().sycl_copy_engine) {
+        LOG_DEBUG("AllGather Large - using IPC CE");
         e = allgatherv_large_impl_ipc_ce<T>(
             q, send_buf, send_count, recv_buf, recv_counts, offsets, dtype, comm, global_stream, sycl_ptrs, deps);
     }
     else if (!is_tmp_used) {
-        LOG_INFO("AllGather Large - using IPC");
+        LOG_DEBUG("AllGather Large - using IPC");
         e = allgatherv_large_impl_ipc<T, vec_size_use>(
             q, send_buf, send_count, recv_buf, recv_counts, offsets, dtype, comm, global_stream, sycl_ptrs, deps);
     }
     else {
-        LOG_INFO("AllGather Large - using tmp buffer");
+        LOG_DEBUG("AllGather Large - using tmp buffer");
         e = allgatherv_large_impl_tmp<T, vec_size_use>(
             q, send_buf, send_count, recv_buf, recv_counts, offsets, dtype, comm, global_stream, sycl_ptrs, deps);
     }
@@ -616,6 +618,7 @@ ccl::event allgatherv_large_impl(sycl::queue& q,
     template ccl::event allgatherv_large_impl<DT, B>(sycl::queue & q, \
                                                      const void* send_buf, \
                                                      size_t send_count, \
+                                                     size_t block_count, \
                                                      void* recv_buf, \
                                                      const ccl::vector_class<size_t>& recv_counts, \
                                                      const ccl::vector_class<size_t>& offsets, \

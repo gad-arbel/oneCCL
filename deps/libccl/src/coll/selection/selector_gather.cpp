@@ -26,6 +26,11 @@ std::map<ccl_coll_gather_algo, std::string>
     };
 
 ccl_algorithm_selector<ccl_coll_gather>::ccl_algorithm_selector() {
+    // Every table stays on direct. ccl_coll_build_gather can only build direct
+    // - gather has no scheduler topo path - so handing the scheduler topo would
+    // hit its CCL_FATAL. The SYCL kernels are not reached through these tables
+    // anyway: ccl_gather gates them on can_use_sycl_kernels alone, and a
+    // done=false from there has to land on direct.
     insert(main_table, 0, CCL_SELECTION_MAX_COLL_SIZE, ccl_coll_gather_direct);
     insert(scaleout_table, 0, CCL_SELECTION_MAX_COLL_SIZE, ccl_coll_gather_direct);
     insert(fallback_table, 0, CCL_SELECTION_MAX_COLL_SIZE, ccl_coll_gather_direct);
@@ -42,8 +47,7 @@ bool ccl_algorithm_selector_helper<ccl_coll_gather_algo>::can_use(
         can_use = false;
     }
     else if (algo == ccl_coll_gather_topo) {
-        // topo gather is not implemented yet; keep it unselectable until the
-        // topo algorithm is wired end-to-end (mirrors selector_scatter.cpp)
+        // kept unselectable: there is no scheduler builder for it
         can_use = false;
     }
 

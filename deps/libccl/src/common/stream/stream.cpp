@@ -36,6 +36,7 @@ std::string to_string(device_family family) {
         case device_family::family6: return "family6";
         case device_family::family7: return "family7";
         case device_family::family8: return "family8";
+        case device_family::family9: return "family9";
         default: return "unknown";
     }
 }

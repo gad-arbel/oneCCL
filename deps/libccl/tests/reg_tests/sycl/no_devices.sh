@@ -8,11 +8,20 @@ SCRIPT_DIR=$(cd $(dirname "${BASH_SOURCE}") && pwd -P)
 ROOT_DIR="$(dirname "${SCRIPT_DIR}")"
 BASENAME="$(basename $0 .sh)"
 TEST_LOG="${BASENAME}.log"
-BINFILE="${SCRIPT_DIR}/../../../build/_install/examples/cpu/cpu_allreduce_test"
+# The cpu reg test, built by every reg-test build. The examples install tree it
+# used to be taken from only exists in a standalone v1 build.
+BINFILE="${ROOT_DIR}/cpu/allreduce"
 
 source "${ROOT_DIR}/utils.sh"
 
 make_common_actions "${SCRIPT_DIR}" "${TEST_LOG}" "sycl"
+
+if [ ! -x "${BINFILE}" ]
+then
+    echo "Error: ${BINFILE} not found, run the reg-test build stage first"
+    echo "Fail"
+    exit 1
+fi
 
 function run_cmd() {
     if ! "$@"; then

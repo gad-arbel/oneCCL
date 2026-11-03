@@ -16,6 +16,7 @@
 
 #include "coll/algorithms/alltoallv/sycl/alltoallv_large_sycl_impl.hpp"
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
+#include "coll/selection/policy/policy_env.hpp"
 
 ccl::event alltoallv_large(const void* send_buf,
                            const std::vector<size_t>& send_counts,
@@ -36,7 +37,7 @@ ccl::event alltoallv_large(const void* send_buf,
     const size_t dsize = ccl::global_data::get().dtypes->get(dtype).size();
 
     bool is_arc = is_arc_card(ccl::global_data::get().ze_data->devices[0].family);
-    CCL_THROW_IF_NOT(!ccl::global_data::env().sycl_copy_engine || is_arc,
+    CCL_THROW_IF_NOT(!ccl::selection::call_env().sycl_copy_engine || is_arc,
                      "alltoallv using copy engines not supported");
 
     if (comm->is_multi_thread_instance() == true) {

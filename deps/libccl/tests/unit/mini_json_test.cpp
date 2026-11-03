@@ -111,7 +111,7 @@ TEST(MiniJsonPolicyFile, PrimitivesRoundTrip) {
     ASSERT_NE(gc, nullptr);
     ASSERT_TRUE(gc->is_object());
 
-    const Value* dl = gc->find("p2p_domain_level");
+    const Value* dl = gc->find("CCL_SYCL_P2P_LEVEL");
     ASSERT_NE(dl, nullptr);
     ASSERT_TRUE(dl->is_string());
     EXPECT_EQ(dl->get<std::string>(), "node");
@@ -140,7 +140,8 @@ TEST(MiniJsonPolicyFile, VocabularyArraysParseAsArrays) {
 TEST(MiniJsonPolicyFile, NestedNavigationHitsEmptyLeaf) {
     // Path: collective=allgather / p2p_domain=any / phase=scaleup / is_arc=yes
     // / is_multi_thread=yes / protocol=sycl_ll / algorithm=ring
-    // / line_size=256 -> {}  (empty object, used by the engine as a knob).
+    // / ll_table=oneshot:0-256;ring:257-max -> {}  (empty object, used by the
+    // engine as a knob).
     std::ifstream in(policy_fixture_path());
     Value doc = Value::parse(in);
 
@@ -152,7 +153,7 @@ TEST(MiniJsonPolicyFile, NestedNavigationHitsEmptyLeaf) {
     n = n->find("is_multi_thread=yes");ASSERT_NE(n, nullptr);
     n = n->find("protocol=sycl_ll");   ASSERT_NE(n, nullptr);
     n = n->find("algorithm=ring");     ASSERT_NE(n, nullptr);
-    n = n->find("line_size=256");      ASSERT_NE(n, nullptr);
+    n = n->find("ll_table=oneshot:0-256;ring:257-max"); ASSERT_NE(n, nullptr);
     ASSERT_TRUE(n->is_object());
     EXPECT_TRUE(n->empty());
 }

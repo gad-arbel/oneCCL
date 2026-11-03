@@ -59,6 +59,13 @@ struct ccl_kernel_lifecycle {
     static void wait_kernel_start(const ccl_kernel_lifecycle* lc, uint32_t gen) {
         wait_backoff_ge(&lc->started_gen, gen);
     }
+
+    // Non-blocking wait_kernel_start(): whether the kernel for generation `gen` has begun, by the
+    // same wrap-safe >= predicate. Static to keep the struct trivial and POD-compatible.
+    static bool kernel_started(const ccl_kernel_lifecycle* lc, uint32_t gen) {
+        const uint32_t observed = *static_cast<const volatile uint32_t*>(&lc->started_gen);
+        return static_cast<int32_t>(observed - gen) >= 0;
+    }
 };
 
 /* ======== Device command types ======== */

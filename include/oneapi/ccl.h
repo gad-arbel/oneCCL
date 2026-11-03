@@ -82,7 +82,7 @@ extern "C" {
  * @brief Minor version of oneCCL
  * @ingroup Macros
  */
-#define ONECCL_MINOR 2
+#define ONECCL_MINOR 3
 
 /**
  * @def ONECCL_PATCH

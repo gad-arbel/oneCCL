@@ -15,6 +15,7 @@
 */
 
 #include <dlfcn.h>
+#include <glob.h>
 #include <libgen.h>
 #include <sys/stat.h>
 
@@ -35,8 +36,8 @@ std::string get_ofi_lib_path() {
     // 1. CCL_OFI_LIBRARY_PATH (always)
     // 2. I_MPI_OFI_LIBRARY (only when transport==mpi)
     // 3. $I_MPI_ROOT/opt/mpi/libfabric/lib/libfabric.so.1 (only when transport==mpi)
-    // 4. CCL_ROOT-relative bundled libfabric (dladdr-derived CCL_ROOT):
-    //      /opt/mpi/libfabric/lib/libfabric.so.1 (where we install it)
+    // 4. libfabric from an IMPI co-installed under CCL_ROOT (dladdr-derived CCL_ROOT):
+    //      /opt/mpi/libfabric/lib/libfabric.so.1 (IMPI in the unified directory layout)
     //      /lib/libfabric/libfabric.so            (IMPI <= 2021.14)
     //      /lib/libfabric.so                      (IMPI 2021.15)
     // 5. "libfabric.so.1" (LD_LIBRARY_PATH / ldconfig)
@@ -68,12 +69,12 @@ std::string get_ofi_lib_path() {
         }
     }
 
-    // Prefer the libfabric bundled with the package. The relative paths cover the
-    // different install layouts (default install is opt/mpi/libfabric/lib).
+    // Prefer libfabric from an IMPI co-installed under CCL_ROOT. The relative
+    // paths cover the different IMPI install layouts.
     auto ccl_root = get_relative_ccl_root_path();
     if (!ccl_root.empty()) {
         const char* relative_paths[] = {
-            "/opt/mpi/libfabric/lib/libfabric.so.1", // Our actual install path
+            "/opt/mpi/libfabric/lib/libfabric.so.1", // IMPI in the unified directory layout
             "/lib/libfabric/libfabric.so",            // IMPI <= 2021.14
             "/lib/libfabric.so",                      // IMPI 2021.15
         };
@@ -81,7 +82,7 @@ std::string get_ofi_lib_path() {
         for (const char* rel : relative_paths) {
             std::string candidate = ccl_root + rel;
             if (stat(candidate.c_str(), &buffer) == 0) {
-                LOG_DEBUG("OFI lib path (bundled): ", candidate);
+                LOG_DEBUG("OFI lib path (CCL_ROOT-relative IMPI): ", candidate);
                 return candidate;
             }
         }
@@ -105,13 +106,21 @@ static std::string get_relative_ccl_root_path() {
             libccl_path[PATH_MAX - 1] = '\0';
 
             // Remove `libccl.so` from the path to get directory like `$CCL_ROOT/lib`
-            char* libccl_dir = dirname(libccl_path);
+            std::string libccl_dir = dirname(libccl_path);
+            // The CPU-only libccl.so is in `$CCL_ROOT/lib/ccl/cpu/lib`
+            const std::string cpu_lib_subdir = "/ccl/cpu/lib";
+            if (libccl_dir.size() > cpu_lib_subdir.size() &&
+                libccl_dir.compare(libccl_dir.size() - cpu_lib_subdir.size(),
+                                   cpu_lib_subdir.size(),
+                                   cpu_lib_subdir) == 0) {
+                libccl_dir.resize(libccl_dir.size() - cpu_lib_subdir.size());
+            }
             // Remove the `lib` from the path the get just the `CCL_ROOT`
-            char* ccl_root_cstr = dirname(libccl_dir);
-
-            auto ccl_root = std::string(ccl_root_cstr);
-
-            return ccl_root;
+            auto slash = libccl_dir.find_last_of('/');
+            if (slash == std::string::npos) {
+                return {};
+            }
+            return slash == 0 ? std::string("/") : libccl_dir.substr(0, slash);
         }
     }
 
@@ -128,7 +137,7 @@ static bool load_libfabric() {
         return true;
     }
 
-    // If the bundled/explicit path failed, retry the system libfabric as a last resort.
+    // If the explicit/IMPI path failed, retry the system libfabric as a last resort.
     if (ofi_lib_info.path != "libfabric.so.1") {
         print_error(error, ofi_lib_info);
         LOG_INFO("Retrying to load system libfabric.so.1");
@@ -140,7 +149,17 @@ static bool load_libfabric() {
     }
 
     print_error(error, ofi_lib_info);
+    LOG_ERROR("no usable libfabric found; install libfabric "
+              "(e.g. distro package libfabric1) or set CCL_OFI_LIBRARY_PATH");
     return false;
+}
+
+// True if dir holds a libfabric provider plugin (lib<name>-fi.so)
+static bool has_provider_plugins(const std::string& dir) {
+    glob_t matches{};
+    bool found = glob((dir + "/lib*-fi.so").c_str(), 0, nullptr, &matches) == 0;
+    globfree(&matches);
+    return found;
 }
 
 static void setup_providers() {
@@ -163,17 +182,27 @@ static void setup_providers() {
     }
 
     // libfabric honors only the first entry of FI_PROVIDER_PATH, so this must be
-    // the directory holding the provider plugins - not a colon-joined list, and
-    // not the directory of the core library itself.
-    std::string provider_path = std::string(real_libfabric_path) + "/prov";
+    // the one directory holding the provider plugins - not a colon-joined list.
+    // Two layouts ship them: a bundled one with the plugins in <libfabric dir>/prov
+    // (oneAPI IMPI), and a flat one with the plugins next to libfabric itself
+    // (the impi-rt pip wheel, conda impi_rt).
+    std::string libfabric_dir(real_libfabric_path);
+    std::string provider_path = libfabric_dir + "/prov";
 
-    // Leave FI_PROVIDER_PATH unset when there is no bundled provider directory:
-    // setting it to a non-existent path would override libfabric's own default
-    // search and hide providers built into the library we loaded.
     struct stat buffer {};
     if (stat(provider_path.c_str(), &buffer) != 0) {
-        LOG_DEBUG("no provider directory at ", provider_path, ", leaving FI_PROVIDER_PATH unset");
-        return;
+        // Leave FI_PROVIDER_PATH unset when no provider plugins ship with the
+        // library: setting it would override libfabric's own default search and
+        // hide providers built into the library we loaded.
+        if (!has_provider_plugins(libfabric_dir)) {
+            LOG_DEBUG("no provider plugins at ",
+                      provider_path,
+                      " or ",
+                      libfabric_dir,
+                      ", leaving FI_PROVIDER_PATH unset");
+            return;
+        }
+        provider_path = libfabric_dir;
     }
 
     if (setenv("FI_PROVIDER_PATH", provider_path.c_str(), 1) != 0) {

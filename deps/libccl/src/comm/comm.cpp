@@ -37,6 +37,7 @@
 #include "kvs_impl.hpp"
 
 #ifdef CCL_ENABLE_SYCL
+#include "coll/algorithms/utils/host_task.hpp"
 #include "common/utils/sycl_utils.hpp"
 #endif // CCL_ENABLE_SYCL
 
@@ -95,11 +96,8 @@ sycl::event invoke_barrier(const std::shared_ptr<ccl_comm> comm,
     bool gpu_increment = use_recording_path(q);
     sycl::event e;
     if (use_cpu) {
-        e = q.submit([=](sycl::handler& h) {
-            h.depends_on(dep_events);
-            h.host_task([comm]() {
-                comm_barrier(comm);
-            });
+        e = ccl_host_task(q, dep_events, [comm]() {
+            comm_barrier(comm);
         });
     }
     else {
@@ -341,6 +339,7 @@ ccl_comm::ccl_comm(const ccl_comm& src, int comm_id)
     even_comm = src.even_comm;
     pair_comm = src.pair_comm;
     block_ordered_with_r2r = src.block_ordered_with_r2r;
+    p2p_level = src.p2p_level;
 }
 
 std::shared_ptr<ikvs_wrapper> ccl_comm::get_kvs_wrapper(std::shared_ptr<ccl::kvs_interface> kvs) {
@@ -585,7 +584,9 @@ void ccl_comm::create_topo_subcomms(std::shared_ptr<atl_base_comm> atl_comm) {
     bool is_arc __attribute__((unused)) = false;
 
 #if defined(CCL_ENABLE_SYCL) && defined(CCL_ENABLE_ZE)
-    is_arc = ccl::ze::is_arc_card(ccl::global_data::get().ze_data->devices[0].family);
+    const auto& ze_data = ccl::global_data::get().ze_data;
+    is_arc =
+        ze_data && !ze_data->devices.empty() && ccl::ze::is_arc_card(ze_data->devices[0].family);
     my_numa_node = get_numa_node_for_gpu(node_comm, device_ptr, context_ptr);
     if (is_arc) {
         my_pcie_switch = get_pcie_switch_for_gpu(node_comm, device_ptr, context_ptr);
@@ -775,6 +776,17 @@ void ccl_comm::create_topo_subcomms(std::shared_ptr<atl_base_comm> atl_comm) {
     self_comm = std::shared_ptr<ccl_comm>(create_subcomm(atl_comm->get_rank()));
     self_r2r_comm = std::shared_ptr<ccl_comm>(create_subcomm(0));
     cache_block_ordered_p2p_layout(size(), self_comm, self_r2r_comm);
+
+    // Tag each p2p / r2r pair with the domain level ccl_p2p_domain::get_p2p_comms()
+    // returns it for; each sub-comm object serves exactly one level.
+    node_comm->p2p_level = ccl_p2p_domain_level::p2p_node;
+    r2r_comm->p2p_level = ccl_p2p_domain_level::p2p_node;
+    numa_comm->p2p_level = ccl_p2p_domain_level::p2p_numa;
+    numa_r2r_comm->p2p_level = ccl_p2p_domain_level::p2p_numa;
+    pcie_switch_comm->p2p_level = ccl_p2p_domain_level::p2p_switch;
+    pcie_switch_r2r_comm->p2p_level = ccl_p2p_domain_level::p2p_switch;
+    self_comm->p2p_level = ccl_p2p_domain_level::p2p_none;
+    self_r2r_comm->p2p_level = ccl_p2p_domain_level::p2p_none;
 
     even_comm = std::shared_ptr<ccl_comm>(
         create_subcomm(topo_manager.get_inter_card_color(atl_comm->get_rank())));
@@ -1221,7 +1233,8 @@ void ccl_scaleout_host_bufs::put_scaleout_host_buf(const void* buf) {
 
 size_t ccl_scaleout_host_bufs::get_scaleout_host_buf_size() {
     if (buf_size == 0) {
-        buf_size = ccl::global_data::env().sycl_scaleout_host_buf_size;
+        buf_size = is_small ? ccl::global_data::env().sycl_scaleout_small_host_buf_size
+                            : ccl::global_data::env().sycl_scaleout_host_buf_size;
     }
     return buf_size;
 }

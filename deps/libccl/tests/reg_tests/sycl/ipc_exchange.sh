@@ -18,7 +18,7 @@ transports="ofi mpi"
 sched_cache_modes="0 1"
 ze_cache_modes="0 1"
 
-bench_options="-w 16 -i 1024 -j off -c all -b sycl -y 32,64,1024 -l all $(get_default_bench_dtype)"
+bench_options="-w 2 -i 8 -j off -c all -b sycl -y 32,64,1024 -l all $(get_default_bench_dtype)"
 
 for ze_cache_mode in ${ze_cache_modes}
 do

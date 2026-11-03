@@ -77,9 +77,21 @@ ccl::event allgatherv_scaleout_sycl_direct(sycl::queue& q,
     }
     else if (!is_cpu_buffers) {
         if (!check_mpi_supports_rdma()) {
-            LOG_INFO("copy_to_host=false with a GPU buffer. "
-                     "make sure MPI GPU RDMA is enabled");
+            LOG_DEBUG("copy_to_host=false with a GPU buffer. "
+                      "make sure MPI GPU RDMA is enabled");
         }
+        // atl copies the local chunk with a host memcpy, which faults on device USM;
+        // copy it on the device and send from the recv slot so that atl detects in-place case AND skips the copy
+        void* local_chunk = (char*)recv_buf + recv_offsets[comm->rank()];
+        if (local_chunk != send_buf) {
+            ev = q.submit([=](sycl::handler& h) {
+                h.depends_on(sycl_deps);
+                h.memcpy(local_chunk, send_buf, send_count * ccl_dtype.size());
+            });
+            sycl_deps.clear();
+            sycl_deps.push_back(ev);
+        }
+        scaleout_send_buf = local_chunk;
     }
 
     auto op_end = ccl_host_task(q, sycl_deps, [=]() {
@@ -134,7 +146,7 @@ ccl::event allgatherv_scaleout_sycl(sycl::queue& q,
                            ccl::global_data::get().proxy_service->is_started();
 
     switch (tune_attr.algo()) {
-        case ccl::sycl_policy::algorithm::direct:
+        case ccl::sycl_policy::scaleout_algo::direct:
         default: {
 #ifdef CCL_ENABLE_ITT
             ccl::profile::itt::task_begin(
@@ -162,7 +174,7 @@ ccl::event allgatherv_scaleout_sycl(sycl::queue& q,
 #endif // CCL_ENABLE_ITT
             return e;
         }
-        case ccl::sycl_policy::algorithm::ring: {
+        case ccl::sycl_policy::scaleout_algo::ring: {
 #ifdef CCL_ENABLE_ITT
             ccl::profile::itt::task_begin(
                 use_proxy ? "allgatherv_scaleout_sycl_proxy_ring" : "allgatherv_scaleout_sycl_ring",

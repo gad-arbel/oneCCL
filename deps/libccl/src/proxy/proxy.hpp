@@ -22,13 +22,15 @@
 #pragma once
 
 #include "oneapi/ccl/types.hpp"
-#include "comm/comm.hpp"
 
 #include "proxy/proxy_types.hpp"
 #include "proxy/proxy_staging.hpp"
 #include "proxy/host_initiated/cmd_ring_types.hpp"
 #include "proxy/host_initiated/cmd_ring_host.hpp"
 #include "proxy/host_initiated/cmd_ring_context.hpp"
+#include "proxy/device_initiated/request_ring_types.hpp"
+#include "proxy/device_initiated/request_ring_host.hpp"
+#include "proxy/device_initiated/request_ring_context.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -51,7 +53,8 @@ public:
     void start(ccl_cmd_ring_producer* producer,
                ccl_kernel_lifecycle* lifecycle,
                ccl_proxy_staging* staging,
-               sycl::queue* queue);
+               sycl::queue* queue,
+               ccl_request_ring_consumer* request_consumer);
 
     // Returns true if the thread was joined and everything it points at (ring,
     // staging, queue, and this object) is safe to free. Returns false if it did
@@ -63,12 +66,14 @@ public:
 
 private:
     void work_loop();
-    bool poll_host_op(ccl_proxy_op& out_op);
+    bool poll_host_op(ccl_proxy_op& out_op, bool& out_pending);
+    bool poll_device_op();
 
     ccl_cmd_ring_producer* m_producer{ nullptr };
     ccl_kernel_lifecycle* m_lifecycle{ nullptr };
     ccl_proxy_staging* m_staging{ nullptr };
     sycl::queue* m_queue{ nullptr };
+    ccl_request_ring_consumer* m_request_consumer{ nullptr };
 
     std::queue<ccl_proxy_op> m_host_op_queue;
     std::mutex m_host_queue_mutex;
@@ -116,6 +121,13 @@ public:
         return m_staging;
     }
 
+    /* Device-initiated framework (GPU → CPU): a kernel captures this handle by value and posts
+     * send/recv requests through it (request_ring_device.hpp). The comm each request names is not
+     * the service's business - the kernel carries it, resolved by ccl_make_device_comm_proxy(). */
+    ccl_device_ring_handle device_ring_handle() const {
+        return m_req_ctx.handle();
+    }
+
     // Assign the next monotonic generation for an op/kernel launch pair.
     // Single source of truth for the lifecycle handshake.
     uint32_t next_generation() {
@@ -124,6 +136,7 @@ public:
 
 private:
     ccl_cmd_ring_context m_cmd_ctx;
+    ccl_request_ring_context m_req_ctx;
     ccl_proxy_staging m_staging;
     sycl::queue* m_proxy_sycl_queue{ nullptr };
 

@@ -17,12 +17,14 @@
 #pragma once
 #include "oneapi/ccl.hpp"
 #include "common/global/global.hpp"
+#include "coll/selection/policy/policy_env.hpp"
 
 #if defined(CCL_ENABLE_ZE) || defined(CCL_ENABLE_SYCL)
 #include "coll/algorithms/utils/sycl_barrier.hpp"
 #include "coll/algorithms/utils/sycl_copy.hpp"
 #include "coll/algorithms/utils/sycl_reductions.hpp"
 #include "coll/algorithms/utils/sycl_ptrs.hpp"
+#include "coll/algorithms/utils/sycl_ce_eu_pipeline.hpp"
 #include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_ring.hpp"
 #include "coll/algorithms/allreduce/sycl/allreduce_sycl.hpp"
 #include "coll/algorithms/utils/transmit/ring_transmit.hpp"
@@ -251,6 +253,8 @@ void allreduce_large_su_ring_write_single_kernel(const void *send_buf,
     const size_t recv_bytes = recv_count * dsize;
     const size_t last_recv_bytes = last_block_count * dsize;
 
+    // the segment variables are for the multi-kernel rings; this one always takes a whole
+    // tmp buffer per slot, so its chunks only ever come from a slice that does not fit
     size_t chunk_size = get_tmp_buf_size_per_rank();
     if (chunk_size > last_recv_bytes)
         chunk_size = last_recv_bytes;
@@ -350,8 +354,41 @@ void allreduce_large_su_ring_write_multi_kernel(const void *send_buf,
 
     T *peer_recv = (T *)(sycl_ptrs.node_ptrs_wr[peer_rank]);
 
-    const bool use_memcpy = ccl::global_data::env().sycl_copy_engine;
+    const bool use_memcpy = ccl::selection::call_env().sycl_copy_engine;
     size_t num_threads = ccl::global_data::env().sycl_num_threads;
+
+    {
+        ce_eu_pipeline_request_t request;
+        request.collective = "allreduce";
+        request.stream = global_stream;
+        request.comm = comm;
+        request.ranks = N;
+        request.is_cpu_barrier = is_cpu_barrier;
+        request.has_whole_vectors = is_whole_vector_count(count_per_rank, dsize);
+        request.dsize = dsize;
+        request.message_bytes = count * dsize;
+        request.count_per_rank = count_per_rank;
+        request.preferred_chunk_bytes = CE_EU_ALLREDUCE_CHUNK_BYTES;
+        const ce_eu_pipeline_plan_t plan = plan_ce_eu_pipeline(request);
+        if (plan.use_pipeline) {
+            ce_eu_args_t args;
+            args.is_allreduce = true;
+            args.send_buf = send_buf;
+            args.recv_buf = recv_buf;
+            args.count_per_rank = count_per_rank;
+            args.send_stride = count_per_rank;
+            args.dtype = dtype;
+            args.reduction = reduction;
+            args.comm = comm;
+            args.p2p_comm = p2p_comm;
+            args.global_stream = global_stream;
+            args.peer_recv_buf = peer_recv;
+            args.deps_ptr = &deps;
+            // like the serial path below, no event: the stream queue is in order
+            run_ce_eu_pipeline<T>(args, plan);
+            return;
+        }
+    }
 
     sycl::device device = q.get_device();
     // Query the maximum work-group size
@@ -370,8 +407,14 @@ void allreduce_large_su_ring_write_multi_kernel(const void *send_buf,
     const size_t recv_bytes = recv_count * dsize;
     void *recv_buf_rank_offset = (T *)recv_buf + my_offset_count;
     void *peer_recv_buf_rank_offset = (T *)peer_recv + my_offset_count;
-    const size_t chunk_size = ccl::global_data::env().sycl_tmp_buf_size / pipeline_size /
-                              sizeof(message_t) * sizeof(message_t);
+    const size_t chunk_size = get_simple_ring_segment_size(
+        CCL_SYCL_ALLREDUCE_SIMPLE_RING_SEGMENT_SIZE,
+        simple_ring_segment_request(
+            CCL_SYCL_ALLREDUCE_SIMPLE_RING_SEGMENT_SIZE,
+            ccl::selection::call_env().sycl_allreduce_simple_ring_segment_size,
+            use_full_vector),
+        pipeline_size,
+        large_tmp_buf_align);
     const size_t chunk_count = chunk_size / dsize;
     const size_t rem_chunk_count = recv_count % chunk_count;
     const size_t num_chunks = recv_count / chunk_count + (rem_chunk_count != 0);
@@ -518,7 +561,7 @@ sycl::event allreduce_large_su_ring_write_no_ipc(const void *send_buf,
     constexpr int partial_vec_size = get_num_elements<T, 16, false>();
     int vec_size = use_full_vector ? full_vec_size : partial_vec_size;
 
-    const bool use_memcpy = ccl::global_data::env().sycl_copy_engine;
+    const bool use_memcpy = ccl::selection::call_env().sycl_copy_engine;
     size_t num_threads = ccl::global_data::env().sycl_num_threads;
 
     sycl::device device = q.get_device();
@@ -540,7 +583,15 @@ sycl::event allreduce_large_su_ring_write_no_ipc(const void *send_buf,
     sycl::event work_event;
 
     const int pipeline_size = N;
-    const size_t chunk_size = ccl::global_data::env().sycl_tmp_buf_size / pipeline_size;
+    // whole vectors, so every segment and slot stays aligned
+    const size_t chunk_size = get_simple_ring_segment_size(
+        CCL_SYCL_ALLREDUCE_SIMPLE_RING_SEGMENT_SIZE,
+        simple_ring_segment_request(
+            CCL_SYCL_ALLREDUCE_SIMPLE_RING_SEGMENT_SIZE,
+            ccl::selection::call_env().sycl_allreduce_simple_ring_segment_size,
+            use_full_vector),
+        pipeline_size,
+        large_tmp_buf_align);
 
     const size_t my_offset_count = count_per_rank * rank;
     const size_t recv_count = count_per_rank;
@@ -745,7 +796,7 @@ sycl::event allreduce_large_su_ring(const void *send_buf,
     T *peer_send = (T *)(sycl_ptrs.node_ptrs_rd[peer_rank]);
     T *peer_recv = (T *)(sycl_ptrs.node_ptrs_wr[peer_rank]);
 
-    const bool use_memcpy = ccl::global_data::env().sycl_copy_engine;
+    const bool use_memcpy = ccl::selection::call_env().sycl_copy_engine;
     const bool use_single_kernel = ccl::global_data::env().sycl_simple_single_kernel;
     const bool read_algo = ccl::global_data::env().sycl_allreduce_simple_read;
 

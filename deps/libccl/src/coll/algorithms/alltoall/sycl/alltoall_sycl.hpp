@@ -47,7 +47,7 @@ ccl::event alltoall_sycl(sycl::queue q,
 } // namespace v1
 } // namespace ccl
 
-// ring with LL protocols
+template <template <typename, template <typename, int> class, bool, int> class Transmit>
 ccl::event alltoall_ll(const void* send_buf,
                        void* recv_buf,
                        size_t send_count,

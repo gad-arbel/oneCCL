@@ -34,7 +34,8 @@ ccl::event allreduce_scaleout_sycl(sycl::queue& q,
                                    bool original_deps,
                                    sycl_scaleout_tune_attr tune_attr,
                                    bool& done,
-                                   bool is_cpu_buffers) {
+                                   bool is_cpu_buffers,
+                                   bool is_remainder_chunk) {
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     bool copy_to_host = ccl::global_data::env().sycl_enable_direct_gpu_rdma ? false : true;
     ze_device_handle_t ze_dev =
@@ -42,7 +43,7 @@ ccl::event allreduce_scaleout_sycl(sycl::queue& q,
     if (should_disable_rdma(ze_dev) || ccl::global_data::env().atl_transport == ccl_atl_ofi) {
         copy_to_host = true;
     }
-    sycl_scaleout_algo algo = tune_attr.algo();
+    ccl::sycl_policy::scaleout_algo algo = tune_attr.algo();
 
     // when the proxy service is enabled for allreduce, the selected algorithm runs its
     // scale-out exchange on the proxy thread instead of in a host task; a service that
@@ -54,7 +55,7 @@ ccl::event allreduce_scaleout_sycl(sycl::queue& q,
     done = false;
 
     switch (algo) {
-        case ccl::sycl_policy::algorithm::direct:
+        case ccl::sycl_policy::scaleout_algo::direct:
 #ifdef CCL_ENABLE_ITT
             ccl::profile::itt::task_begin("allreduce_scaleout_sycl_simple",
                                           "send_size",
@@ -78,15 +79,17 @@ ccl::event allreduce_scaleout_sycl(sycl::queue& q,
                                                 done,
                                                 copy_to_host,
                                                 is_cpu_buffers,
+                                                is_remainder_chunk,
                                                 use_proxy);
 #ifdef CCL_ENABLE_ITT
             ccl::profile::itt::task_end();
 #endif // CCL_ENABLE_ITT
             // no need to goto fallback, just return
             return ccl::event::create_from_native(ev);
-        case ccl::sycl_policy::algorithm::rabenseifner:
+        case ccl::sycl_policy::scaleout_algo::rabenseifner:
 #ifdef CCL_ENABLE_ITT
-            ccl::profile::itt::task_begin("allreduce_scaleout_sycl_rabenseifner",
+            ccl::profile::itt::task_begin(use_proxy ? "allreduce_scaleout_sycl_proxy_rabenseifner"
+                                                    : "allreduce_scaleout_sycl_rabenseifner",
                                           "send_size",
                                           count * ccl_dtype.size(),
                                           comm->unique_id());
@@ -94,18 +97,26 @@ ccl::event allreduce_scaleout_sycl(sycl::queue& q,
             LOG_DEBUG("|CCL_SYCL| allreduce scaleout selects rabenseifner kernel, count:",
                       count,
                       " datatype: ",
-                      dtype);
-            ev = allreduce_scaleout_sycl_rabenseifner(q,
-                                                      send_buf,
-                                                      recv_buf,
-                                                      count,
-                                                      dtype,
-                                                      reduction,
-                                                      comm,
-                                                      deps,
-                                                      original_deps,
-                                                      tune_attr,
-                                                      done);
+                      dtype,
+                      " use_proxy: ",
+                      use_proxy);
+            if (use_proxy) {
+                ev = allreduce_scaleout_sycl_proxy_rabenseifner(
+                    q, send_buf, recv_buf, count, dtype, reduction, comm, deps, tune_attr, done);
+            }
+            else {
+                ev = allreduce_scaleout_sycl_rabenseifner(q,
+                                                          send_buf,
+                                                          recv_buf,
+                                                          count,
+                                                          dtype,
+                                                          reduction,
+                                                          comm,
+                                                          deps,
+                                                          original_deps,
+                                                          tune_attr,
+                                                          done);
+            }
 #ifdef CCL_ENABLE_ITT
             ccl::profile::itt::task_end();
 #endif // CCL_ENABLE_ITT
@@ -113,7 +124,7 @@ ccl::event allreduce_scaleout_sycl(sycl::queue& q,
                 goto fallback;
             }
             return ccl::event::create_from_native(ev);
-        case ccl::sycl_policy::algorithm::ring:
+        case ccl::sycl_policy::scaleout_algo::ring:
 #ifdef CCL_ENABLE_ITT
             ccl::profile::itt::task_begin(
                 use_proxy ? "allreduce_scaleout_sycl_proxy_ring" : "allreduce_scaleout_sycl_ring",
@@ -173,7 +184,8 @@ fallback:
                                         deps,
                                         done,
                                         copy_to_host,
-                                        is_cpu_buffers);
+                                        is_cpu_buffers,
+                                        is_remainder_chunk);
 #ifdef CCL_ENABLE_ITT
     ccl::profile::itt::task_end();
 #endif // CCL_ENABLE_ITT

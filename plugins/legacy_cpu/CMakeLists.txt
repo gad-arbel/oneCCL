@@ -25,11 +25,14 @@ target_link_libraries(ccl_legacy_cpu PRIVATE "${COVERAGE_CXX_FLAGS}")
 target_compile_options(ccl_legacy_cpu PRIVATE "${EXTRA_CXX_FLAGS}")
 target_link_options(ccl_legacy_cpu PRIVATE "${EXTRA_CXX_FLAGS}")
 
+# Add warning flags
+target_compile_options(ccl_legacy_cpu PRIVATE "${ONECCL_WARNING_COMPILE_FLAGS}")
+
 # Set the RPATH for the install tree: prefer the CPU-only libccl.so.1 from
 # ccl/cpu/lib, fall back to the one next to the plugin (flat wheel layout)
 set_target_properties(ccl_legacy_cpu PROPERTIES
     BUILD_WITH_INSTALL_RPATH FALSE
-    INSTALL_RPATH "\$ORIGIN/ccl/cpu/lib/;\$ORIGIN"
+    INSTALL_RPATH "\$ORIGIN/${ONECCL_CPU_LIB_SUBDIR}/;\$ORIGIN"
     INSTALL_RPATH_USE_LINK_PATH TRUE
 )
 
@@ -40,7 +43,7 @@ target_link_options(ccl_legacy_cpu PRIVATE "-Wl,--disable-new-dtags")
 # Set the RPATH for the build tree if using system libccl.so
 if(NOT "${_oneccl_root}" STREQUAL "")
     set_target_properties(ccl_legacy_cpu PROPERTIES
-        BUILD_RPATH "${_oneccl_root}/lib/ccl/cpu/lib/"
+        BUILD_RPATH "${_oneccl_root}/lib/${ONECCL_CPU_LIB_SUBDIR}/"
     )
 
     # Add include directories for oneCCL headers

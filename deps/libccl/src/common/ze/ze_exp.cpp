@@ -31,7 +31,7 @@ static void* get_ext_func_pointer(ze_driver_handle_t driver, const char* func_na
         return nullptr;
     }
 
-    L0_INFO("Loaded ", func_name, " at ", (void*)func_ptr);
+    L0_DEBUG("Loaded ", func_name, " at ", (void*)func_ptr);
 
     return func_ptr;
 };

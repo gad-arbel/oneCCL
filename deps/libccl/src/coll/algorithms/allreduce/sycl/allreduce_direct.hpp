@@ -76,6 +76,7 @@ inline sycl::event allreduce_scaleout_sycl_simple(sycl::queue& q,
                                                   bool& done,
                                                   bool copy_to_host,
                                                   bool is_cpu_buffers,
+                                                  bool is_remainder_chunk = false,
                                                   bool use_proxy = false) {
     sycl::event op_end, copy_e;
     std::shared_ptr<atl_base_comm> atl_comm = comm->get_atl_comm();
@@ -102,7 +103,13 @@ inline sycl::event allreduce_scaleout_sycl_simple(sycl::queue& q,
         }
 
         scaleout_send_buf = ATL_IN_PLACE;
-        scaleout_recv_buf = comm->get_scaleout_host_buf();
+        // only the remainder chunk uses the small pool; the size check makes
+        // sure the data fits, so a small slot can never overflow
+        const bool use_small_host_buf =
+            is_remainder_chunk &&
+            count * ccl_dtype.size() <= comm->get_scaleout_small_host_buf_size();
+        scaleout_recv_buf = use_small_host_buf ? comm->get_scaleout_small_host_buf()
+                                               : comm->get_scaleout_host_buf();
         copy_e = q.submit([=](sycl::handler& h) {
             h.depends_on(dep_events);
             h.memcpy(scaleout_recv_buf,

@@ -84,6 +84,7 @@
 #include "coll/algorithms/recv/sycl/recv_sycl.hpp"
 #include "coll/algorithms/send/sycl/send_sycl.hpp"
 #include "coll/algorithms/scatter/sycl/scatter_sycl.hpp"
+#include "coll/algorithms/gather/sycl/gather_sycl.hpp"
 #endif // CCL_ENABLE_SYCL && CCL_ENABLE_ZE
 
 #if defined(CCL_ENABLE_SYCL)
@@ -1677,12 +1678,17 @@ ccl::event ccl_alltoallv(const void* send_buf,
         return std::unique_ptr<ccl::event_impl>(new ccl::host_event_impl(req));
     };
 #if defined(CCL_ENABLE_SYCL) && defined(CCL_ENABLE_ZE)
+    size_t total_send_count = std::accumulate(send_counts, send_counts + comm->size(), 0ul);
+    size_t total_recv_count = std::accumulate(recv_counts, recv_counts + comm->size(), 0ul);
+    void* buf = total_recv_count > 0 ? recv_buf : nullptr;
+    if (!buf && total_send_count > 0)
+        buf = const_cast<void*>(send_buf);
     ccl_selector_param param = ccl_selector_param::create(ccl_coll_alltoallv,
                                                           0,
                                                           dtype,
                                                           comm,
                                                           const_cast<ccl_stream*>(stream),
-                                                          recv_buf,
+                                                          buf,
                                                           ccl::reduction::custom,
                                                           false, // is_vector_buf
                                                           false, // is_sycl_buf
@@ -2437,7 +2443,55 @@ ccl::event ccl_gather(const void* send_buf,
             ccl_gather_impl(send_buf, recv_buf, count, dtype, root, attr, comm, stream, (*op_deps));
         return std::unique_ptr<ccl::event_impl>(new ccl::host_event_impl(req));
     };
+#if defined(CCL_ENABLE_SYCL) && defined(CCL_ENABLE_ZE)
+    ccl_selector_param param = ccl_selector_param::create(ccl_coll_gather,
+                                                          count,
+                                                          dtype,
+                                                          comm,
+                                                          const_cast<ccl_stream*>(stream),
+                                                          // not recv_buf: root-only, so a nullptr
+                                                          // elsewhere would make is_device_buf
+                                                          // disagree across ranks
+                                                          const_cast<void*>(send_buf),
+                                                          ccl::reduction::custom,
+                                                          false, // is_vector_buf
+                                                          false, // is_sycl_buf
+                                                          CCL_INVALID_PEER_RANK_IDX, // peer_rank
+                                                          {}, // hint_algo
+                                                          false); // is_scaleout
 
+    // a sycl::buffer call hands over the address of the buffer object, not a
+    // device pointer: can_use_sycl_kernels rejects it on is_device_buf, but a
+    // multi-thread communicator returns ahead of that check
+    if (!attr.is_sycl_buf && can_use_sycl_kernels(param)) {
+        LOG_DEBUG("|CCL_SYCL| gather selects sycl-kernels count: ", count, ", datatype: ", dtype);
+
+        ccl_stream* op_stream = const_cast<ccl_stream*>(stream);
+        auto dummy_unused_attr = ccl::create_operation_attr<ccl::gather_attr>();
+        collective = [=]() -> ccl::event {
+            bool done = false;
+            auto q = op_stream->get_native_stream();
+            ccl::event ccl_event = ccl::gather_sycl(q,
+                                                    send_buf,
+                                                    recv_buf,
+                                                    count,
+                                                    dtype,
+                                                    root,
+                                                    comm,
+                                                    op_stream,
+                                                    dummy_unused_attr,
+                                                    (*op_deps),
+                                                    done);
+            if (done) {
+                if (ccl::global_data::env().enable_op_sync) {
+                    ccl_event.wait();
+                }
+                return ccl_event;
+            }
+            return collective();
+        };
+    }
+#endif // CCL_ENABLE_SYCL && CCL_ENABLE_ZE
     ccl_request* req{};
     ccl::event event = std::unique_ptr<ccl::event_impl>(
         new ccl::host_event_impl(req, group_impl::is_group_active()));

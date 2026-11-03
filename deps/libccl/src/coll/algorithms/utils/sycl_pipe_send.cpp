@@ -20,26 +20,20 @@
 #include <memory>
 
 #include "coll/algorithms/utils/host_task.hpp"
+#include "coll/algorithms/utils/sycl_pipeline_chunk.hpp"  // pipeline_alignment
 
 //namespace ccl {
 //namespace v1 {
 
 const int num_chunk_buffs = ccl_scaleout_pipeline_bufs::num_chunk_buffs;
 
-// calculate the total number of chunks for pipeline
-void pipe_prep(size_t min_msg_count,
-               size_t max_msg_count,
-               size_t dsize,
-               size_t pipeline_chunk_size,
-               size_t& nchunks) {
-    size_t align = std::max<size_t>(4, dsize);
-
-    min_msg_count = (min_msg_count * dsize + align - 1) / align;
-
+// calculate the total number of chunks for pipeline; the count and the chunk size are both
+// converted to units of the alignment, so every dtype gets ceil(bytes / pipeline_chunk_size)
+void pipe_prep(size_t max_msg_count, size_t dsize, size_t pipeline_chunk_size, size_t& nchunks) {
+    size_t align = ccl::sycl_policy::pipeline_alignment(dsize);
+    size_t max_msg_align_count = (max_msg_count * dsize + align - 1) / align;
     size_t max_pipeline_chunk_count = pipeline_chunk_size / align;
-    size_t min_nchunks = (min_msg_count + max_pipeline_chunk_count - 1) / max_pipeline_chunk_count;
-    size_t max_nchunks = (max_msg_count + max_pipeline_chunk_count - 1) / max_pipeline_chunk_count;
-    nchunks = std::max(min_nchunks, max_nchunks);
+    nchunks = (max_msg_align_count + max_pipeline_chunk_count - 1) / max_pipeline_chunk_count;
 }
 
 static void calculate_chunk_sizes(size_t total_send_size,
@@ -50,7 +44,7 @@ static void calculate_chunk_sizes(size_t total_send_size,
                                   size_t& recv_chunk_size) {
     send_chunk_size = (total_send_size + nchunks - 1) / nchunks;
     recv_chunk_size = (total_recv_size + nchunks - 1) / nchunks;
-    size_t align = std::max<size_t>(4, dsize);
+    size_t align = ccl::sycl_policy::pipeline_alignment(dsize);
 
     send_chunk_size = (send_chunk_size + align - 1) / align * align;
     recv_chunk_size = (recv_chunk_size + align - 1) / align * align;
@@ -58,6 +52,14 @@ static void calculate_chunk_sizes(size_t total_send_size,
     size_t max_pipeline_chunk_size = ccl::global_data::env().sycl_max_pipeline_chunk_size;
     CCL_ASSERT(send_chunk_size <= max_pipeline_chunk_size &&
                recv_chunk_size <= max_pipeline_chunk_size);
+}
+
+// nchunks is based on the largest block, so a small block can end before its
+// last chunk: chunk_size is rounded up to the alignment and
+// chunk_size * (nchunks - 1) can exceed total_size. The chunks after the end
+// are empty, so every rank still posts nchunks sends and recvs.
+static size_t chunk_bytes(size_t total_size, size_t chunk_size, size_t idx) {
+    return std::min(chunk_size, total_size - std::min(idx * chunk_size, total_size));
 }
 
 // one-way RDMA (send side)
@@ -102,30 +104,63 @@ sycl::event pipe_sendrecv_rdma_oneway_send(sycl::queue& q,
     int idx = 0;
     int chunk_index = 0, prev_chunk_index = 0;
     int next_chunk_index = 1;
-    int send_size = (1 == nchunks ? total_send_size : send_chunk_size);
-    int recv_size = (1 == nchunks ? total_recv_size : recv_chunk_size);
+    size_t send_size = chunk_bytes(total_send_size, send_chunk_size, 0);
+    size_t recv_size = chunk_bytes(total_recv_size, recv_chunk_size, 0);
 
     // post recv (pipe)
-    recv_e = q.submit([=](sycl::handler& h) {
-        h.depends_on(deps);
-        h.host_task([=]() {
+    recv_e = ccl_host_task(q, deps, [=]() {
+        atl_req_t& recv_req = comm->get_pipeline_recv_req();
+        ATL_CALL_THROW_IF_ERROR(atl_comm->recv(
+            ep_idx, recv_pipe_chunks[chunk_index], recv_size, src, recvtag, recv_req));
+    });
+    // post send (rdma)
+    send_e = ccl_host_task(q, deps, [=]() {
+        atl_req_t& send_req = comm->get_pipeline_send_req();
+        ATL_CALL_THROW_IF_ERROR(
+            atl_comm->send(ep_idx, send_buf, send_size, dest, sendtag, send_req));
+    });
+    recv_done_e = ccl_host_task(q, { recv_e, send_e }, [=]() {
+        atl_req_t& send_req = comm->get_pipeline_send_req();
+        atl_req_t& recv_req = comm->get_pipeline_recv_req();
+        ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
+        if (!recv_req.is_completed) {
+            ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
+        }
+        ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
+        if (!send_req.is_completed) {
+            ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
+        }
+    });
+    for (idx = 1; idx < nchunks; idx++) {
+        send_size = chunk_bytes(total_send_size, send_chunk_size, idx);
+        recv_size = chunk_bytes(total_recv_size, recv_chunk_size, idx);
+        size_t prev_recv_size = chunk_bytes(total_recv_size, recv_chunk_size, idx - 1);
+
+        chunk_index = idx % num_chunk_buffs;
+        prev_chunk_index = (chunk_index + num_chunk_buffs - 1) % num_chunk_buffs;
+
+        // post send and recv
+        recv_e = ccl_host_task(q, { recv_done_e }, [=]() {
+            atl_req_t& send_req = comm->get_pipeline_send_req();
             atl_req_t& recv_req = comm->get_pipeline_recv_req();
+            ATL_CALL_THROW_IF_ERROR(atl_comm->send(ep_idx,
+                                                   (char*)send_buf + idx * send_chunk_size,
+                                                   send_size,
+                                                   dest,
+                                                   sendtag,
+                                                   send_req));
             ATL_CALL_THROW_IF_ERROR(atl_comm->recv(
                 ep_idx, recv_pipe_chunks[chunk_index], recv_size, src, recvtag, recv_req));
         });
-    });
-    // post send (rdma)
-    send_e = q.submit([=](sycl::handler& h) {
-        h.depends_on(deps);
-        h.host_task([=]() {
-            atl_req_t& send_req = comm->get_pipeline_send_req();
-            ATL_CALL_THROW_IF_ERROR(
-                atl_comm->send(ep_idx, send_buf, send_size, dest, sendtag, send_req));
+        // copy for receive for prev chunk
+        recv_copy_e = q_rcopy.submit([=](sycl::handler& h) {
+            h.depends_on(recv_done_e);
+            h.memcpy((char*)recv_buf + (idx - 1) * recv_chunk_size,
+                     recv_pipe_chunks[prev_chunk_index],
+                     prev_recv_size);
         });
-    });
-    recv_done_e = q.submit([=](sycl::handler& h) {
-        h.depends_on({ recv_e, send_e });
-        h.host_task([=]() {
+        // wait for send/recv completion
+        recv_done_e = ccl_host_task(q, { recv_e, recv_copy_e }, [=]() {
             atl_req_t& send_req = comm->get_pipeline_send_req();
             atl_req_t& recv_req = comm->get_pipeline_recv_req();
             ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
@@ -136,55 +171,6 @@ sycl::event pipe_sendrecv_rdma_oneway_send(sycl::queue& q,
             if (!send_req.is_completed) {
                 ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
             }
-        });
-    });
-    for (idx = 1; idx < nchunks; idx++) {
-        send_size =
-            (idx == nchunks - 1 ? total_send_size - send_chunk_size * idx : send_chunk_size);
-        recv_size =
-            (idx == nchunks - 1 ? total_recv_size - recv_chunk_size * idx : recv_chunk_size);
-
-        chunk_index = idx % num_chunk_buffs;
-        prev_chunk_index = (chunk_index + num_chunk_buffs - 1) % num_chunk_buffs;
-
-        // post send and recv
-        recv_e = q.submit([=](sycl::handler& h) {
-            h.depends_on(recv_done_e);
-            h.host_task([=]() {
-                atl_req_t& send_req = comm->get_pipeline_send_req();
-                atl_req_t& recv_req = comm->get_pipeline_recv_req();
-                ATL_CALL_THROW_IF_ERROR(atl_comm->send(ep_idx,
-                                                       (char*)send_buf + idx * send_chunk_size,
-                                                       send_size,
-                                                       dest,
-                                                       sendtag,
-                                                       send_req));
-                ATL_CALL_THROW_IF_ERROR(atl_comm->recv(
-                    ep_idx, recv_pipe_chunks[chunk_index], recv_size, src, recvtag, recv_req));
-            });
-        });
-        // copy for receive for prev chunk
-        recv_copy_e = q_rcopy.submit([=](sycl::handler& h) {
-            h.depends_on(recv_done_e);
-            h.memcpy((char*)recv_buf + (idx - 1) * recv_chunk_size,
-                     recv_pipe_chunks[prev_chunk_index],
-                     recv_chunk_size);
-        });
-        // wait for send/recv completion
-        recv_done_e = q.submit([=](sycl::handler& h) {
-            h.depends_on({ recv_e, recv_copy_e });
-            h.host_task([=]() {
-                atl_req_t& send_req = comm->get_pipeline_send_req();
-                atl_req_t& recv_req = comm->get_pipeline_recv_req();
-                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
-                if (!recv_req.is_completed) {
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
-                }
-                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
-                if (!send_req.is_completed) {
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
-                }
-            });
         });
     }
     // copy for recv for last chunk (recv_size is already calculated)
@@ -239,8 +225,8 @@ sycl::event pipe_sendrecv_rdma_oneway_recv(sycl::queue& q,
     int idx = 0;
     int chunk_index = 0, prev_chunk_index = 0;
     int next_chunk_index = 1;
-    int send_size = (1 == nchunks ? total_send_size : send_chunk_size);
-    int recv_size = (1 == nchunks ? total_recv_size : recv_chunk_size);
+    size_t send_size = chunk_bytes(total_send_size, send_chunk_size, 0);
+    size_t recv_size = chunk_bytes(total_recv_size, recv_chunk_size, 0);
 
     // copy for send
     send_copy_e = q_scopy.submit([=](sycl::handler& h) {
@@ -248,27 +234,20 @@ sycl::event pipe_sendrecv_rdma_oneway_recv(sycl::queue& q,
         h.memcpy(send_pipe_chunks[chunk_index], send_buf, send_size);
     });
     // post recv (rdma)
-    recv_e = q.submit([=](sycl::handler& h) {
-        h.depends_on(deps);
-        h.host_task([=]() {
-            atl_req_t& recv_req = comm->get_pipeline_recv_req();
-            ATL_CALL_THROW_IF_ERROR(
-                atl_comm->recv(ep_idx, recv_buf, recv_size, src, recvtag, recv_req));
-        });
+    recv_e = ccl_host_task(q, deps, [=]() {
+        atl_req_t& recv_req = comm->get_pipeline_recv_req();
+        ATL_CALL_THROW_IF_ERROR(
+            atl_comm->recv(ep_idx, recv_buf, recv_size, src, recvtag, recv_req));
     });
     // post send (pipe)
-    send_e = q.submit([=](sycl::handler& h) {
-        h.depends_on(send_copy_e);
-        h.host_task([=]() {
-            atl_req_t& send_req = comm->get_pipeline_send_req();
-            ATL_CALL_THROW_IF_ERROR(atl_comm->send(
-                ep_idx, send_pipe_chunks[chunk_index], send_size, dest, sendtag, send_req));
-        });
+    send_e = ccl_host_task(q, { send_copy_e }, [=]() {
+        atl_req_t& send_req = comm->get_pipeline_send_req();
+        ATL_CALL_THROW_IF_ERROR(atl_comm->send(
+            ep_idx, send_pipe_chunks[chunk_index], send_size, dest, sendtag, send_req));
     });
     // start copy next chunk for send
     if (nchunks > 1) {
-        int next_send_size =
-            (1 == nchunks - 1 ? total_send_size - send_chunk_size : send_chunk_size);
+        size_t next_send_size = chunk_bytes(total_send_size, send_chunk_size, 1);
         send_copy_e = q_scopy.submit([=](sycl::handler& h) {
             h.depends_on(deps);
             h.memcpy(send_pipe_chunks[next_chunk_index],
@@ -276,9 +255,48 @@ sycl::event pipe_sendrecv_rdma_oneway_recv(sycl::queue& q,
                      next_send_size);
         });
     }
-    recv_done_e = q.submit([=](sycl::handler& h) {
-        h.depends_on({ send_copy_e, recv_e, send_e });
-        h.host_task([=]() {
+    recv_done_e = ccl_host_task(q, { send_copy_e, recv_e, send_e }, [=]() {
+        atl_req_t& send_req = comm->get_pipeline_send_req();
+        atl_req_t& recv_req = comm->get_pipeline_recv_req();
+        ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
+        if (!recv_req.is_completed) {
+            ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
+        }
+        ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
+        if (!send_req.is_completed) {
+            ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
+        }
+    });
+    for (idx = 1; idx < nchunks - 1; idx++) {
+        send_size = chunk_bytes(total_send_size, send_chunk_size, idx);
+        size_t next_send_size = chunk_bytes(total_send_size, send_chunk_size, idx + 1);
+        recv_size = chunk_bytes(total_recv_size, recv_chunk_size, idx);
+
+        chunk_index = idx % num_chunk_buffs;
+        next_chunk_index = (chunk_index + 1) % num_chunk_buffs;
+
+        // post send and recv
+        recv_e = ccl_host_task(q, { recv_done_e }, [=]() {
+            atl_req_t& send_req = comm->get_pipeline_send_req();
+            atl_req_t& recv_req = comm->get_pipeline_recv_req();
+            ATL_CALL_THROW_IF_ERROR(atl_comm->send(
+                ep_idx, send_pipe_chunks[chunk_index], send_size, dest, sendtag, send_req));
+            ATL_CALL_THROW_IF_ERROR(atl_comm->recv(ep_idx,
+                                                   (char*)recv_buf + idx * recv_chunk_size,
+                                                   recv_size,
+                                                   src,
+                                                   recvtag,
+                                                   recv_req));
+        });
+        // copy for send for next chunk
+        send_copy_e = q_scopy.submit([=](sycl::handler& h) {
+            h.depends_on(recv_done_e);
+            h.memcpy(send_pipe_chunks[next_chunk_index],
+                     (char*)send_buf + (idx + 1) * send_chunk_size,
+                     next_send_size);
+        });
+        // wait for send/recv completion
+        recv_done_e = ccl_host_task(q, { recv_e, send_copy_e }, [=]() {
             atl_req_t& send_req = comm->get_pipeline_send_req();
             atl_req_t& recv_req = comm->get_pipeline_recv_req();
             ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
@@ -290,88 +308,34 @@ sycl::event pipe_sendrecv_rdma_oneway_recv(sycl::queue& q,
                 ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
             }
         });
-    });
-    for (idx = 1; idx < nchunks - 1; idx++) {
-        send_size =
-            (idx == nchunks - 1 ? total_send_size - send_chunk_size * idx : send_chunk_size);
-        int next_send_size = (idx + 1 == nchunks - 1 ? total_send_size - send_chunk_size * (idx + 1)
-                                                     : send_chunk_size);
-        recv_size =
-            (idx == nchunks - 1 ? total_recv_size - recv_chunk_size * idx : recv_chunk_size);
-
-        chunk_index = idx % num_chunk_buffs;
-        next_chunk_index = (chunk_index + 1) % num_chunk_buffs;
-
-        // post send and recv
-        recv_e = q.submit([=](sycl::handler& h) {
-            h.depends_on(recv_done_e);
-            h.host_task([=]() {
-                atl_req_t& send_req = comm->get_pipeline_send_req();
-                atl_req_t& recv_req = comm->get_pipeline_recv_req();
-                ATL_CALL_THROW_IF_ERROR(atl_comm->send(
-                    ep_idx, send_pipe_chunks[chunk_index], send_size, dest, sendtag, send_req));
-                ATL_CALL_THROW_IF_ERROR(atl_comm->recv(ep_idx,
-                                                       (char*)recv_buf + idx * recv_chunk_size,
-                                                       recv_size,
-                                                       src,
-                                                       recvtag,
-                                                       recv_req));
-            });
-        });
-        // copy for send for next chunk
-        send_copy_e = q_scopy.submit([=](sycl::handler& h) {
-            h.depends_on(recv_done_e);
-            h.memcpy(send_pipe_chunks[next_chunk_index],
-                     (char*)send_buf + (idx + 1) * send_chunk_size,
-                     next_send_size);
-        });
-        // wait for send/recv completion
-        recv_done_e = q.submit([=](sycl::handler& h) {
-            h.depends_on({ recv_e, send_copy_e });
-            h.host_task([=]() {
-                atl_req_t& send_req = comm->get_pipeline_send_req();
-                atl_req_t& recv_req = comm->get_pipeline_recv_req();
-                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
-                if (!recv_req.is_completed) {
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
-                }
-                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
-                if (!send_req.is_completed) {
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
-                }
-            });
-        });
     }
 
     //  send last chunk
     if (nchunks > 1) {
-        send_size = total_send_size - send_chunk_size * (nchunks - 1);
-        recv_size = total_recv_size - recv_chunk_size * (nchunks - 1);
+        send_size = chunk_bytes(total_send_size, send_chunk_size, nchunks - 1);
+        recv_size = chunk_bytes(total_recv_size, recv_chunk_size, nchunks - 1);
         chunk_index = idx % num_chunk_buffs;
         // post send and recv
-        recv_done_e = q.submit([=](sycl::handler& h) {
-            h.depends_on(recv_done_e);
-            h.host_task([=]() {
-                atl_req_t& send_req = comm->get_pipeline_send_req();
-                atl_req_t& recv_req = comm->get_pipeline_recv_req();
-                ATL_CALL_THROW_IF_ERROR(
-                    atl_comm->recv(ep_idx,
-                                   (char*)recv_buf + (nchunks - 1) * recv_chunk_size,
-                                   recv_size,
-                                   src,
-                                   recvtag,
-                                   recv_req));
-                ATL_CALL_THROW_IF_ERROR(atl_comm->send(
-                    ep_idx, send_pipe_chunks[chunk_index], send_size, dest, sendtag, send_req));
-                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
-                if (!recv_req.is_completed) {
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
-                }
-                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
-                if (!send_req.is_completed) {
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
-                }
-            });
+        recv_done_e = ccl_host_task(q, { recv_done_e }, [=]() {
+            atl_req_t& send_req = comm->get_pipeline_send_req();
+            atl_req_t& recv_req = comm->get_pipeline_recv_req();
+            ATL_CALL_THROW_IF_ERROR(
+                atl_comm->recv(ep_idx,
+                               (char*)recv_buf + (nchunks - 1) * recv_chunk_size,
+                               recv_size,
+                               src,
+                               recvtag,
+                               recv_req));
+            ATL_CALL_THROW_IF_ERROR(atl_comm->send(
+                ep_idx, send_pipe_chunks[chunk_index], send_size, dest, sendtag, send_req));
+            ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
+            if (!recv_req.is_completed) {
+                ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
+            }
+            ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
+            if (!send_req.is_completed) {
+                ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
+            }
         });
     }
 
@@ -419,8 +383,8 @@ sycl::event pipe_sendrecv_plain(sycl::queue& q,
     int idx = 0;
     int chunk_index = 0, prev_chunk_index = 0;
     int next_chunk_index = 1;
-    int send_size = (1 == nchunks ? total_send_size : send_chunk_size);
-    int recv_size = (1 == nchunks ? total_recv_size : recv_chunk_size);
+    size_t send_size = chunk_bytes(total_send_size, send_chunk_size, 0);
+    size_t recv_size = chunk_bytes(total_recv_size, recv_chunk_size, 0);
 
     // recv0   send0   |  send1     recv1   |  send2     recv2 | send3   recv3
     // s_copy0 s_copy1 |  s_copy2   r_copy0 |  s_copy3 r_copy1 | r_copy2 r_copy3
@@ -431,27 +395,20 @@ sycl::event pipe_sendrecv_plain(sycl::queue& q,
         h.memcpy(send_pipe_chunks[chunk_index], send_buf, send_size);
     });
     // post recv
-    recv_e = q.submit([=](sycl::handler& h) {
-        h.depends_on(deps);
-        h.host_task([=]() {
-            atl_req_t& recv_req = comm->get_pipeline_recv_req();
-            ATL_CALL_THROW_IF_ERROR(atl_comm->recv(
-                ep_idx, recv_pipe_chunks[chunk_index], recv_size, src, recvtag, recv_req));
-        });
+    recv_e = ccl_host_task(q, deps, [=]() {
+        atl_req_t& recv_req = comm->get_pipeline_recv_req();
+        ATL_CALL_THROW_IF_ERROR(atl_comm->recv(
+            ep_idx, recv_pipe_chunks[chunk_index], recv_size, src, recvtag, recv_req));
     });
     // post send after copy is done
-    send_e = q.submit([=](sycl::handler& h) {
-        h.depends_on(send_copy_e);
-        h.host_task([=]() {
-            atl_req_t& send_req = comm->get_pipeline_send_req();
-            ATL_CALL_THROW_IF_ERROR(atl_comm->send(
-                ep_idx, send_pipe_chunks[chunk_index], send_size, dest, sendtag, send_req));
-        });
+    send_e = ccl_host_task(q, { send_copy_e }, [=]() {
+        atl_req_t& send_req = comm->get_pipeline_send_req();
+        ATL_CALL_THROW_IF_ERROR(atl_comm->send(
+            ep_idx, send_pipe_chunks[chunk_index], send_size, dest, sendtag, send_req));
     });
     // start copy next chunk for send
     if (nchunks > 1) {
-        int next_send_size =
-            (1 == nchunks - 1 ? total_send_size - send_chunk_size : send_chunk_size);
+        size_t next_send_size = chunk_bytes(total_send_size, send_chunk_size, 1);
         send_copy_e = q_scopy.submit([=](sycl::handler& h) {
             h.depends_on(send_copy_e);
             h.memcpy(send_pipe_chunks[next_chunk_index],
@@ -459,50 +416,42 @@ sycl::event pipe_sendrecv_plain(sycl::queue& q,
                      next_send_size);
         });
     }
-    recv_done_e = q.submit([=](sycl::handler& h) {
-        h.depends_on({ send_copy_e, recv_e, send_e });
-        h.host_task([=]() {
-            atl_req_t& send_req = comm->get_pipeline_send_req();
-            atl_req_t& recv_req = comm->get_pipeline_recv_req();
-            ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
-            //if (!send_req.is_completed) {
-            //    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
-            //}
-            ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
-            //if (!recv_req.is_completed) {
-            //    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
-            //}
-        });
+    recv_done_e = ccl_host_task(q, { send_copy_e, recv_e, send_e }, [=]() {
+        atl_req_t& send_req = comm->get_pipeline_send_req();
+        atl_req_t& recv_req = comm->get_pipeline_recv_req();
+        ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
+        //if (!send_req.is_completed) {
+        //    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
+        //}
+        ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
+        //if (!recv_req.is_completed) {
+        //    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
+        //}
     });
 
     for (idx = 1; idx < nchunks - 1; idx++) {
-        send_size = send_chunk_size;
-        int next_send_size = (idx + 1 == nchunks - 1 ? total_send_size - send_chunk_size * (idx + 1)
-                                                     : send_chunk_size);
-        recv_size = recv_chunk_size;
-        int next_recv_size = (idx + 1 == nchunks - 1 ? total_recv_size - recv_chunk_size * (idx + 1)
-                                                     : recv_chunk_size);
+        send_size = chunk_bytes(total_send_size, send_chunk_size, idx);
+        size_t next_send_size = chunk_bytes(total_send_size, send_chunk_size, idx + 1);
+        recv_size = chunk_bytes(total_recv_size, recv_chunk_size, idx);
+        size_t prev_recv_size = chunk_bytes(total_recv_size, recv_chunk_size, idx - 1);
         chunk_index = idx % num_chunk_buffs;
         next_chunk_index = (chunk_index + 1) % num_chunk_buffs;
         prev_chunk_index = (chunk_index + num_chunk_buffs - 1) % num_chunk_buffs;
         // post send and recv
-        recv_e = q.submit([=](sycl::handler& h) {
-            h.depends_on(recv_done_e);
-            h.host_task([=]() {
-                atl_req_t& send_req = comm->get_pipeline_send_req();
-                atl_req_t& recv_req = comm->get_pipeline_recv_req();
-                ATL_CALL_THROW_IF_ERROR(atl_comm->recv(
-                    ep_idx, recv_pipe_chunks[chunk_index], recv_size, src, recvtag, recv_req));
-                ATL_CALL_THROW_IF_ERROR(atl_comm->send(
-                    ep_idx, send_pipe_chunks[chunk_index], send_size, dest, sendtag, send_req));
-            });
+        recv_e = ccl_host_task(q, { recv_done_e }, [=]() {
+            atl_req_t& send_req = comm->get_pipeline_send_req();
+            atl_req_t& recv_req = comm->get_pipeline_recv_req();
+            ATL_CALL_THROW_IF_ERROR(atl_comm->recv(
+                ep_idx, recv_pipe_chunks[chunk_index], recv_size, src, recvtag, recv_req));
+            ATL_CALL_THROW_IF_ERROR(atl_comm->send(
+                ep_idx, send_pipe_chunks[chunk_index], send_size, dest, sendtag, send_req));
         });
         // copy for receive for prev chunk
         recv_copy_e = q_rcopy.submit([=](sycl::handler& h) {
             h.depends_on(recv_done_e);
             h.memcpy((char*)recv_buf + (idx - 1) * recv_chunk_size,
                      recv_pipe_chunks[prev_chunk_index],
-                     recv_chunk_size);
+                     prev_recv_size);
         });
         // copy for send for next chunk
         send_copy_e = q_scopy.submit([=](sycl::handler& h) {
@@ -512,43 +461,37 @@ sycl::event pipe_sendrecv_plain(sycl::queue& q,
                      next_send_size);
         });
         // wait for send/recv completion
-        recv_done_e = q.submit([=](sycl::handler& h) {
-            h.depends_on({ recv_e, recv_copy_e, send_copy_e });
-            h.host_task([=]() {
-                atl_req_t& send_req = comm->get_pipeline_send_req();
-                atl_req_t& recv_req = comm->get_pipeline_recv_req();
-                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
-                if (!recv_req.is_completed) {
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
-                }
-                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
-                if (!send_req.is_completed) {
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
-                }
-            });
+        recv_done_e = ccl_host_task(q, { recv_e, recv_copy_e, send_copy_e }, [=]() {
+            atl_req_t& send_req = comm->get_pipeline_send_req();
+            atl_req_t& recv_req = comm->get_pipeline_recv_req();
+            ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
+            if (!recv_req.is_completed) {
+                ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
+            }
+            ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
+            if (!send_req.is_completed) {
+                ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
+            }
         });
     }
 
     //  send last chunk
     if (nchunks > 1) {
-        send_size = total_send_size - send_chunk_size * (nchunks - 1);
-        recv_size = total_recv_size - recv_chunk_size * (nchunks - 1);
+        send_size = chunk_bytes(total_send_size, send_chunk_size, nchunks - 1);
+        recv_size = chunk_bytes(total_recv_size, recv_chunk_size, nchunks - 1);
         chunk_index = idx % num_chunk_buffs;
         // post send and recv
-        recv_e = q.submit([=](sycl::handler& h) {
-            h.depends_on(recv_done_e);
-            h.host_task([=]() {
-                atl_req_t& send_req = comm->get_pipeline_send_req();
-                atl_req_t& recv_req = comm->get_pipeline_recv_req();
-                ATL_CALL_THROW_IF_ERROR(atl_comm->recv(
-                    ep_idx, recv_pipe_chunks[chunk_index], recv_size, src, recvtag, recv_req));
-                ATL_CALL_THROW_IF_ERROR(atl_comm->send(
-                    ep_idx, send_pipe_chunks[chunk_index], send_size, dest, sendtag, send_req));
-            });
+        recv_e = ccl_host_task(q, { recv_done_e }, [=]() {
+            atl_req_t& send_req = comm->get_pipeline_send_req();
+            atl_req_t& recv_req = comm->get_pipeline_recv_req();
+            ATL_CALL_THROW_IF_ERROR(atl_comm->recv(
+                ep_idx, recv_pipe_chunks[chunk_index], recv_size, src, recvtag, recv_req));
+            ATL_CALL_THROW_IF_ERROR(atl_comm->send(
+                ep_idx, send_pipe_chunks[chunk_index], send_size, dest, sendtag, send_req));
         });
     }
     // copy for recv for previous chunk
-    int prev_recv_size = total_recv_size > recv_chunk_size ? recv_chunk_size : total_recv_size;
+    size_t prev_recv_size = chunk_bytes(total_recv_size, recv_chunk_size, idx - 1);
     prev_chunk_index = (idx - 1) % num_chunk_buffs;
     recv_copy_e = q_rcopy.submit([=](sycl::handler& h) {
         h.depends_on(recv_done_e);
@@ -557,20 +500,17 @@ sycl::event pipe_sendrecv_plain(sycl::queue& q,
                  prev_recv_size);
     });
     if (nchunks > 1) {
-        recv_done_e = q.submit([=](sycl::handler& h) {
-            h.depends_on({ recv_e, recv_copy_e });
-            h.host_task([=]() {
-                atl_req_t& send_req = comm->get_pipeline_send_req();
-                atl_req_t& recv_req = comm->get_pipeline_recv_req();
-                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
-                if (!send_req.is_completed) {
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
-                }
-                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
-                if (!recv_req.is_completed) {
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
-                }
-            });
+        recv_done_e = ccl_host_task(q, { recv_e, recv_copy_e }, [=]() {
+            atl_req_t& send_req = comm->get_pipeline_send_req();
+            atl_req_t& recv_req = comm->get_pipeline_recv_req();
+            ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
+            if (!send_req.is_completed) {
+                ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
+            }
+            ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
+            if (!recv_req.is_completed) {
+                ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
+            }
         });
         // copy for recv for current chunk
         recv_copy_e = q_rcopy.submit([=](sycl::handler& h) {
@@ -687,23 +627,20 @@ sycl::event sendrecv_rdma(sycl::queue q,
     size_t recv_size = recv_count * ccl_dtype.size();
 
     int ep_idx = 0;
-    e = q.submit([=](sycl::handler& h) {
-        h.depends_on(deps);
-        h.host_task([=]() {
-            atl_req_t send_req, recv_req;
-            ATL_CALL_THROW_IF_ERROR(
-                atl_comm->send(ep_idx, send_buf, send_size, dest, sendtag, send_req));
-            ATL_CALL_THROW_IF_ERROR(
-                atl_comm->recv(ep_idx, recv_buf, recv_size, src, recvtag, recv_req));
-            ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
-            if (!send_req.is_completed) {
-                ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
-            }
-            ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
-            if (!recv_req.is_completed) {
-                ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
-            }
-        });
+    e = ccl_host_task(q, deps, [=]() {
+        atl_req_t send_req, recv_req;
+        ATL_CALL_THROW_IF_ERROR(
+            atl_comm->send(ep_idx, send_buf, send_size, dest, sendtag, send_req));
+        ATL_CALL_THROW_IF_ERROR(
+            atl_comm->recv(ep_idx, recv_buf, recv_size, src, recvtag, recv_req));
+        ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
+        if (!send_req.is_completed) {
+            ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
+        }
+        ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
+        if (!recv_req.is_completed) {
+            ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
+        }
     });
     return e;
 }
@@ -750,16 +687,14 @@ sycl::event gpu_send_plain(sycl::queue& q,
             group_impl::add_group_send_request(send_req_ptr, q, sendtag);
         }
         else {
-            e = q.submit([=](sycl::handler& h) {
-                h.host_task([=]() {
-                    atl_req_t send_req;
-                    ATL_CALL_THROW_IF_ERROR(
-                        atl_comm->send(ep_idx, send_buf, send_size, dest, sendtag, send_req));
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
-                    if (!send_req.is_completed) {
-                        ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
-                    }
-                });
+            e = ccl_host_task(q, {}, [=]() {
+                atl_req_t send_req;
+                ATL_CALL_THROW_IF_ERROR(
+                    atl_comm->send(ep_idx, send_buf, send_size, dest, sendtag, send_req));
+                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
+                if (!send_req.is_completed) {
+                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
+                }
             });
         }
         return e;
@@ -816,17 +751,14 @@ sycl::event gpu_send_plain(sycl::queue& q,
         });
 
         int ep_idx = 0;
-        e = q.submit([=](sycl::handler& h) {
-            h.depends_on(e);
-            h.host_task([=]() {
-                atl_req_t send_req;
-                ATL_CALL_THROW_IF_ERROR(
-                    atl_comm->send(ep_idx, host_buf, send_size, dest, sendtag, send_req));
-                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
-                if (!send_req.is_completed) {
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
-                }
-            });
+        e = ccl_host_task(q, { e }, [=]() {
+            atl_req_t send_req;
+            ATL_CALL_THROW_IF_ERROR(
+                atl_comm->send(ep_idx, host_buf, send_size, dest, sendtag, send_req));
+            ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, send_req));
+            if (!send_req.is_completed) {
+                ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, send_req));
+            }
         });
         comm->put_scaleout_host_buf(host_buf);
     }
@@ -875,16 +807,14 @@ sycl::event gpu_recv_plain(sycl::queue& q,
             group_impl::add_group_recv_request(recv_req_ptr, q, recvtag);
         }
         else {
-            e = q.submit([=](sycl::handler& h) {
-                h.host_task([=]() {
-                    atl_req_t recv_req;
-                    ATL_CALL_THROW_IF_ERROR(
-                        atl_comm->recv(ep_idx, recv_buf, recv_size, src, recvtag, recv_req));
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
-                    if (!recv_req.is_completed) {
-                        ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
-                    }
-                });
+            e = ccl_host_task(q, {}, [=]() {
+                atl_req_t recv_req;
+                ATL_CALL_THROW_IF_ERROR(
+                    atl_comm->recv(ep_idx, recv_buf, recv_size, src, recvtag, recv_req));
+                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
+                if (!recv_req.is_completed) {
+                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
+                }
             });
         }
         return e;
@@ -933,17 +863,14 @@ sycl::event gpu_recv_plain(sycl::queue& q,
 
         void* host_buf = comm->get_scaleout_host_buf();
         int ep_idx = 0;
-        e = q.submit([=](sycl::handler& h) {
-            h.depends_on(deps);
-            h.host_task([=]() {
-                atl_req_t recv_req;
-                ATL_CALL_THROW_IF_ERROR(
-                    atl_comm->recv(ep_idx, host_buf, recv_size, src, recvtag, recv_req));
-                ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
-                if (!recv_req.is_completed) {
-                    ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
-                }
-            });
+        e = ccl_host_task(q, deps, [=]() {
+            atl_req_t recv_req;
+            ATL_CALL_THROW_IF_ERROR(
+                atl_comm->recv(ep_idx, host_buf, recv_size, src, recvtag, recv_req));
+            ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, recv_req));
+            if (!recv_req.is_completed) {
+                ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, recv_req));
+            }
         });
 
         e = q.submit([=](sycl::handler& h) {

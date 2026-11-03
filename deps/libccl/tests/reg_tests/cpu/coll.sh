@@ -53,6 +53,12 @@ do
                         fi
 
                         cmd="CCL_WORKER_COUNT=${worker_count}"
+                        if [[ ${test} = "external_kvs" ]]
+                        then
+                            # the test wraps ccl::kvs into its own kvs_interface and
+                            # uses it as a key-value store, which requires pmi mode
+                            cmd+=" CCL_KVS_MODE=pmi"
+                        fi
                         cmd+=" CCL_ATL_TRANSPORT=${transport}"
                         cmd+=" FI_PROVIDER=${ofi_prov}"
                         cmd+=" mpiexec -l -n ${proc_count} -ppn 2"

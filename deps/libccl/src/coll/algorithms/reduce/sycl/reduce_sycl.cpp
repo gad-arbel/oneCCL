@@ -16,6 +16,7 @@
 
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
 #include "coll/algorithms/utils/sycl_selection.hpp"
+#include "coll/algorithms/utils/sycl_policy_resolver_scaleout.hpp"
 #include "coll/algorithms/utils/sycl_policy_resolver_scaleup.hpp"
 #include "coll/algorithms/utils/barrier_data.hpp"  // use_recording_path
 
@@ -31,14 +32,7 @@ namespace ccl {
 namespace v1 {
 
 static bool do_fallback_to_scheduler(size_t size) {
-#ifdef CCL_ENABLE_ESIMD
-    const bool is_esimd_enabled = ccl::global_data::env().sycl_esimd;
-#else
-    const bool is_esimd_enabled = false;
-#endif // CCL_ENABLE_ESIMD
-    bool is_above_threshold = size > ccl::global_data::env().sycl_reduce_scaleout_threshold;
-    bool exception_cases = is_esimd_enabled;
-    return is_above_threshold || exception_cases;
+    return size > ccl::global_data::env().sycl_reduce_scaleout_threshold;
 }
 
 namespace {
@@ -170,9 +164,10 @@ ccl::event reduce_sycl_single_node(sycl::queue& q,
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     const auto tune = ccl::sycl_policy_resolver::scaleup_resolver{
         ccl::sycl_policy::policy_query(
-            ccl_coll_reduce, count * ccl_dtype.size(), ccl_dtype,
+            ccl_coll_reduce, count, ccl_dtype,
             /*r2r_size=*/0, global_comm->size(), use_recording_path(q))
             .with_comm(global_comm)
+            .with_p2p_comm(global_comm->get_node_comm().get())
             .with_stream(global_stream)
     }.reduce();
 
@@ -217,7 +212,7 @@ ccl::event reduce_sycl_multi_node(sycl::queue& q,
                   count * ccl_dtype.size(),
                   " is above scaleout SYCL threshold = ",
                   ccl::global_data::env().sycl_reduce_scaleout_threshold,
-                  " or sycl::esimd mode is enabled -- falling back");
+                  " -- falling back");
         done = false;
         return ev;
     }
@@ -233,6 +228,13 @@ ccl::event reduce_sycl_multi_node(sycl::queue& q,
         done = false;
         return ev;
     }
+
+    // Only `direct` exists;
+    ccl::sycl_policy_resolver::scaleout_resolver{
+        ccl::sycl_policy::policy_query(ccl_coll_reduce, count, ccl_dtype,
+            r2r_comm->size(), global_comm->size(), use_recording_path(q))
+            .with_p2p_level(r2r_comm->get_p2p_level())
+    }.reduce();
 
     std::vector<sycl::event> dep_events = get_sycl_events(deps);
     std::vector<event> evs;
@@ -366,7 +368,7 @@ ccl::event reduce_sycl_multi_node(sycl::queue& q,
                                    false); // is_cpu_buffers
 
         if (!done) {
-            LOG_INFO("reduce_sycl_multi_node: Phase 1 (scale-out) was not done -- falling back");
+            LOG_DEBUG("reduce_sycl_multi_node: Phase 1 (scale-out) was not done -- falling back");
             if (preop_dev_buf) {
                 global_comm->put_scaleout_device_buf(preop_dev_buf);
             }
@@ -406,7 +408,8 @@ ccl::event reduce_sycl_multi_node(sycl::queue& q,
                                           done);
 
             if (!done) {
-                LOG_INFO("reduce_sycl_multi_node: Phase 2 (scale-up) was not done -- falling back");
+                LOG_DEBUG(
+                    "reduce_sycl_multi_node: Phase 2 (scale-up) was not done -- falling back");
                 if (preop_dev_buf) {
                     global_comm->put_scaleout_device_buf(preop_dev_buf);
                 }

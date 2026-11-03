@@ -57,6 +57,9 @@ class CommunicatorLegacy {
     std::optional<ccl::device> device;
     std::optional<ccl::context> context;
     ccl::communicator comm;
+    // kvs_for entry this comm was created from, released in release_kvs()
+    ccl::shared_ptr_class<ccl::kvs> kvs;
+    std::optional<ccl::kvs::address_type> kvs_address;
 
     // Constructor using initializer list
     CommunicatorLegacy(int rank, int size, ccl::shared_ptr_class<ccl::kvs> kvs,
@@ -72,7 +75,7 @@ class CommunicatorLegacy {
     // Constructor using initializer list
     CommunicatorLegacy(int rank, int size, ccl::shared_ptr_class<ccl::kvs> kvs)
         : rank(rank), size(size),
-          comm(std::move(ccl::create_communicator(size, rank, kvs))) {}
+          comm(ccl::create_communicator(size, rank, kvs)) {}
 
     // Construction using external ccl::communicator, for example as a result of
     // a split
@@ -86,9 +89,30 @@ onecclResult_t oneccl_finalize_communicator_impl(onecclComm_t comm) {
     return onecclSuccess;
 }
 
+// Drop the kvs_for entry of a unique id once no comm holds it. Otherwise every
+// unique id keeps its kvs server thread and sockets until process exit.
+void release_kvs(const ccl::kvs::address_type &address) {
+    ccl::shared_ptr_class<ccl::kvs> last_ref;
+    {
+        std::lock_guard<std::mutex> lock(kvs_for_mutex);
+        auto it = kvs_for.find(address);
+        if (it != kvs_for.end() && it->second.use_count() == 1) {
+            last_ref = std::move(it->second);
+            kvs_for.erase(it);
+        }
+    }
+    // last_ref is destroyed here, outside the lock: the kvs destructor joins
+    // its server thread
+}
+
 onecclResult_t oneccl_destroy_communicator_impl(onecclComm_t comm) {
     auto *comm_legacy = static_cast<CommunicatorLegacy *>(comm->pExt);
+    const std::optional<ccl::kvs::address_type> kvs_address =
+        comm_legacy->kvs_address;
     delete comm_legacy;
+    if (kvs_address) {
+        release_kvs(*kvs_address);
+    }
     return onecclSuccess;
 }
 
@@ -294,7 +318,8 @@ onecclResult_t oneccl_allgather_impl(const void *sendbuff, void *recvbuff,
         sendbuff, comm, stream,
         [=](CommunicatorLegacy *comm_legacy, sycl::queue *sycl_ext) {
             auto attrs = ccl::create_operation_attr<ccl::allgatherv_attr>();
-            size_t const comm_size = comm_legacy->comm.size();
+            size_t const comm_size =
+                static_cast<size_t>(comm_legacy->comm.size());
             std::vector<size_t> const recvcounts(comm_size, sendcount);
 
             ccl::allgatherv(sendbuff, sendcount, recvbuff, recvcounts,
@@ -302,7 +327,8 @@ onecclResult_t oneccl_allgather_impl(const void *sendbuff, void *recvbuff,
                             get_stream(sycl_ext), attrs, get_deps(sycl_ext));
         },
         [=](CommunicatorLegacy *comm_legacy) {
-            size_t const comm_size = comm_legacy->comm.size();
+            size_t const comm_size =
+                static_cast<size_t>(comm_legacy->comm.size());
             std::vector<size_t> const recvcounts(comm_size, sendcount);
 
             return ccl::allgatherv(sendbuff, sendcount, recvbuff, recvcounts,
@@ -337,7 +363,8 @@ onecclResult_t oneccl_alltoallv_impl(const void *sendbuff,
         sendbuff, comm, stream,
         [=](CommunicatorLegacy *comm_legacy, sycl::queue *sycl_ext) {
             auto attrs = ccl::create_operation_attr<ccl::alltoallv_attr>();
-            size_t const comm_size = comm_legacy->comm.size();
+            size_t const comm_size =
+                static_cast<size_t>(comm_legacy->comm.size());
 
             std::vector<size_t> const sendcounts(send_counts,
                                                  send_counts + comm_size);
@@ -349,7 +376,8 @@ onecclResult_t oneccl_alltoallv_impl(const void *sendbuff,
                            get_stream(sycl_ext), attrs, get_deps(sycl_ext));
         },
         [=](CommunicatorLegacy *comm_legacy) {
-            size_t const comm_size = comm_legacy->comm.size();
+            size_t const comm_size =
+                static_cast<size_t>(comm_legacy->comm.size());
             std::vector<size_t> const sendcounts(send_counts,
                                                  send_counts + comm_size);
             std::vector<size_t> const recvcounts(recv_counts,
@@ -599,8 +627,6 @@ onecclResult_t oneccl_get_device_impl(onecclComm_t comm, int *index) {
 }
 
 onecclResult_t oneccl_platform_score_impl(int *score) {
-    int const new_score = 0;
-
     auto platforms = sycl::platform::get_platforms();
     sycl::platform l0_platform;
     bool l0_found = false;
@@ -864,13 +890,15 @@ onecclResult_t oneccl_init_communicator_impl(onecclComm_t *comm, size_t nranks,
         auto multi_threaded = config->multiThreaded == 1;
         comm_legacy = new CommunicatorLegacy(
             rank, static_cast<int>(nranks), kvs, device_index,
-            std::move(ccl::create_device(*selected_device)),
-            std::move(ccl::create_context(*selected_context)), multi_threaded);
+            ccl::create_device(*selected_device),
+            ccl::create_context(*selected_context), multi_threaded);
     } else {
         // CPU only path
         comm_legacy =
             new CommunicatorLegacy(rank, static_cast<int>(nranks), kvs);
     }
+    comm_legacy->kvs = kvs;
+    comm_legacy->kvs_address = legacy_id->address;
 
     (*comm)->pExt = comm_legacy;
     (*comm)->finalize = oneccl_finalize_communicator_impl;

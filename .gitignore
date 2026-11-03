@@ -27,6 +27,7 @@ examples/main_output.txt
 .vs
 .vscode
 include/oneapi/ccl/config.h
+/compile_commands.json
 *.bc
 tools/ze_info/ze_info
 tools/ze_health/ze_health
@@ -71,6 +72,8 @@ deps/libccl/tests/reg_tests/sycl/pt2pt/pt2pt_group
 deps/libccl/tests/reg_tests/sycl/pt2pt/pt2pt_self
 AGENTS.md
 CLAUDE.md
+.claude/settings.local.json
 .claude/skills/
 .github/skills/
 .agents/skills/
+.clang-check-*

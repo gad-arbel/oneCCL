@@ -24,7 +24,7 @@
 
 // Allgather for large payload using copy engine
 // even this function is in allgatherv path, it implements only allgather, 
-// recv_counts and offsets are not used, but kept for compatibility with other allgatherv implementations
+// recv_counts is not used, but kept for compatibility with other allgatherv implementations
 ccl::event allgather_large_copy_engine(sycl::queue& q,
                                        const void* send_buf,
                                        size_t send_count,
@@ -59,8 +59,11 @@ ccl::event allgather_large_copy_engine(sycl::queue& q,
     // send address is the input buffer
     const void* send_addr = send_buf;
 
+    // offsets place this rank's block when the caller runs a chunk of a larger buffer
+    const size_t my_offset = offsets.empty() ? my_node_rank * data_size : offsets[my_node_rank];
+
     // copy self data to dest at offset
-    void* self_dest_addr = (uint8_t*)recv_buf + my_node_rank * data_size;
+    void* self_dest_addr = (uint8_t*)recv_buf + my_offset;
     LOG_TRACE("copy self data ", data_size, " bytes from {", send_addr, "} to {", self_dest_addr, "}");
     CCL_THROW_IF_NOT(cmd_list->mem_copy(self_dest_addr, send_addr, data_size) == ZE_RESULT_SUCCESS,
                      "failed to copy self data on rank ", my_node_rank);
@@ -76,7 +79,7 @@ ccl::event allgather_large_copy_engine(sycl::queue& q,
         int to_rank = (my_node_rank + step + 1) % comm_size;
 
         // copy destination to_rank recv address + my_rank offset
-        void* dest_addr = (uint8_t*)sycl_ptrs.node_ptrs_wr[to_rank] + my_node_rank * data_size;
+        void* dest_addr = (uint8_t*)sycl_ptrs.node_ptrs_wr[to_rank] + my_offset;
         LOG_DEBUG("Rank(", my_node_rank, 
                  ") copy ", data_size, 
                  " bytes from {", send_addr, 

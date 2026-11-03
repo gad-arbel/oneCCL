@@ -39,7 +39,7 @@ ccl::event scatter_large(const void* send_buf,
         LOG_DEBUG("invoking scatter_large");
     }
 
-    sycl_ptrs_type sycl_ptrs;
+    sycl_ptrs_type sycl_ptrs{};
     const std::shared_ptr<ccl_comm>& local_comm = p2p_comm;
     std::shared_ptr<ccl_comm> registration_comm = comm->get_node_comm();
     const int local_size = local_comm->size();
@@ -49,6 +49,7 @@ ccl::event scatter_large(const void* send_buf,
 
     bool is_tmp_used = force_tmp_buf || coll_attr.force_use_tmp ||
                        ccl::global_data::env().sycl_scatter_large_tmp_buf;
+    const bool is_write = !ccl::global_data::env().sycl_scatter_read;
 
     if (!is_tmp_used) {
         // Registered-pointer fast path: when the user has called
@@ -58,22 +59,35 @@ ccl::event scatter_large(const void* send_buf,
         // ze_handle_exchange round trip per call). Same shape as
         // allgatherv_large_sycl.cpp:79-94 and allreduce_large_sycl.cpp.
         //
-        // Scatter-specific note: this path requires every local-domain rank (including
-        // non-root) to have a real send_buf of size count*local_size*dsize
-        // and to have registered it. Registration is collective, so if any
-        // rank registered, all did and all pass real send_buf. If non-root
-        // passes send_buf == nullptr the registration check returns empty
-        // and we fall to the slow path consistently across ranks.
-        std::vector<void*> registered_send_ptrs;
-        if (send_buf != nullptr) {
-            registered_send_ptrs = registration_comm->get_registered_ptrs(
+        // Scatter-specific note: which buffer has to be reachable across ranks
+        // depends on the selected direction. Read sources every rank's slice
+        // from root's send_buf, so it needs node_ptrs_rd and requires every
+        // local-domain rank (including non-root) to pass and register a real
+        // send_buf of size count*local_size*dsize. Write has root store into
+        // each peer's recv_buf, so it needs node_ptrs_wr and only recv_buf has
+        // to be registered. Registration is collective, so if any rank
+        // registered, all did. If read's send_buf is nullptr on a non-root rank
+        // the registration check returns empty and we fall to the slow path
+        // consistently across ranks.
+        std::vector<void*> registered_ptrs;
+        if (is_write) {
+            registered_ptrs = registration_comm->get_registered_ptrs(recv_buf, count * dsize);
+        }
+        else if (send_buf != nullptr) {
+            registered_ptrs = registration_comm->get_registered_ptrs(
                 send_buf, count * static_cast<size_t>(local_size) * dsize);
         }
 
-        if (registered_send_ptrs.size() != 0) {
-            LOG_DEBUG("scatter_large: send_buf is registered, skipping do_ipc_exchange");
-            sycl_ptrs.node_ptrs_rd = get_ipc_ptrs<void, MAX_NODE_RANKS>(
-                registered_send_ptrs, comm, local_comm, (void*)send_buf);
+        if (registered_ptrs.size() != 0) {
+            LOG_DEBUG("scatter_large: buffer is registered, skipping do_ipc_exchange");
+            if (is_write) {
+                sycl_ptrs.node_ptrs_wr =
+                    get_ipc_ptrs<void, MAX_NODE_RANKS>(registered_ptrs, comm, local_comm, recv_buf);
+            }
+            else {
+                sycl_ptrs.node_ptrs_rd = get_ipc_ptrs<void, MAX_NODE_RANKS>(
+                    registered_ptrs, comm, local_comm, (void*)send_buf);
+            }
         }
         else {
             // For non-root ranks, send_buf may be nullptr (per spec, only root uses
@@ -101,8 +115,18 @@ ccl::event scatter_large(const void* send_buf,
         // reduce_scatter_large_sycl. Full per-rank slice in scatter is
         // count*dsize bytes; the memcpy starts at rank * count * dsize, so
         // the offset must also align. all_aligned() folds both checks.
+        //
+        // Gate on the array the selected direction actually dereferences:
+        // read uses node_ptrs_rd, write uses node_ptrs_wr. Both arrays hold the
+        // same peer addresses on every rank, so all_aligned() returns the same
+        // answer everywhere and is_tmp_used stays rank-independent. Testing the
+        // local send_buf instead would not have that property, since only root
+        // supplies one, and ranks disagreeing here would run different
+        // protocols and hang.
         const size_t align = 4;
-        if (!all_aligned(sycl_ptrs.node_ptrs_rd.data(), local_size, count, dsize, align)) {
+        void** checked_ptrs =
+            is_write ? sycl_ptrs.node_ptrs_wr.data() : sycl_ptrs.node_ptrs_rd.data();
+        if (!all_aligned(checked_ptrs, local_size, count, dsize, align)) {
             LOG_DEBUG("scatter_large: IPC pointers not 4-byte aligned, falling back to tmp-buf");
             is_tmp_used = true;
             sycl_ptrs.node_ptrs_rd = get_remote_large_tmp_buf(0, local_comm.get());

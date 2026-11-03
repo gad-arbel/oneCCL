@@ -65,4 +65,20 @@ struct ccl_proxy_staging {
                             size_t pipeline_chunk_size,
                             ccl_comm* comm,
                             int tag_base);
+
+    static void do_send(ccl_proxy_staging* staging,
+                        const void* send_dev_ptr,
+                        size_t send_bytes,
+                        int send_to,
+                        size_t pipeline_chunk_size,
+                        ccl_comm* comm,
+                        int tag_base);
+
+    static void do_recv(ccl_proxy_staging* staging,
+                        void* recv_dev_ptr,
+                        size_t recv_bytes,
+                        int recv_from,
+                        size_t pipeline_chunk_size,
+                        ccl_comm* comm,
+                        int tag_base);
 };

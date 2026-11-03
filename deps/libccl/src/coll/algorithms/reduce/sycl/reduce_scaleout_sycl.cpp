@@ -15,6 +15,7 @@
 */
 
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
+#include "coll/algorithms/utils/host_task.hpp"
 
 #if defined(CCL_ENABLE_ZE) || defined(CCL_ENABLE_SYCL)
 #include "coll/algorithms/reduce/sycl/reduce_sycl.hpp"
@@ -76,30 +77,27 @@ ccl::event reduce_scaleout_sycl_direct(sycl::queue& q,
         }
     }
 
-    op_end = q.submit([=](sycl::handler& h) {
-        h.depends_on(dep_events);
-        h.host_task([=]() {
-            // call ccl::wrapper for MPI/OFI.
-            // use endpoint 0; multi-endpoint selection (atl_ep->idx / sched->bin->get_atl_ep())
-            // is not wired through this path yet
-            int ep_idx = 0;
-            atl_req_t req;
-            std::shared_ptr<atl_base_comm> atl_comm = comm->get_atl_comm();
-            ATL_CALL_THROW_IF_ERROR(
-                atl_comm->reduce(ep_idx,
-                                scaleout_send_buf,
-                                scaleout_recv_buf,
-                                count,
-                                root,
-                                ccl_dtype.atl_datatype(),
-                                static_cast<atl_reduction_t>(reduction),
-                                req));
+    op_end = ccl_host_task(q, dep_events, [=]() {
+        // call ccl::wrapper for MPI/OFI.
+        // use endpoint 0; multi-endpoint selection (atl_ep->idx / sched->bin->get_atl_ep())
+        // is not wired through this path yet
+        int ep_idx = 0;
+        atl_req_t req;
+        std::shared_ptr<atl_base_comm> atl_comm = comm->get_atl_comm();
+        ATL_CALL_THROW_IF_ERROR(
+            atl_comm->reduce(ep_idx,
+                            scaleout_send_buf,
+                            scaleout_recv_buf,
+                            count,
+                            root,
+                            ccl_dtype.atl_datatype(),
+                            static_cast<atl_reduction_t>(reduction),
+                            req));
 
-            ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, req));
-            if (!req.is_completed) {
-                ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, req));
-            }
-        });
+        ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, req));
+        if (!req.is_completed) {
+            ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, req));
+        }
     });
 
     if (copy_to_host && comm->rank() == root) {

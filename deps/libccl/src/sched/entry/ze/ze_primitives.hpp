@@ -40,6 +40,7 @@ enum class device_id : uint32_t {
     id6 = 0xe210, /* ARC B-series DT6 */
     id7 = 0xe220, /* ARC B-series DT1, DT2, DT3 */
     id8 = 0x6740, /* CRI */
+    id9 = 0x6750, /* CRI SKU4B (0x6751) */
 };
 
 enum class copy_engine_mode { none, main, link, auto_mode };
@@ -128,17 +129,17 @@ constexpr ze_device_properties_t default_device_props = { .stype =
 
 constexpr ze_device_compute_properties_t default_device_compute_properties = { .stype =
                                                                                   ZE_STRUCTURE_TYPE_DEVICE_COMPUTE_PROPERTIES,
-                                                                              .pNext = nullptr,
-                                                                              .maxTotalGroupSize = 0,
-                                                                              .maxGroupSizeX = 0,
-                                                                              .maxGroupSizeY = 0,
-                                                                              .maxGroupSizeZ = 0,
-                                                                              .maxGroupCountX = 0,
-                                                                              .maxGroupCountY = 0,
-                                                                              .maxGroupCountZ = 0,
-                                                                              .maxSharedLocalMemory = 0,
-                                                                              .numSubGroupSizes = 0,
-                                                                              .subGroupSizes = {} };
+                                                                               .pNext = nullptr,
+                                                                               .maxTotalGroupSize = 0,
+                                                                               .maxGroupSizeX = 0,
+                                                                               .maxGroupSizeY = 0,
+                                                                               .maxGroupSizeZ = 0,
+                                                                               .maxGroupCountX = 0,
+                                                                               .maxGroupCountY = 0,
+                                                                               .maxGroupCountZ = 0,
+                                                                               .maxSharedLocalMemory = 0,
+                                                                               .numSubGroupSizes = 0,
+                                                                               .subGroupSizes = {} };
 
 constexpr ze_event_pool_desc_t default_event_pool_desc = { .stype =
                                                                ZE_STRUCTURE_TYPE_EVENT_POOL_DESC,
@@ -294,6 +295,7 @@ std::string flags_to_string(uint32_t flags) {
 }
 
 bool is_arc_card(device_family family);
+bool is_cri_card(device_family family);
 bool should_disable_rdma(const ze_device_handle_t& device);
 
 // ==== proxy service staging copy engines context ====
@@ -335,13 +337,22 @@ void ze_submit_copy(ze_command_list_handle_t cmdlist,
                     ze_event_handle_t signal_ev);
 void ze_wait_and_reset(ze_event_handle_t ev);
 
-// GDR (GPU Direct RDMA) mmap utilities for device memory access from host
+/* GDR (GPU Direct RDMA) mmap utilities for device memory access from host.
+ *
+ * Returns the host alias of `device_ptr` itself, which is generally NOT the base of
+ * the mapping: SYCL USM pools device allocations, so `device_ptr` is routinely
+ * a suballocation at a nonzero offset inside a larger L0 allocation, and an IPC
+ * handle always refers to that whole allocation.
+ *
+ * `out_map_base` and `out_map_size` receive what munmap needs - hand them straight to
+ * ze_ipc_munmap_device_allocation();
+ */
 void* ze_ipc_mmap_device_allocation(ze_context_handle_t ctx,
                                     void* device_ptr,
-                                    size_t size_bytes);
-
-void ze_ipc_munmap_device_allocation(void* host_ptr,
-                                     size_t size_bytes);
+                                    size_t size_bytes,
+                                    void** out_map_base,
+                                    size_t* out_map_size);
+void ze_ipc_munmap_device_allocation(void* map_base, size_t map_size);
 
 } // namespace ze
 } // namespace ccl

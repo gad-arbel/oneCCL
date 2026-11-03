@@ -161,7 +161,6 @@ sycl::event arc_ll256_alltoall(const void *src,
 
     for (int i_s = 0; i_s < submit_loop; i_s++) {
         sycl_e = q.submit([&](auto &h) {
-            //using namespace sycl::ext::intel::experimental::esimd;
 
             int local_world_rank = comm_rank;
             int local_world_size = comm_size;

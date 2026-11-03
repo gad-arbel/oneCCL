@@ -134,6 +134,8 @@ typedef struct ze_lib_ops {
     decltype(zeCommandListHostSynchronize) *zeCommandListHostSynchronize;
     decltype(zeEventCounterBasedCreate) *zeEventCounterBasedCreate;
     decltype(zeEventCounterBasedGetDeviceAddress) *zeEventCounterBasedGetDeviceAddress;
+    decltype(zeCommandListGetOrdinal) *zeCommandListGetOrdinal;
+    decltype(zeCommandListImmediateGetIndex) *zeCommandListImmediateGetIndex;
 } ze_lib_ops_t;
 
 static std::vector<std::string> ze_fn_names = {
@@ -243,6 +245,8 @@ static std::vector<std::string> ze_fn_names_optional = {
     "zeCommandListHostSynchronize",
     "zeEventCounterBasedCreate",
     "zeEventCounterBasedGetDeviceAddress",
+    "zeCommandListGetOrdinal",
+    "zeCommandListImmediateGetIndex",
 };
 
 extern ccl::ze_lib_ops_t ze_lib_ops;
@@ -353,6 +357,8 @@ extern ccl::ze_lib_ops_t ze_lib_ops;
 #define zeCommandListHostSynchronize        ccl::ze_lib_ops.zeCommandListHostSynchronize
 #define zeEventCounterBasedCreate           ccl::ze_lib_ops.zeEventCounterBasedCreate
 #define zeEventCounterBasedGetDeviceAddress ccl::ze_lib_ops.zeEventCounterBasedGetDeviceAddress
+#define zeCommandListGetOrdinal             ccl::ze_lib_ops.zeCommandListGetOrdinal
+#define zeCommandListImmediateGetIndex      ccl::ze_lib_ops.zeCommandListImmediateGetIndex
 
 bool ze_api_init();
 void ze_api_fini();

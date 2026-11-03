@@ -83,8 +83,8 @@ ccl::event reduce_scatter_scaleout_sycl_simple(sycl::queue& q,
     }
     else if (!is_cpu_buffers) {
         if (!check_mpi_supports_rdma()) {
-            LOG_WARN("copy_to_host=false with a GPU buffer. "
-                     "make sure MPI GPU RDMA is enabled");
+            LOG_DEBUG("copy_to_host=false with a GPU buffer. "
+                      "make sure MPI GPU RDMA is enabled");
         }
     }
 
@@ -163,7 +163,7 @@ ccl::event reduce_scatter_scaleout_sycl(sycl::queue& q,
     if (should_disable_rdma(ze_dev) || ccl::global_data::env().atl_transport == ccl_atl_ofi) {
         copy_to_host = true;
     }
-    sycl_scaleout_algo algo = tune_attr.algo();
+    ccl::sycl_policy::scaleout_algo algo = tune_attr.algo();
 
     // when the proxy service is enabled for reduce-scatter, the selected algorithm runs
     // its scale-out exchange on the proxy thread instead of in a host task; a service
@@ -172,7 +172,7 @@ ccl::event reduce_scatter_scaleout_sycl(sycl::queue& q,
                            ccl::global_data::get().proxy_service->is_started();
 
     switch (algo) {
-        case ccl::sycl_policy::algorithm::direct:
+        case ccl::sycl_policy::scaleout_algo::direct:
         default: {
 #ifdef CCL_ENABLE_ITT
             ccl::profile::itt::task_begin(
@@ -189,7 +189,7 @@ ccl::event reduce_scatter_scaleout_sycl(sycl::queue& q,
 #endif // CCL_ENABLE_ITT
             return e;
         }
-        case ccl::sycl_policy::algorithm::ring: {
+        case ccl::sycl_policy::scaleout_algo::ring: {
 #ifdef CCL_ENABLE_ITT
             ccl::profile::itt::task_begin(
                 use_proxy ? "reduce_scatter_scaleout_sycl_proxy_ring" : "reduce_scatter_scaleout_sycl_ring",

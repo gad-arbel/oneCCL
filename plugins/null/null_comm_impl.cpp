@@ -185,7 +185,7 @@ onecclResult_t oneccl_plugin_init() {
 onecclResult_t oneccl_get_unique_id_impl(onecclUniqueId *id_ptr) {
     PROCESS_HOOKS(ONECCL_BEFORE_UNIQUE_ID);
 
-    *(reinterpret_cast<int *>(&id_ptr->any[0])) = onecclNull;
+    *(reinterpret_cast<int *>(&id_ptr->any[0])) = static_cast<int>(onecclNull);
 
     PROCESS_HOOKS(ONECCL_AFTER_UNIQUE_ID);
 
@@ -290,7 +290,9 @@ onecclResult_t oneccl_comm_window_deregister_impl(onecclComm_t /*comm*/,
 }
 
 onecclResult_t oneccl_platform_score_impl(int *score) {
-    *score = 10;
+    // Never selected automatically, as it does no communication: only
+    // CCL_PLUGIN=ONECCL_NULL selects it, which does not evaluate the score
+    *score = 0;
     return onecclSuccess;
 }
 

@@ -238,6 +238,9 @@ static bool ccl_is_device_side_algo(ccl_coll_algo algo, const ccl_selector_param
     else if (param.ctype == ccl_coll_scatter) {
         return algo.scatter == ccl_coll_scatter_topo;
     }
+    else if (param.ctype == ccl_coll_gather) {
+        return algo.gather == ccl_coll_gather_topo;
+    }
 
     return false;
 }
@@ -250,7 +253,8 @@ bool ccl_is_device_side_algo(const ccl_selector_param& param) {
     auto supported_colls = { ccl_coll_allgather,      ccl_coll_allgatherv, ccl_coll_allreduce,
                              ccl_coll_alltoall,       ccl_coll_alltoallv,  ccl_coll_bcast,
                              ccl_coll_broadcast,      ccl_coll_recv,       ccl_coll_reduce,
-                             ccl_coll_reduce_scatter, ccl_coll_send,       ccl_coll_scatter };
+                             ccl_coll_reduce_scatter, ccl_coll_send,       ccl_coll_scatter,
+                             ccl_coll_gather };
     RETURN_FALSE_IF(!checkers::is_coll_supported(supported_colls, param.ctype),
                     "coll ",
                     ccl_coll_type_to_str(param.ctype),
@@ -295,6 +299,9 @@ bool ccl_is_device_side_algo(const ccl_selector_param& param) {
     else if (param.ctype == ccl_coll_scatter) {
         algo.scatter = selector->get<ccl_coll_scatter>(param);
     }
+    else if (param.ctype == ccl_coll_gather) {
+        algo.gather = selector->get<ccl_coll_gather>(param);
+    }
 
     return ccl_is_device_side_algo(algo, param);
 }
@@ -309,7 +316,8 @@ bool ccl_can_use_topo_algo(const ccl_selector_param& param) {
     auto supported_colls = { ccl_coll_allgather,      ccl_coll_allgatherv, ccl_coll_allreduce,
                              ccl_coll_alltoall,       ccl_coll_alltoallv,  ccl_coll_bcast,
                              ccl_coll_broadcast,      ccl_coll_recv,       ccl_coll_reduce,
-                             ccl_coll_reduce_scatter, ccl_coll_send,       ccl_coll_scatter };
+                             ccl_coll_reduce_scatter, ccl_coll_send,       ccl_coll_scatter,
+                             ccl_coll_gather };
     RETURN_FALSE_IF(!checkers::is_coll_supported(supported_colls, param.ctype),
                     "coll is not supported");
 

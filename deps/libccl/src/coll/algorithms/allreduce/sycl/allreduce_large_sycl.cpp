@@ -14,88 +14,11 @@
  limitations under the License.
 */
 
-#ifdef CCL_ENABLE_ESIMD
-#include "coll/algorithms/allreduce/sycl/allreduce_large_sycl.hpp"
-
-#define MAX_RANK 16
-
-void *allreduce_large_buffer = NULL;
-void *allreduce_large_buffers[MAX_RANK];
-void *allreduce_large_sync_buffer[MAX_RANK];
-size_t allreduce_large_offsets[MAX_RANK];
-ze_ipc_mem_handle_t allreduce_large_ipc_handle[MAX_RANK];
-int allreduce_large_buffer_index = 0;
-
-#define ALLREDUCE_LARGE_API_DECL(TYPE) \
-    void init_allreduce_large_##TYPE(ccl::datatype dtype, \
-                                     sycl::queue &queue, \
-                                     ccl_comm *comm, \
-                                     ccl_stream *stream, \
-                                     uint32_t rank_in, \
-                                     uint32_t world_in); \
-    ccl::event run_allreduce_large_##TYPE(ccl::datatype dtype, \
-                                          sycl::queue &queue, \
-                                          const void *in_buf, \
-                                          void *out_buf, \
-                                          size_t count, \
-                                          ccl::reduction reduction, \
-                                          const ccl::vector_class<ccl::event> &deps, \
-                                          bool &done)
-
-ALLREDUCE_LARGE_API_DECL(fp16);
-ALLREDUCE_LARGE_API_DECL(bf16);
-ALLREDUCE_LARGE_API_DECL(fp32);
-ALLREDUCE_LARGE_API_DECL(int32);
-
-#define SWITCH_INIT_TYPE(TYPE, ccl_type) \
-    case ccl_type: \
-        init_allreduce_large_##TYPE(dtype, queue, comm, stream, rank_in, world_in); \
-        break;
-
-void init_allreduce_large(ccl::datatype dtype,
-                          sycl::queue &queue,
-                          ccl_comm *comm,
-                          ccl_stream *stream,
-                          uint32_t rank_in,
-                          uint32_t world_in) {
-    switch (dtype) {
-        SWITCH_INIT_TYPE(fp16, ccl::datatype::float16)
-        SWITCH_INIT_TYPE(bf16, ccl::datatype::bfloat16)
-        SWITCH_INIT_TYPE(fp32, ccl::datatype::float32)
-        SWITCH_INIT_TYPE(int32, ccl::datatype::int32)
-        default: CCL_THROW("unsupported datatype for allreduce"); assert(0);
-    }
-}
-
-#define SWITCH_RUN_TYPE(TYPE, ccl_type) \
-    case ccl_type: \
-        e = run_allreduce_large_##TYPE( \
-            dtype, queue, in_buf, out_buf, count, reduction, deps, done); \
-        break;
-
-ccl::event run_allreduce_large(ccl::datatype dtype,
-                               sycl::queue &queue,
-                               const void *in_buf,
-                               void *out_buf,
-                               size_t count,
-                               ccl::reduction reduction,
-                               const ccl::vector_class<ccl::event> &deps,
-                               bool &done) {
-    ccl::event e;
-    switch (dtype) {
-        SWITCH_RUN_TYPE(fp16, ccl::datatype::float16)
-        SWITCH_RUN_TYPE(bf16, ccl::datatype::bfloat16)
-        SWITCH_RUN_TYPE(fp32, ccl::datatype::float32)
-        SWITCH_RUN_TYPE(int32, ccl::datatype::int32)
-        default: CCL_THROW("unsupported datatype for allreduce"); assert(0);
-    }
-    return e;
-}
-#endif // CCL_ENABLE_ESIMD
-
 #include "coll/algorithms/allreduce/sycl/allreduce_large_sycl_impl.hpp"
 #include "coll/algorithms/allreduce/sycl/allreduce_large_sycl_ring.hpp"
 #include "coll/algorithms/utils/sycl_custom_preop.hpp"
+#include "coll/algorithms/utils/sycl_selection.hpp"
+#include "coll/selection/policy/policy_env.hpp"
 
 ccl::event allreduce_large(const void *send_buf,
                            void *recv_buf,
@@ -120,6 +43,14 @@ ccl::event allreduce_large(const void *send_buf,
     std::shared_ptr<ccl_comm> pair_comm = comm->get_pair_comm();
     std::shared_ptr<ccl_comm> even_comm = comm->get_even_comm();
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
+    const size_t dsize = ccl_dtype.size();
+    static const simple_chunk_size_table_t simple_chunk_sizes =
+        parse_simple_chunk_size_spec(CCL_SYCL_ALLREDUCE_SIMPLE_CHUNK_SIZE,
+                                     ccl::global_data::env().sycl_allreduce_simple_chunk_size);
+    // the policy knob `simple_chunk_size`, when set for this call, replaces the spec
+    size_t chunk_size = ccl::selection::call_env().sycl_allreduce_simple_chunk_size_override
+                            ? ccl::selection::call_env().sycl_allreduce_simple_chunk_size_override
+                            : select_simple_chunk_size(simple_chunk_sizes, count * dsize);
 
     // BMG
     if (is_arc_card(ccl::global_data::get().ze_data->devices[0].family)) {
@@ -144,18 +75,30 @@ ccl::event allreduce_large(const void *send_buf,
         }
         const ccl::vector_class<ccl::event> &transport_deps =
             reduce_has_pre_operation ? transport_deps_local : deps;
+        // the narrow (4 byte) vector path of the su_ring corrupts data once the collective is
+        // split, so run it as one call and warn that the chunk size is ignored
+        if (chunk_size && !chunks_use_full_vector(chunk_size, transport_send_buf, recv_buf, count,
+                                                  dsize, p2p_comm->size())) {
+            LOG_WARN_ONCE("allreduce: the narrow vector path runs the large allreduce unchunked, ",
+                          "ignoring chunk size ",
+                          chunk_size,
+                          "; ");
+            chunk_size = 0;
+        }
         bool is_tmp_used = ccl::global_data::env().sycl_allreduce_tmp_buf ||
                            reduce_has_pre_operation ||
                            !comm->get_topo_manager().has_p2p_access();
         if (is_tmp_used) {
             LOG_DEBUG("invoking allreduce_large_su_ring_write_no_ipc");
-            auto lambda = [&]<typename T>() {
-                return allreduce_large_su_ring_write_no_ipc<T>(
-                    transport_send_buf, recv_buf, count, dtype, transport_reduction,
-                    comm, p2p_comm, global_stream, transport_deps);
-            };
-            sycl::event e = invoke_collective_sycl(lambda, dtype);
-            return ccl::event::create_from_native(e);
+            return for_each_chunk(chunk_size, count, dsize, [&](size_t offset, size_t pack_count) {
+                auto lambda = [&]<typename T>() {
+                    return allreduce_large_su_ring_write_no_ipc<T>(
+                        (const char *)transport_send_buf + offset * dsize, (char *)recv_buf + offset * dsize,
+                        pack_count, dtype, transport_reduction, comm, p2p_comm, global_stream, transport_deps);
+                };
+                sycl::event e = invoke_collective_sycl(lambda, dtype);
+                return ccl::event::create_from_native(e);
+            });
         }
         else {
             std::vector<void *> registered_send_ptrs =
@@ -180,20 +123,24 @@ ccl::event allreduce_large(const void *send_buf,
                 delete exchange_entry;
                 delete sched;
             }
-            auto lambda = [&]<typename T>() {
-                return allreduce_large_su_ring<T>(send_buf,
-                                                  recv_buf,
-                                                  count,
-                                                  dtype,
-                                                  reduction,
-                                                  comm,
-                                                  p2p_comm,
-                                                  global_stream,
-                                                  sycl_ptrs,
-                                                  deps);
-            };
-            sycl::event e = invoke_collective_sycl(lambda, dtype);
-            return ccl::event::create_from_native(e);
+            return for_each_chunk(chunk_size, count, dsize, [&](size_t offset, size_t pack_count) {
+                const size_t offset_bytes = offset * dsize;
+                sycl_ptrs_type chunk_ptrs = offset_sycl_ptrs(sycl_ptrs, offset_bytes, offset_bytes);
+                auto lambda = [&]<typename T>() {
+                    return allreduce_large_su_ring<T>((const char *)send_buf + offset_bytes,
+                                                      (char *)recv_buf + offset_bytes,
+                                                      pack_count,
+                                                      dtype,
+                                                      reduction,
+                                                      comm,
+                                                      p2p_comm,
+                                                      global_stream,
+                                                      chunk_ptrs,
+                                                      deps);
+                };
+                sycl::event e = invoke_collective_sycl(lambda, dtype);
+                return ccl::event::create_from_native(e);
+            });
         }
     }
 
@@ -294,32 +241,39 @@ ccl::event allreduce_large(const void *send_buf,
         }
     }
 
-    auto lambda = [&]<typename T>() {
-        if (use_full_vector) {
-            return allreduce_large_impl<T, true>(send_buf,
-                                                 recv_buf,
-                                                 count,
-                                                 dtype,
-                                                 reduction,
-                                                 comm,
-                                                 global_stream,
-                                                 sycl_ptrs,
-                                                 deps,
-                                                 is_use_tmp);
-        }
-        else {
-            return allreduce_large_impl<T, false>(send_buf,
-                                                  recv_buf,
-                                                  count,
-                                                  dtype,
-                                                  reduction,
-                                                  comm,
-                                                  global_stream,
-                                                  sycl_ptrs,
-                                                  deps,
-                                                  is_use_tmp);
-        }
-    };
-
-    return invoke_collective(lambda, dtype);
+    return for_each_chunk(chunk_size, count, dsize, [&](size_t offset, size_t pack_count) {
+        const size_t offset_bytes = offset * dsize;
+        // tmp-buffer peers are not user buffers, so they keep their base
+        sycl_ptrs_type chunk_ptrs =
+            is_use_tmp ? sycl_ptrs : offset_sycl_ptrs(sycl_ptrs, offset_bytes, offset_bytes);
+        const void *chunk_send_buf = (const char *)send_buf + offset_bytes;
+        void *chunk_recv_buf = (char *)recv_buf + offset_bytes;
+        auto lambda = [&]<typename T>() {
+            if (use_full_vector) {
+                return allreduce_large_impl<T, true>(chunk_send_buf,
+                                                     chunk_recv_buf,
+                                                     pack_count,
+                                                     dtype,
+                                                     reduction,
+                                                     comm,
+                                                     global_stream,
+                                                     chunk_ptrs,
+                                                     deps,
+                                                     is_use_tmp);
+            }
+            else {
+                return allreduce_large_impl<T, false>(chunk_send_buf,
+                                                      chunk_recv_buf,
+                                                      pack_count,
+                                                      dtype,
+                                                      reduction,
+                                                      comm,
+                                                      global_stream,
+                                                      chunk_ptrs,
+                                                      deps,
+                                                      is_use_tmp);
+            }
+        };
+        return invoke_collective(lambda, dtype);
+    });
 }

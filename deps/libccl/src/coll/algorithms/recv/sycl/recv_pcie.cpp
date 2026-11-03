@@ -33,6 +33,8 @@ ccl::event recv_ll(const void *recv_buf,
     sycl::queue q = global_stream->get_native_stream();
     std::shared_ptr<ccl_comm> node_comm = comm->get_node_comm();
     bool recording = use_recording_path(q);
+    CCL_THROW_IF_NOT(!(recording && comm->is_multi_thread_instance()),
+                     "|CCL_SYCL| Multi-threaded algos do not support sycl_graph recording");
     const int comm_size = node_comm->size();
     const int comm_rank = node_comm->rank();
 

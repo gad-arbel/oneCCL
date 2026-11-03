@@ -10,10 +10,15 @@ if ("$ENV{CCL_CONFIGURATION}" STREQUAL "cpu")
     endif()
 
     get_filename_component(_oneccl_headers "${_oneccl_root}/include" ABSOLUTE)
-    get_filename_component(_oneccl_lib "${_oneccl_root}/lib/ccl/cpu/lib/libccl.so" ABSOLUTE)
+    get_filename_component(_oneccl_lib "${_oneccl_root}/lib/ccl/cpu/lib/libccl.so.1" ABSOLUTE)
 else()
     get_filename_component(_oneccl_headers "${_oneccl_root}/include" ABSOLUTE)
-    get_filename_component(_oneccl_lib "${_oneccl_root}/lib/libccl.so" ABSOLUTE)
+    get_filename_component(_oneccl_lib "${_oneccl_root}/lib/libccl.so.1" ABSOLUTE)
+endif()
+# In a oneCCL v2 install libccl.so is a linker script, so prefer the C++ API library itself. A libccl built with
+# another LIB_MAJOR_VERSION has no libccl.so.1.
+if (NOT EXISTS "${_oneccl_lib}")
+    string(REGEX REPLACE "\\.1$" "" _oneccl_lib "${_oneccl_lib}")
 endif()
 
 if (EXISTS "${_oneccl_headers}" AND EXISTS "${_oneccl_lib}")

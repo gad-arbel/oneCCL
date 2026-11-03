@@ -252,3 +252,49 @@ void ccl_proxy_staging::do_sendrecv(ccl_proxy_staging* staging,
         wait_h2d(b);
     }
 }
+
+// ==== One-directional pipelined staging ====
+
+// One-directional pipelined staging, for algorithms with plain sends/recvs
+// (e.g. the rabenseifner first-group phases). Both delegate to do_sendrecv
+// with the unused direction zeroed: its loop then degenerates to exactly the
+// pipeline a hand-written one-directional version would run -- D2H of the
+// next slice overlaps the current ATL send, and the ATL recv overlaps the
+// previous slice's H2D.
+void ccl_proxy_staging::do_send(ccl_proxy_staging* staging,
+                                const void* send_dev_ptr,
+                                size_t send_bytes,
+                                int send_to,
+                                size_t pipeline_chunk_size,
+                                ccl_comm* comm,
+                                int tag_base) {
+    do_sendrecv(staging,
+                send_dev_ptr,
+                send_bytes,
+                send_to,
+                /*recv_dev_ptr=*/nullptr,
+                /*recv_bytes=*/0,
+                /*recv_from=*/-1,
+                pipeline_chunk_size,
+                comm,
+                tag_base);
+}
+
+void ccl_proxy_staging::do_recv(ccl_proxy_staging* staging,
+                                void* recv_dev_ptr,
+                                size_t recv_bytes,
+                                int recv_from,
+                                size_t pipeline_chunk_size,
+                                ccl_comm* comm,
+                                int tag_base) {
+    do_sendrecv(staging,
+                /*send_dev_ptr=*/nullptr,
+                /*send_bytes=*/0,
+                /*send_to=*/-1,
+                recv_dev_ptr,
+                recv_bytes,
+                recv_from,
+                pipeline_chunk_size,
+                comm,
+                tag_base);
+}

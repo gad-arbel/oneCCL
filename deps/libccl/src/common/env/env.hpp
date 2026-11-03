@@ -105,7 +105,47 @@ enum class ccl_sycl_alltoall_protocol {
     write
 };
 
+enum class ccl_sycl_gather_protocol {
+    read,
+    write
+};
+
+// How a multi-domain reduce_scatter is structured: the scale-up + scale-out
+// decomposition, or one flat ring over the whole communicator.
+enum class ccl_sycl_reduce_scatter_domain_mode {
+    hierarchical,
+    flat
+};
+
 namespace ccl {
+
+// Which engine copies a large call's peer blocks: auto leaves the choice to the
+// collective's own rule. A plain int, not an enum class, so that env_2_type() can parse
+// the variable into it and bind_copy_path() can write it.
+enum copy_engine_mode : int {
+    copy_engine_auto = -1,
+    copy_engine_kernel = 0,
+    copy_engine_on = 1,
+};
+
+// The env_data fields a selection-policy knob can set for one call (policy_knobs.hpp).
+// Read them through ccl::selection::call_env(), the calling thread's copy; env_data
+// holds the parsed values in `knobs`.
+struct knob_env {
+    bool sycl_copy_engine = false;
+    int sycl_alltoall_copy_engine_mode = copy_engine_auto;
+    size_t sycl_allgatherv_self_copy_threshold = 8 * 1024 * 1024;
+    size_t sycl_alltoall_self_copy_threshold = 8 * 1024 * 1024;
+    size_t sycl_alltoallv_self_copy_threshold = 8 * 1024 * 1024;
+    size_t sycl_allreduce_simple_ring_segment_size = 0;
+    size_t sycl_reduce_scatter_simple_ring_segment_size = 0;
+    size_t sycl_allgatherv_simple_ring_segment_size = 0;
+    // simple_chunk_size knob only, no env var; 0 = no knob
+    size_t sycl_allreduce_simple_chunk_size_override = 0;
+    size_t sycl_reduce_scatter_simple_chunk_size_override = 0;
+    size_t sycl_allgatherv_simple_chunk_size_override = 0;
+    size_t sycl_alltoall_simple_chunk_size_override = 0;
+};
 
 class env_data {
 public:
@@ -176,6 +216,10 @@ public:
     ssize_t mnic_count;
     atl_mnic_offset_t mnic_offset;
     std::string ofi_domain_names;
+    /* ofi_domain_names when its entries were written as ':'-separated groups: one group of domain
+       names per local rank, the provider list that rank opens. Empty for the plain form, which pins a
+       single domain through the OFI hints instead. See parse_ofi_domain_groups(). */
+    std::vector<std::vector<std::string>> ofi_domain_groups;
 
     /*
        parsing logic can be quite complex
@@ -239,7 +283,6 @@ public:
     ccl_overlapping_collectives overlapping_collectives;
     bool enable_hostname_sharing;
     bool enable_init_hostname_sharing;
-    std::string occp_server_hostname;
     size_t occp_server_io_threads;
     size_t occp_server_op_timeout;
     size_t occp_server_ranks_per_thread;
@@ -273,7 +316,6 @@ public:
 
     bool sycl_allreduce_tmp_buf;
     size_t sycl_allreduce_small_threshold;
-    size_t sycl_allreduce_medium_threshold;
     size_t sycl_allreduce_scaleout_threshold;
     std::string sycl_allreduce_scaleout_algo;
     bool sycl_enable_arc_allreduce;
@@ -281,6 +323,7 @@ public:
     size_t sycl_allreduce_simple_threshold;
     bool sycl_allreduce_simple_read;
     size_t sycl_allreduce_chunking_threshold;
+    std::string sycl_allreduce_simple_chunk_size;
     std::string sycl_allreduce_ll_algo;
 
     size_t sycl_reduce_ll_threshold;
@@ -291,16 +334,16 @@ public:
 
     bool sycl_reduce_scatter_tmp_buf;
     size_t sycl_reduce_scatter_small_threshold;
-    size_t sycl_reduce_scatter_medium_threshold;
     size_t sycl_reduce_scatter_scaleout_threshold;
     std::string sycl_reduce_scatter_scaleout_algo;
+    ccl_sycl_reduce_scatter_domain_mode sycl_reduce_scatter_domain_mode;
     size_t sycl_reduce_scatter_ll_threshold;
     size_t sycl_reduce_scatter_simple_threshold;
     std::string sycl_reduce_scatter_ll_algo;
+    std::string sycl_reduce_scatter_simple_chunk_size;
 
     bool sycl_allgatherv_tmp_buf;
     size_t sycl_allgatherv_small_threshold;
-    size_t sycl_allgatherv_medium_threshold;
     size_t sycl_allgatherv_scaleout_threshold;
     std::string sycl_allgatherv_scaleout_algo;
     size_t sycl_allgatherv_ll_threshold;
@@ -340,23 +383,34 @@ public:
     // production-style selection.
     int sycl_broadcast_scatter_allgather_max_ppn;
     size_t sycl_allgatherv_chunking_threshold;
+    std::string sycl_allgatherv_simple_chunk_size;
 
     bool sycl_scatter_large_tmp_buf;
+    bool sycl_scatter_read;
     size_t sycl_scatter_small_threshold;
     size_t sycl_scatter_scaleout_threshold;
     size_t sycl_scatter_scaleout_small_threshold;
     bool sycl_scatter_scaleout_overlap;
     size_t sycl_scatter_scaleout_overlap_buf_size;
 
+    ccl_sycl_gather_protocol sycl_gather_large_protocol;
+    bool sycl_gather_tmp_buf;
+    bool sycl_gather_large_tmp_buf;
+    size_t sycl_gather_small_threshold;
+    size_t sycl_gather_scaleout_threshold;
+
     std::string sycl_alltoall_scaleout_algo;
     bool sycl_enable_arc_alltoall_ll;
     bool sycl_alltoall_tmp_buf;
     size_t sycl_alltoall_ll_threshold;
+    std::string sycl_alltoall_ll_algo;
     size_t sycl_alltoall_chunking_threshold;
+    std::string sycl_alltoall_simple_chunk_size;
     bool sycl_alltoall_single_node_algorithm;
     bool sycl_alltoall_use_barrier;
     size_t sycl_alltoall_simple_threshold;
-    bool sycl_alltoall_copy_engine;
+    size_t sycl_alltoall_cri_copy_engine_threshold;
+    knob_env knobs; // the per-call knob fields, see knob_env
 
     bool enable_sycl_kernels;
 
@@ -365,19 +419,19 @@ public:
     bool sycl_single_node_algorithm;
     bool sycl_auto_use_tmp_buf;
     bool sycl_force_use_tmp_buf_scaleout;
-    bool sycl_copy_engine;
     bool sycl_kernel_copy;
-#ifdef CCL_ENABLE_ESIMD
-    bool sycl_esimd;
-#endif // CCL_ENABLE_ESIMD
     bool sycl_full_vector;
     bool sycl_force_recording_path;
     graph_type sycl_graph_type;
     bool sycl_oneshot_allgather_wa;
+    bool sycl_oneshot_alltoall_wa;
     host_task_type sycl_host_task_type;
     bool sycl_kernel_memcpy_upsize;
     size_t sycl_tmp_buf_size;
+    bool enable_sycl_ce_eu_pipeline;
+    size_t sycl_ce_eu_pipeline_chunk_size;
     size_t sycl_scaleout_host_buf_size;
+    size_t sycl_scaleout_small_host_buf_size;
     size_t sycl_scaleout_device_buf_size;
     size_t sycl_kernels_line_size;
     size_t sycl_max_pipeline_chunk_size;
@@ -392,6 +446,7 @@ public:
     bool sycl_enable_allreduce_scaleout_proxy;
     bool sycl_enable_reduce_scatter_scaleout_proxy;
     bool sycl_enable_allgatherv_scaleout_proxy;
+    bool sycl_enable_broadcast_scaleout_proxy;
     bool sycl_sub_communicator;
     bool sycl_force_pcie;
     bool sycl_ll_buffer_global;
@@ -527,7 +582,7 @@ public:
     type2_tune_mode type2_mode;
     std::string drmfd_dev_render_dir_path;
     std::string drmfd_dev_render_suffix;
-    bool enable_ze_ce;                      // CCL_ENABLE_ZE_CE
+    bool enable_ze_ce; // CCL_ENABLE_ZE_CE
 #endif // CCL_ENABLE_SYCL
     bool ipc_allgatherv_wa;
 
@@ -573,6 +628,7 @@ public:
     int env_2_worker_mem_affinity(int local_proc_count);
 
 private:
+    void parse_ofi_domain_groups();
     int env_2_worker_affinity_auto(int local_proc_idx, size_t workers_per_process);
     static int parse_affinity(const std::string& input,
                               std::vector<ssize_t>& output,

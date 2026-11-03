@@ -36,6 +36,10 @@ ccl::event broadcast_large_impl_ipc(const void* send_buf,
     LOG_DEBUG("broadcast large kernel no tmp buffer");
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     const int dsize = ccl_dtype.size();
+    LOG_DEBUG("broadcast path: ipc, world=",
+              p2p_comm->size(),
+              ", bytes=",
+              count * static_cast<size_t>(dsize));
     std::vector<sycl::event> dep_events = get_sycl_events(deps);
     const bool is_cpu_barrier = ccl::global_data::env().sycl_ccl_barrier;
 

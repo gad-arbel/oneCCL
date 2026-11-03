@@ -43,6 +43,7 @@
 #include "oneapi/ccl/coll_attr_ids_traits.hpp"
 #include "oneapi/ccl/coll_attr.hpp"
 #include "coll/algorithms/algorithm_utils.hpp"
+#include "coll/algorithms/utils/p2p_domain.hpp"
 #if defined(CCL_ENABLE_SYCL) && defined(CCL_ENABLE_ZE)
 #include "common/ze/ze_wrapper.hpp"
 #include "common/global/ze/ze_fd_manager.hpp"
@@ -613,7 +614,9 @@ private:
 
 class alignas(CACHELINE_SIZE) ccl_scaleout_host_bufs {
 public:
-    ccl_scaleout_host_bufs() = default;
+    // is_small picks CCL_SYCL_SCALEOUT_SMALL_HOST_BUF_SIZE as the slot size,
+    // instead of CCL_SYCL_SCALEOUT_HOST_BUF_SIZE
+    explicit ccl_scaleout_host_bufs(bool small = false) : is_small(small) {}
     ~ccl_scaleout_host_bufs();
     ccl_scaleout_host_bufs(const ccl_scaleout_host_bufs&) = delete;
     ccl_scaleout_host_bufs& operator=(const ccl_scaleout_host_bufs&) = delete;
@@ -623,6 +626,7 @@ public:
 
 private:
     static constexpr int buf_count = 3;
+    const bool is_small = false;
     size_t buf_size = 0;
     void* host_bufs[buf_count] = { nullptr, nullptr, nullptr };
     int index = 0;
@@ -825,6 +829,14 @@ public:
         return m_scaleout_host_bufs.get_scaleout_host_buf();
     }
 
+    void* get_scaleout_small_host_buf() {
+        return m_scaleout_small_host_bufs.get_scaleout_host_buf();
+    }
+
+    size_t get_scaleout_small_host_buf_size() {
+        return m_scaleout_small_host_bufs.get_scaleout_host_buf_size();
+    }
+
     void put_scaleout_host_buf(const void* buf) {
         return m_scaleout_host_bufs.put_scaleout_host_buf(buf);
     }
@@ -957,6 +969,8 @@ private:
     ccl_tmp_bufs m_tmp_buf;
     ccl_large_tmp_bufs m_large_tmp_buf{};
     ccl_scaleout_host_bufs m_scaleout_host_bufs;
+    // pool used for small messages; see CCL_SYCL_SCALEOUT_SMALL_HOST_BUF_SIZE
+    ccl_scaleout_host_bufs m_scaleout_small_host_bufs{ /*small=*/true };
     ccl_scaleout_device_bufs m_scaleout_device_bufs;
     // for sycl pipeline sendrecv
     ccl_scaleout_pipeline_bufs m_scaleout_pipeline_bufs;
@@ -1013,6 +1027,10 @@ public:
 #ifdef CCL_ENABLE_SYCL
             if (serialize_stream && serialize_stream->hasMainQueue()) {
                 serialize_stream->getMainQueue().ext_oneapi_submit_barrier().wait();
+            }
+            if (m_ipc_dummy_buf && m_ipc_dummy_q) {
+                sycl::free(m_ipc_dummy_buf, *m_ipc_dummy_q);
+                m_ipc_dummy_buf = nullptr;
             }
 #ifdef CCL_ENABLE_ZE
             last_event.wait();
@@ -1263,6 +1281,10 @@ public:
         return self_comm;
     }
 
+    std::optional<ccl_p2p_domain_level> get_p2p_level() const {
+        return p2p_level;
+    }
+
     std::shared_ptr<ccl_comm> get_self_r2r_comm() const {
         if (parent_comm) {
             return parent_comm->get_self_r2r_comm();
@@ -1454,6 +1476,12 @@ public:
     size_t get_scaleout_host_buf_size() {
         return comm_impl->get_scaleout_host_buf_size();
     }
+    void* get_scaleout_small_host_buf() {
+        return comm_impl->get_scaleout_small_host_buf();
+    }
+    size_t get_scaleout_small_host_buf_size() {
+        return comm_impl->get_scaleout_small_host_buf_size();
+    }
 
     void* get_scaleout_device_buf(sycl::queue& q) {
         return comm_impl->get_scaleout_device_buf(q);
@@ -1566,6 +1594,23 @@ public:
     {
         return ze_device_manager.devices();
     }
+
+    // Dummy for the IPC exchange, for a rank that has no send and no recv
+    // buffer. Every exchange slot must be a real device ptr, so a rank needs
+    // one alloc. It is never read/written, bc all transfers are guarded with
+    // counts[peer] > 0
+    void* get_ipc_dummy_buf(sycl::queue& q) {
+        if (!m_ipc_dummy_buf) {
+            m_ipc_dummy_buf = sycl::malloc_device(CACHELINE_SIZE, q);
+            CCL_THROW_IF_NOT(m_ipc_dummy_buf, "failed to allocate IPC anchor buffer");
+            m_ipc_dummy_q = std::make_shared<sycl::queue>(q);
+        }
+        // A USM device allocation is bound to a context, not a queue.
+        // For a different context the pointer is invalid
+        CCL_THROW_IF_NOT(m_ipc_dummy_q->get_context() == q.get_context(),
+                         "IPC anchor buffer was allocated on a different SYCL context");
+        return m_ipc_dummy_buf;
+    }
 #endif // CCL_ENABLE_SYCL
 
     void set_topo_info();
@@ -1619,6 +1664,8 @@ public:
 
     bool is_uniform = false;
 private:
+    std::optional<ccl_p2p_domain_level> p2p_level;
+
     // this is an internal part of the communicator
     // we store there only the fields which should be shared
     // across ccl_comm copies/clones
@@ -1652,6 +1699,9 @@ private:
     ze_device_manager_t ze_device_manager;
     // ze_device_ptr ze_device;
     ze_cmd_queue_ptr  ce_queue;
+    void* m_ipc_dummy_buf = nullptr;
+    // keeps the queue alive so the free below is valid, same as ccl_tmp_bufs::free_q
+    std::shared_ptr<sycl::queue> m_ipc_dummy_q;
 #endif // CCL_ENABLE_SYCL && CCL_ENABLE_ZE
 
     // these fields are duplicate with the ones in ccl_internal_comm

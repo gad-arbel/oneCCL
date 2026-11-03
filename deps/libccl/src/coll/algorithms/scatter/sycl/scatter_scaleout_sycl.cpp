@@ -16,6 +16,7 @@
 
 #include "atl/mpi/atl_mpi_ctx.hpp"
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
+#include "coll/algorithms/utils/host_task.hpp"
 
 #if defined(CCL_ENABLE_ZE) || defined(CCL_ENABLE_SYCL)
 #include "coll/algorithms/scatter/sycl/scatter_sycl.hpp"
@@ -142,25 +143,22 @@ ccl::event scatter_scaleout_sycl(sycl::queue& q,
     }
     else if (!is_cpu_buffers) {
         if (!check_mpi_supports_rdma()) {
-            LOG_INFO("copy_to_host=false with a GPU buffer. "
-                     "make sure MPI GPU RDMA is enabled");
+            LOG_DEBUG("copy_to_host=false with a GPU buffer. "
+                      "make sure MPI GPU RDMA is enabled");
         }
     }
 
-    auto op_end = q.submit([=](sycl::handler& h) {
-        h.depends_on(sycl_deps);
-        h.host_task([=]() {
-            int ep_idx = 0;
-            atl_req_t req;
-            std::shared_ptr<atl_base_comm> atl_comm = comm->get_atl_comm();
-            ATL_CALL_THROW_IF_ERROR(atl_comm->scatter(
-                ep_idx, scaleout_send_buf, scaleout_recv_buf, send_bytes, root, req));
+    auto op_end = ccl_host_task(q, sycl_deps, [=]() {
+        int ep_idx = 0;
+        atl_req_t req;
+        std::shared_ptr<atl_base_comm> atl_comm = comm->get_atl_comm();
+        ATL_CALL_THROW_IF_ERROR(atl_comm->scatter(
+            ep_idx, scaleout_send_buf, scaleout_recv_buf, send_bytes, root, req));
 
-            ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, req));
-            if (!req.is_completed) {
-                ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, req));
-            }
-        });
+        ATL_CALL_THROW_IF_ERROR(atl_comm->check(ep_idx, req));
+        if (!req.is_completed) {
+            ATL_CALL_THROW_IF_ERROR(atl_comm->wait(ep_idx, req));
+        }
     });
 
     if (copy_to_host) {

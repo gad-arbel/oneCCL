@@ -102,19 +102,23 @@ public:
             for (int i = 0; i < nranks; ++i)
                 offsets[i] = offs[i];
         }
-        // See memory layout diagram in runAllreduce()
-        for (int i = 0; i < nranks; ++i)
-            scatterSinks[i] =
-                reinterpret_cast<oneshotPtr>((uintptr_t)peerBuf0[i] + rank * ringSize);
+        // Collectives that only need the gather half - alltoall and alltoallv -
+        // pass peerBuf0 == nullptr.
+        if (peerBuf0 != nullptr) {
+            // See memory layout diagram in runAllreduce()
+            for (int i = 0; i < nranks; ++i)
+                scatterSinks[i] =
+                    reinterpret_cast<oneshotPtr>((uintptr_t)peerBuf0[i] + rank * ringSize);
 
-        // Indexed by the writing peer, not by distance from us, so the reduce loops
-        // can fold in ascending rank order. Entry [rank] is our own input, unused.
-        for (int p = 0; p < nranks; ++p) {
-            if (p == rank)
-                continue;
+            // Indexed by the writing peer, not by distance from us, so the reduce loops
+            // can fold in ascending rank order. Entry [rank] is our own input, unused.
+            for (int p = 0; p < nranks; ++p) {
+                if (p == rank)
+                    continue;
 
-            localScatterSinks[p] =
-                reinterpret_cast<oneshotPtr>((uintptr_t)scatterBuf + p * ringSize);
+                localScatterSinks[p] =
+                    reinterpret_cast<oneshotPtr>((uintptr_t)scatterBuf + p * ringSize);
+            }
         }
 
         // Gather sinks mirror the allgather (broadcast) phase of the two-shots
@@ -479,6 +483,78 @@ public:
             } while (
                 sycl::any_of_group(sycl::ext::oneapi::this_work_item::get_sub_group(), retry));
         }
+
+        ProtoT::restoreData(v[0]);
+        ProtoT::storeOutput(o_ptr, v[0], nelems, gr);
+    }
+
+    // One-shot alltoall: like runAllgather, one wire per (cable, peer) pair, but
+    // every peer gets a different chunk instead of a copy of the same one. So a
+    // wire is no longer either a sender or a receiver: it sends the chunk this
+    // rank holds for its peer and receives the chunk that peer holds for us.
+    // The send is a plain store, so both happen in one shot with no pairwise
+    // barrier - contrast RingTransmit::runAllToAll, which walks nranks-1 steps
+    // with a barrier in each.
+    inline void runAllToAll(size_t inputOffset,
+                            size_t iter,
+                            ssize_t workLeft,
+                            AccessGranularity gr) {
+        if (workLeft <= 0) {
+            return;
+        }
+
+        auto wireId =
+            sycl::ext::oneapi::this_work_item::get_nd_item<1>().get_global_id(0) / SubGroupSize;
+
+        auto y_id = wireId % nranks; // the peer this wire exchanges with
+        auto x_id = wireId / nranks * nranks; // cableId * nranks
+
+        // the chunk destined for ourselves is a local copy, done by the caller
+        if ((int)y_id == rank) {
+            return;
+        }
+
+        auto inputOffInType = inputOffset / sizeof(T); // position within a chunk
+        uint32_t seqNo = getSeqNo();
+        auto flag = seqNo + iter / nSlot;
+        size_t slot = (seqNo + iter) % nSlot;
+        auto nelems = workElems - inputOffInType;
+
+        const int unroll = 1;
+
+        message_t v[unroll];
+
+        // Chunk exchanged with peer y_id, on both sides: offsets, when supplied,
+        // are the byte offsets of the per-peer chunks.
+        T* i_ptr;
+        T* o_ptr;
+        if (has_offsets) {
+            i_ptr = reinterpret_cast<T*>((char*)ingress + offsets[y_id]) + inputOffInType;
+            o_ptr = reinterpret_cast<T*>((char*)egress + offsets[y_id]) + inputOffInType;
+        }
+        else {
+            i_ptr = ingress + (size_t)y_id * workElems + inputOffInType;
+            o_ptr = egress + (size_t)y_id * workElems + inputOffInType;
+        }
+
+        // send: our chunk for peer y_id goes into y_id's gather buffer at the
+        // cell reserved for this rank. That is the very cell runAllgather uses,
+        // (rank + cable), so peer y_id finds it under its own wireId - which is
+        // where the recv below reads from. gatherSinks is indexed by hop
+        // distance from this rank (see constructor), so peer y_id maps back to
+        // hop (y_id - rank - 1) mod nranks.
+        auto sinkId = (y_id + nranks - rank - 1) % nranks;
+        ProtoT::loadInput(v[0], i_ptr, nelems, gr);
+        ProtoT::shuffleData(v[0]);
+        ProtoT::insertFlags(v[0], flag);
+        ProtoT::sendMessages(gatherSinks[sinkId][x_id][slot], v[0]);
+
+        // recv: the chunk peer y_id holds for us.
+        bool retry;
+        do {
+            retry = false;
+            retry |= ProtoT::recvMessages(v[0], localGatherSink[wireId][slot], flag);
+        } while (sycl::any_of_group(sycl::ext::oneapi::this_work_item::get_sub_group(), retry));
 
         ProtoT::restoreData(v[0]);
         ProtoT::storeOutput(o_ptr, v[0], nelems, gr);

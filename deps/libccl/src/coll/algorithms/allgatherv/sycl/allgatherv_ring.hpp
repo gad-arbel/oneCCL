@@ -190,7 +190,7 @@ inline sycl::event allgatherv_ring_nonblocking(sycl::queue& q,
     size_t nchunks;
     auto min_count = std::min_element(recv_counts.begin(), recv_counts.end());
     auto max_count = std::max_element(recv_counts.begin(), recv_counts.end());
-    pipe_prep(*min_count, *max_count, ccl_dtype.size(), pipeline_chunk_size, nchunks);
+    pipe_prep(*max_count, ccl_dtype.size(), pipeline_chunk_size, nchunks);
     LOG_DEBUG("Allgatherv ring min_block_count: ",
               *min_count,
               " max_block_count: ",
@@ -388,7 +388,7 @@ inline void proxy_allgatherv_ring(const ccl_proxy_op& op, ccl_proxy_context& ctx
     const size_t send_count = op.count;
     std::vector<size_t> recv_counts =
         op.recv_counts.empty() ? std::vector<size_t>(op.comm->size(), send_count) : op.recv_counts;
-    std::vector<size_t> offsets = op.offsets;
+    std::vector<size_t> offsets = op.recv_offsets;
 
     allgatherv_proxy_ring_blocking(ctx,
                                    op.src,
@@ -471,7 +471,7 @@ inline sycl::event allgatherv_scaleout_sycl_proxy_ring(
                      /*aux=*/nullptr };
     op.pipeline_chunk_size = tune_attr.pipeline_chunk_size();
     op.recv_counts.assign(recv_counts.begin(), recv_counts.end());
-    op.offsets = std::move(offsets);
+    op.recv_offsets = std::move(offsets);
     // No on-device compute remains, so a single sync-only work-group is fine.
     op.sync_only = true;
 

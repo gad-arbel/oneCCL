@@ -25,64 +25,51 @@
 #endif //#if defined(CCL_ENABLE_ZE) || defined(CCL_ENABLE_SYCL)
 
 #include "common/global/global.hpp"
-#include "coll/algorithms/utils/sycl_policy.hpp"  // ccl::sycl_policy::algorithm
+#include "coll/algorithms/utils/sycl_policy.hpp"  // ccl::sycl_policy::scaleout_algo
 #include "coll/selection/selection.hpp"
 
 // dispatching between SYCL path and Scheduler path
 bool can_use_sycl_kernels(const ccl_selector_param& param);
 
-using sycl_scaleout_algo = ccl::sycl_policy::algorithm;
-using scaleout_sub_kernel = ccl::sycl_policy::scaleout_sub_kernel;
+using sycl_scaleout_tune_attr = ccl::sycl_policy::sycl_scaleout_tune_attr;
 
-// One tune_attr for every collective. Collectives that don't use a given axis
-// simply leave that field at its default and ignore it on read.
-//   allreduce:      algo (direct|rabenseifner|ring|proxy_direct|proxy_ring), chunk
-//   reduce_scatter: algo (direct|ring|proxy_ring),                          chunk
-//   allgatherv:     algo (direct|ring|proxy_ring),                          chunk, sub_kernel
-//   alltoall(v):    algo (direct|gdr_only_pairwise|scatter|numa_gdr_split|fallback)
-//   scatter:        algo (direct),                                                 sub_kernel
-class sycl_scaleout_tune_attr {
+
+class sycl_scaleout_selector {
 public:
-    sycl_scaleout_tune_attr() = default;
-    explicit sycl_scaleout_tune_attr(sycl_scaleout_algo a) noexcept
-        : algo_(a) {}
-    sycl_scaleout_tune_attr(sycl_scaleout_algo a, size_t chunk_bytes) noexcept
-        : algo_(a), pipeline_chunk_size_(chunk_bytes) {}
-
-    sycl_scaleout_algo  algo()                const noexcept { return algo_; }
-    size_t              pipeline_chunk_size() const noexcept { return pipeline_chunk_size_; }
-    scaleout_sub_kernel sub_kernel()          const noexcept { return sub_kernel_; }
-
-    sycl_scaleout_tune_attr& set_algo(sycl_scaleout_algo a) noexcept { algo_ = a; return *this; }
-    sycl_scaleout_tune_attr& set_pipeline_chunk_size(size_t s) noexcept    { pipeline_chunk_size_ = s; return *this; }
-    sycl_scaleout_tune_attr& set_sub_kernel(scaleout_sub_kernel k) noexcept { sub_kernel_ = k; return *this; }
-
-private:
-    sycl_scaleout_algo  algo_{ sycl_scaleout_algo::direct };
-    size_t              pipeline_chunk_size_{ 2 * 1024 * 1024 };
-    scaleout_sub_kernel sub_kernel_{ scaleout_sub_kernel::direct };
-};
-
-
-class sycl_selector {
-public:
-    sycl_selector(size_t sz,
-                  size_t cs,
-                  ccl_datatype dt,
-                  bool rec) noexcept
-        : size(sz), comm_size(cs), dtype(dt), is_recording(rec) {}
+    sycl_scaleout_selector(size_t size,
+                           size_t comm_size,
+                           ccl_datatype dtype,
+                           bool is_recording) noexcept
+        : size(size), comm_size(comm_size), dtype(dtype), is_recording(is_recording) {}
 
     sycl_scaleout_tune_attr allreduce()      const;
     sycl_scaleout_tune_attr reduce_scatter() const;
     sycl_scaleout_tune_attr allgatherv()     const;
     sycl_scaleout_tune_attr alltoall()       const;
+    sycl_scaleout_tune_attr scatter()        const;
+    sycl_scaleout_tune_attr broadcast()      const;
+    sycl_scaleout_tune_attr reduce()         const;
 
-    static size_t allreduce_chunk_size(sycl_scaleout_algo algo, size_t size, size_t comm_size);
-    static size_t reduce_scatter_chunk_size(sycl_scaleout_algo algo, size_t size, size_t comm_size);
-    static size_t allgatherv_chunk_size(sycl_scaleout_algo algo, size_t size, size_t comm_size);
+    static size_t allreduce_chunk_size(ccl::sycl_policy::scaleout_algo algo,
+                                       size_t size,
+                                       size_t comm_size);
+    static size_t reduce_scatter_chunk_size(ccl::sycl_policy::scaleout_algo algo,
+                                            size_t size,
+                                            size_t comm_size);
+    static size_t allgatherv_chunk_size(ccl::sycl_policy::scaleout_algo algo,
+                                        size_t size,
+                                        size_t comm_size);
 
     size_t size;
     size_t comm_size;
     ccl_datatype dtype;
     bool is_recording;
 };
+
+// Per-message-size chunk sizes for the CCL_SYCL_<COLL>_SIMPLE_CHUNK_SIZE envs,
+// parsed with the same "<value>:<lo>-<hi>;..." syntax as CCL_SYCL_ALLREDUCE_LL.
+// Values are chunk sizes in bytes; 0 (or an empty spec) disables chunking.
+using simple_chunk_size_table_t = ccl_selection_table_t<size_t>;
+simple_chunk_size_table_t parse_simple_chunk_size_spec(const char* env_name,
+                                                       const std::string& spec);
+size_t select_simple_chunk_size(const simple_chunk_size_table_t& table, size_t msg_bytes);

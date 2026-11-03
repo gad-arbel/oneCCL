@@ -20,8 +20,7 @@
 #include "common/utils/sycl_utils.hpp"
 #endif // CCL_ENABLE_SYCL
 #include "common/api_wrapper/pmix_api_wrapper.hpp"
-
-#include <netdb.h>
+#include "atl/util/pm/pmi_occp.h"
 
 // atl_ofi
 static int call_count_id = 1;
@@ -32,24 +31,13 @@ atl_ofi::~atl_ofi() {
     }
 }
 
-std::string resolve_hostname_to_ip(const std::string& hostname) {
-    struct addrinfo hints = {};
-    struct addrinfo* res = nullptr;
-    char ipstr[INET_ADDRSTRLEN] = { 0 };
-
-    hints.ai_family = AF_INET; // IPv4 only
-
-    int rc = getaddrinfo(hostname.c_str(), nullptr, &hints, &res);
-    if (rc != 0 || !res) {
-        LOG_ERROR("Failed to resolve hostname: ", hostname);
-        return "";
-    }
-
-    struct sockaddr_in* addr = (struct sockaddr_in*)res->ai_addr;
-    inet_ntop(AF_INET, &(addr->sin_addr), ipstr, sizeof(ipstr));
-    freeaddrinfo(res);
-
-    return std::string(ipstr);
+/* The OCCP client belongs to the communicator's pmi, so the transport itself
+ * holds no OCCP state: a second communicator brings its own pmi and client.
+ * Returns nullptr for every non-OCCP bootstrap channel, which is what all the
+ * OCCP branches below are gated on. */
+static occp_client_t* get_occp_client(std::shared_ptr<ipmi> pmi) {
+    auto occp_pmi = std::dynamic_pointer_cast<pmi_occp>(pmi);
+    return occp_pmi ? occp_pmi->get_client() : nullptr;
 }
 
 atl_status_t atl_ofi::init(int* argc,
@@ -70,7 +58,7 @@ atl_status_t atl_ofi::init(int* argc,
     int open_nw_provs = 1;
     int enable_shm = 0;
     bool should_open_provs = true;
-    std::string server_hostname = ccl::global_data::env().occp_server_hostname;
+    occp_client_t* occp_client = nullptr;
 
     enable_shm = attr->in.enable_shm;
 
@@ -106,51 +94,11 @@ atl_status_t atl_ofi::init(int* argc,
     coord.global_count = pmi->get_size();
     coord.global_idx = pmi->get_rank();
 
-    // Setup OCCP server address/port and create server/client (only when OCCP mode is enabled)
-    if (ccl::global_data::env().kvs_init_mode == ccl::kvs_mode::occp) {
-        occp_srv_ip_ = resolve_hostname_to_ip(server_hostname);
-        if (occp_srv_ip_.empty()) {
-            LOG_ERROR("Could not resolve OCCP server hostname to IP");
-            return ATL_STATUS_FAILURE;
-        }
-        occp_srv_addr_ = sockaddr_t(occp_srv_ip_.c_str(), occp_srv_port_);
-
-        // Start OCCP server only on rank 0
-        if (coord.global_idx == 0 && !occp_server_) {
-            const auto& env = ccl::global_data::env();
-            LOG_INFO("OCCP server config: io_threads=",
-                     env.occp_server_io_threads,
-                     ", op_timeout=",
-                     env.occp_server_op_timeout,
-                     ", ranks_per_thread=",
-                     env.occp_server_ranks_per_thread);
-            occp_server_.reset(
-                new occp_server_t(occp_srv_addr_,
-                                  static_cast<uint32_t>(env.occp_server_io_threads),
-                                  8, // batch_size (default)
-                                  static_cast<uint32_t>(env.occp_server_op_timeout),
-                                  static_cast<uint32_t>(env.occp_server_ranks_per_thread)));
-            LOG_INFO("OCCP server started on rank 0: ", server_hostname, ":", occp_srv_port_);
-            sleep(1); // Let server start
-        }
-
-        // Create OCCP client on every rank
-        const auto& env = ccl::global_data::env();
-        LOG_DEBUG("OCCP client config: io_threads=",
-                  env.occp_client_io_threads,
-                  ", op_timeout=",
-                  env.occp_client_op_timeout);
-        occp_client_.reset(new occp_client_t(coord.global_idx,
-                                             occp_srv_addr_,
-                                             static_cast<uint32_t>(env.occp_client_io_threads),
-                                             2, // batch_size (default)
-                                             static_cast<uint32_t>(env.occp_client_op_timeout)));
-    }
+    occp_client = get_occp_client(pmi);
 
     ccl_logger::set_global_idx(coord.global_idx);
 
-    ret = atl_ofi_get_local_proc_coord(
-        coord, pmi, occp_client_.get(), occp_srv_port_, occp_server_.get());
+    ret = atl_ofi_get_local_proc_coord(coord, pmi, occp_client);
     if (ret) {
         LOG_ERROR("atl_ofi_get_local_proc_coord error");
         goto err;
@@ -174,10 +122,51 @@ atl_status_t atl_ofi::init(int* argc,
 
     /*
      * Domain selection based on local rank index
-     * If CCL_OFI_DOMAIN_NAMES is set, parse the comma-separated list and assign
-     * the domain corresponding to local rank index for better fabric resource utilization
+     *
+     * CCL_OFI_DOMAIN_NAMES has two forms and they reach libfabric differently. Comma-separated groups
+     * of ':'-separated names, one group per local rank (parsed and validated by
+     * env_data::parse_ofi_domain_groups()): nothing is
+     * pinned, so fi_getinfo returns every domain and atl_ofi_open_nw_provs() opens this rank's group
+     * out of it, one provider per name in the order written. A plain comma list, one domain per local
+     * rank: this rank's name is pinned in the hints, so fi_getinfo returns that domain alone.
      */
-    if (ccl::global_data::env().ofi_domain_names != CCL_ENV_STR_NOT_SPECIFIED) {
+    if (!ccl::global_data::env().ofi_domain_groups.empty()) {
+        const auto& domain_groups = ccl::global_data::env().ofi_domain_groups;
+        const int local_idx = coord.local_idx;
+
+        // Missing a group is fatal rather than ignored: this rank would sit on a different number of
+        // providers than the others, surfacing much later as a recv that never matches.
+        CCL_THROW_IF_NOT(local_idx >= 0 && local_idx < static_cast<int>(domain_groups.size()),
+                         "no ",
+                         CCL_OFI_DOMAIN_NAMES,
+                         " group for local rank ",
+                         local_idx,
+                         ": \"",
+                         ccl::global_data::env().ofi_domain_names,
+                         "\" holds ",
+                         domain_groups.size(),
+                         " group(s), one per local rank is required");
+
+        const std::vector<std::string>& group = domain_groups[local_idx];
+        CCL_THROW_IF_NOT(group.size() <= ATL_OFI_MAX_NW_PROV_COUNT,
+                         CCL_OFI_DOMAIN_NAMES,
+                         " group for local rank ",
+                         local_idx,
+                         " names ",
+                         group.size(),
+                         " domains, more than the ",
+                         ATL_OFI_MAX_NW_PROV_COUNT,
+                         " providers a rank can open");
+
+        ctx.mnic_exact_names = group;
+        LOG_INFO("Selected OFI domains: ",
+                 ccl::utils::vec_to_string(ctx.mnic_exact_names),
+                 " for local rank: ",
+                 local_idx,
+                 ", global rank: ",
+                 pmi->get_rank());
+    }
+    else if (ccl::global_data::env().ofi_domain_names != CCL_ENV_STR_NOT_SPECIFIED) {
         std::string domain_names_str = ccl::global_data::env().ofi_domain_names;
         std::vector<std::string> domain_list;
         std::stringstream ss(domain_names_str);
@@ -374,6 +363,7 @@ err:
 atl_status_t atl_ofi::update(std::shared_ptr<ipmi> pmi) {
     int ret;
     size_t prov_idx;
+    occp_client_t* occp_client = get_occp_client(pmi);
 
     ATL_CHECK_STATUS(pmi->pmrt_barrier(), "barrier failed");
 
@@ -388,8 +378,7 @@ atl_status_t atl_ofi::update(std::shared_ptr<ipmi> pmi) {
     coord.global_count = pmi->get_size();
     coord.global_idx = pmi->get_rank();
 
-    ret = atl_ofi_get_local_proc_coord(
-        coord, pmi, occp_client_.get(), occp_srv_port_, occp_server_.get());
+    ret = atl_ofi_get_local_proc_coord(coord, pmi, occp_client);
     if (ret)
         return ATL_OFI_RET(ret);
 
@@ -406,8 +395,7 @@ atl_status_t atl_ofi::update(std::shared_ptr<ipmi> pmi) {
     coord.validate();
 
     for (prov_idx = 0; prov_idx < ctx.prov_count; prov_idx++) {
-        ret = atl_ofi_prov_eps_connect(
-            ctx, coord, prov_idx, pmi, ep_names[prov_idx], occp_client_.get(), occp_srv_port_);
+        ret = atl_ofi_prov_eps_connect(ctx, coord, prov_idx, pmi, ep_names[prov_idx], occp_client);
         if (ret)
             return ATL_OFI_RET(ret);
     }
@@ -822,7 +810,9 @@ atl_status_t atl_ofi::get_rank2proc_map(std::shared_ptr<ipmi> pmi,
         total_named_eps += named_ep_count;
     }
 
-    if (ccl::global_data::env().kvs_init_mode == ccl::kvs_mode::occp) {
+    occp_client_t* occp_client = get_occp_client(pmi);
+
+    if (occp_client) {
         LOG_DEBUG("OCCP exchange_rank_info. rank: ", pmi_rank);
 
         rank_info_t my_info;
@@ -830,28 +820,42 @@ atl_status_t atl_ofi::get_rank2proc_map(std::shared_ptr<ipmi> pmi,
         my_info.hostname[HOSTNAME_MAX_LENGTH - 1] = '\0';
 
         std::vector<rank_info_t> ranks_info(pmi_size);
-        if (!occp_client_ ||
-            !occp_client_->exchange_rank_info(pmi_rank, pmi_size, my_info, ranks_info)) {
+        if (!occp_client->exchange_rank_info(pmi_rank, pmi_size, my_info, ranks_info)) {
             LOG_ERROR("OCCP exchange_rank_info failed");
             return ATL_STATUS_FAILURE;
         }
 
-        // Prepare endpoint arrays
-        ofi_endpoints_t my_efis(total_named_eps);
+        /* One OCCP exchange carries a single endpoint per rank, so every named
+         * endpoint of every provider gets its own exchange */
+        ofi_endpoints_t all_efis(pmi_size * total_named_eps);
         for (size_t prov_idx = 0; prov_idx < ep_names.size(); prov_idx++) {
             auto& prov = ctx.provs[prov_idx];
             size_t named_ep_count = (prov.sep ? 1 : ctx.ep_count);
-            for (size_t ep_idx = 0; ep_idx < named_ep_count; ep_idx++) {
-                size_t flat_idx = per_prov_offset[prov_idx] + ep_idx;
-                std::memcpy(my_efis[flat_idx].data, prov.eps[ep_idx].name.addr, prov.addr_len);
-            }
-        }
 
-        ofi_endpoints_t all_efis(pmi_size * total_named_eps);
-        if (!occp_client_ ||
-            !occp_client_->exchange_ofi_config(pmi_rank, pmi_size, my_efis[0], all_efis)) {
-            LOG_ERROR("OCCP exchange_ofi_config failed");
-            return ATL_STATUS_FAILURE;
+            for (size_t ep_idx = 0; ep_idx < named_ep_count; ep_idx++) {
+                auto& ep_name = prov.eps[ep_idx].name;
+                CCL_THROW_IF_NOT(ep_name.len <= sizeof(ofi_endpoint_t::data),
+                                 "ofi endpoint name (",
+                                 ep_name.len,
+                                 " bytes) does not fit into the occp payload (",
+                                 sizeof(ofi_endpoint_t::data),
+                                 " bytes)");
+
+                /* send the length fi_getname reported, the source is not longer */
+                ofi_endpoint_t my_efi;
+                std::memcpy(my_efi.data, ep_name.addr, ep_name.len);
+
+                ofi_endpoints_t peer_efis(pmi_size);
+                if (!occp_client->exchange_ofi_config(pmi_rank, pmi_size, my_efi, peer_efis)) {
+                    LOG_ERROR("OCCP exchange_ofi_config failed");
+                    return ATL_STATUS_FAILURE;
+                }
+
+                for (size_t r = 0; r < pmi_size; r++) {
+                    all_efis[r * total_named_eps + per_prov_offset[prov_idx] + ep_idx] =
+                        peer_efis[r];
+                }
+            }
         }
 
         // Use the same pattern as PMI/PMIx/SHM: fill prov_ep_names, update rank2proc_map
@@ -1193,12 +1197,12 @@ atl_status_t atl_ofi::progress_ep(atl_ep_t& ep) {
 
     /* ensure progress for all active providers */
     for (idx = 0; idx < ofi_ep->active_prov_count; idx++) {
-        atl_ofi_prov_ep_t* prov_ep;
-        prov_ep = &(ctx.provs[ofi_ep->active_prov_idxs[idx]].eps[ep_idx]);
+        atl_ofi_prov_t* prov = &(ctx.provs[ofi_ep->active_prov_idxs[idx]]);
+        atl_ofi_prov_ep_t* prov_ep = &(prov->eps[ep_idx]);
         do {
             ret = fi_cq_read(prov_ep->cq, entries, ATL_OFI_CQ_BUNCH_SIZE);
             if (ret > 0)
-                process_comps(ep, entries, ret);
+                process_comps(ep, prov, entries, ret);
             else if (ret == -FI_EAGAIN)
                 break;
             else
@@ -1209,7 +1213,10 @@ atl_status_t atl_ofi::progress_ep(atl_ep_t& ep) {
     return ATL_STATUS_SUCCESS;
 }
 
-void atl_ofi::process_comps(atl_ep_t& ep, struct fi_cq_tagged_entry* entries, ssize_t ret) {
+void atl_ofi::process_comps(atl_ep_t& ep,
+                            atl_ofi_prov_t* prov,
+                            struct fi_cq_tagged_entry* entries,
+                            ssize_t ret) {
     ssize_t idx;
     atl_ofi_req_t* comp_ofi_req;
     for (idx = 0; idx < ret; idx++) {
@@ -1217,7 +1224,7 @@ void atl_ofi::process_comps(atl_ep_t& ep, struct fi_cq_tagged_entry* entries, ss
         switch (comp_ofi_req->comp_state) {
             case ATL_OFI_COMP_POSTED:
                 comp_ofi_req->comp_state = ATL_OFI_COMP_COMPLETED;
-                cache.push(ep.idx, comp_ofi_req->mr);
+                cache.push(ep.idx, prov, comp_ofi_req->mr);
                 break;
             case ATL_OFI_COMP_COMPLETED: break;
             case ATL_OFI_COMP_PEEK_STARTED:
@@ -1278,6 +1285,7 @@ atl_status_t atl_ofi::open_providers(char* prov_env,
     ssize_t ret = 0;
     struct fi_info *prov_list = nullptr, *prov_hints = nullptr;
     atl_ofi_prov_t* prov = nullptr;
+    occp_client_t* occp_client = get_occp_client(pmi);
 
     if (prov_env && !strcmp(prov_env, ATL_OFI_SHM_PROV_NAME)) {
         if (coord.global_count != coord.local_count) {
@@ -1329,15 +1337,8 @@ atl_status_t atl_ofi::open_providers(char* prov_env,
         if (ep_names.size() < prov->idx + 1) {
             ep_names.resize(prov->idx + 1);
         }
-        ATL_CALL(atl_ofi_prov_init(ctx,
-                                   coord,
-                                   prov_list,
-                                   prov,
-                                   attr,
-                                   pmi,
-                                   ep_names[prov->idx],
-                                   occp_client_.get(),
-                                   occp_srv_port_),
+        ATL_CALL(atl_ofi_prov_init(
+                     ctx, coord, prov_list, prov, attr, pmi, ep_names[prov->idx], occp_client),
                  goto err);
         fi_freeinfo(prov_list);
         ctx.prov_count++;
@@ -1349,15 +1350,8 @@ atl_status_t atl_ofi::open_providers(char* prov_env,
     }
 
     if (open_nw_provs) {
-        ret = atl_ofi_open_nw_provs(ctx,
-                                    coord,
-                                    base_hints,
-                                    attr,
-                                    pmi,
-                                    ep_names,
-                                    log_on_error,
-                                    occp_client_.get(),
-                                    occp_srv_port_);
+        ret = atl_ofi_open_nw_provs(
+            ctx, coord, base_hints, attr, pmi, ep_names, log_on_error, occp_client);
         if (ret != ATL_STATUS_SUCCESS) {
             if (log_on_error) {
                 LOG_ERROR("atl_ofi_open_nw_provs failed with status: ", ret);
@@ -1409,10 +1403,10 @@ void atl_ofi::fi_cache::get(atl_ep_t& ep,
 #endif // CCL_ENABLE_OFI_HMEM
 }
 
-void atl_ofi::fi_cache::push(size_t idx, fid_mr* mr) {
+void atl_ofi::fi_cache::push(size_t idx, atl_ofi_prov_t* prov, fid_mr* mr) {
 #ifdef CCL_ENABLE_OFI_HMEM
     if (mr)
-        memory_regions.at(idx % memory_regions.size()).push(mr);
+        memory_regions.at(idx % memory_regions.size()).push(prov, mr);
 #endif // CCL_ENABLE_OFI_HMEM
 }
 
@@ -1444,7 +1438,7 @@ void atl_ofi::mr_cache::get(atl_ep_t& ep,
 	return;
     }
 
-    if (ccl::global_data::env().enable_atl_cache) {
+    if (prov->mr_cache_enabled) {
         key_t key(prov->domain, buf, bytes);
         auto key_value = cache.find(key);
         if (key_value != cache.end()) {
@@ -1518,16 +1512,16 @@ void atl_ofi::mr_cache::get(atl_ep_t& ep,
         fi_mr_enable(*mr);
     }
 
-    if (ccl::global_data::env().enable_atl_cache) {
+    if (prov->mr_cache_enabled) {
         key_t key(prov->domain, buf, bytes);
         LOG_DEBUG("inserted to mr cache: buf: ", buf, ", bytes: ", bytes);
         cache.insert({ std::move(key), *mr });
     }
 }
 
-void atl_ofi::mr_cache::push(fid_mr* mr) {
+void atl_ofi::mr_cache::push(atl_ofi_prov_t* prov, fid_mr* mr) {
     CCL_THROW_IF_NOT(mr);
-    if (ccl::global_data::env().enable_atl_cache) {
+    if (prov->mr_cache_enabled) {
         /* do nothing, all mem regions will be closed in clear() */
         return;
     }

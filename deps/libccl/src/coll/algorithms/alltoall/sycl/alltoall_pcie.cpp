@@ -21,6 +21,7 @@
 #include "coll/algorithms/alltoall/sycl/alltoall_pcie.hpp"
 #endif // CCL_ENABLE_SYCL
 
+template <template <typename, template <typename, int> class, bool, int> class Transmit>
 ccl::event alltoall_ll(const void *send_buf,
                        void *recv_buf,
                        size_t send_count,
@@ -34,6 +35,8 @@ ccl::event alltoall_ll(const void *send_buf,
     sycl::event sycl_e;
     sycl::queue q = global_stream->get_native_stream();
     bool recording = use_recording_path(q);
+    CCL_THROW_IF_NOT(!(recording && comm->is_multi_thread_instance()),
+                     "|CCL_SYCL| Multi-threaded algos do not support sycl_graph recording");
     const int comm_size = p2p_comm->size();
     const int comm_rank = p2p_comm->rank();
 
@@ -50,6 +53,7 @@ ccl::event alltoall_ll(const void *send_buf,
         T *peerbuf1[NRanks];
         T *ipcbuf0;
         T *ipcbuf1;
+        size_t ipcbuf_size = 0;
         if (ccl::global_data::env().sycl_ll_buffer_global) {
             // large buffer
             for (int i = 0; i < NRanks; i++) {
@@ -58,6 +62,7 @@ ccl::event alltoall_ll(const void *send_buf,
             }
             ipcbuf0 = (T *)get_large_tmp_buf(0, comm);
             ipcbuf1 = (T *)get_large_tmp_buf(1, comm);
+            ipcbuf_size = ccl::global_data::env().sycl_tmp_buf_size / ccl_large_tmp_bufs::buf_count;
         }
         else {
             // small buffer
@@ -69,12 +74,13 @@ ccl::event alltoall_ll(const void *send_buf,
             }
             ipcbuf0 = (T *)local_tmp_buf;
             ipcbuf1 = (T *)((char *)local_tmp_buf + p2p_comm->get_tmp_buf_size() / 2);
+            ipcbuf_size = p2p_comm->get_tmp_buf_size() / 2;
         }
 
         sycl::event e;
 
         if (recording) {
-            e = AllToAll<T, Proto, RingTransmit, true>::launch(
+            e = AllToAll<T, Proto, Transmit, true>::launch(
                 p2p_comm->get_pattern_data_gpu(),
                 NRanks,
                 (T *)send_buf,
@@ -82,7 +88,7 @@ ccl::event alltoall_ll(const void *send_buf,
                 offs,
                 ipcbuf0,
                 ipcbuf1,
-                RingTransmit<int, Rt64_128_PCIE, true>::ringSize / sizeof(T),
+                ipcbuf_size,
                 peerbuf1,
                 send_count,
                 comm_rank,
@@ -95,7 +101,7 @@ ccl::event alltoall_ll(const void *send_buf,
                 done);
         }
         else {
-            e = AllToAll<T, Proto, RingTransmit, false>::launch(
+            e = AllToAll<T, Proto, Transmit, false>::launch(
                 p2p_comm->get_pattern_data(),
                 NRanks,
                 (T *)send_buf,
@@ -103,7 +109,7 @@ ccl::event alltoall_ll(const void *send_buf,
                 offs,
                 ipcbuf0,
                 ipcbuf1,
-                RingTransmit<int, Rt64_128_PCIE, false>::ringSize / sizeof(T),
+                ipcbuf_size,
                 peerbuf1,
                 send_count,
                 comm_rank,
@@ -130,3 +136,25 @@ ccl::event alltoall_ll(const void *send_buf,
 
     return ccl::event::create_from_native(sycl_e);
 }
+
+template ccl::event alltoall_ll<RingTransmit>(const void *send_buf,
+                                              void *recv_buf,
+                                              size_t send_count,
+                                              const ccl::vector_class<size_t> &offsets,
+                                              ccl::datatype dtype,
+                                              ccl_comm *comm,
+                                              const std::shared_ptr<ccl_comm> p2p_comm,
+                                              ccl_stream *global_stream,
+                                              const ccl::vector_class<ccl::event> &deps,
+                                              bool &done);
+
+template ccl::event alltoall_ll<OneShotTransmit>(const void *send_buf,
+                                                 void *recv_buf,
+                                                 size_t send_count,
+                                                 const ccl::vector_class<size_t> &offsets,
+                                                 ccl::datatype dtype,
+                                                 ccl_comm *comm,
+                                                 const std::shared_ptr<ccl_comm> p2p_comm,
+                                                 ccl_stream *global_stream,
+                                                 const ccl::vector_class<ccl::event> &deps,
+                                                 bool &done);

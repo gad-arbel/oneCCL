@@ -33,25 +33,38 @@
 
 namespace ccl {
 
-static std::atomic<int> next_op_id{ 0 };
-
-// === Handshake data for non-group operations ===
-struct handshake_data {
+// === Handshake data for non-group pt2pt operations ===
+// One entry per (global_id, src, dst) triple, so concurrent pt2pt pairs on the
+// same communicator (e.g. 0->1 and 2->3) rendezvous independently. Like the
+// group path, a single entry supports one outstanding operation per direction
+// per pair: the flags are reset by their consumer so the entry can be reused by
+// the next send/recv on that pair.
+struct pt2pt_rendezvous_entry {
     std::mutex m;
     std::condition_variable cv;
 
-    // Indicate that the receiver has published its pointer
+    // Indicate that the receiver has published its buffer pointer
     bool recv_published = false;
 
-    // Indicate that the sender has finished its memcpy
+    // Indicate that the sender has answered the receiver: either submitted its
+    // memcpy, or skipped it because send_bytes != recv_bytes
     bool copy_done = false;
-};
 
-struct op_id_entry {
-    std::mutex m;
-    std::condition_variable cv;
-    int id = -1;
-    bool ready = false;
+    // Size of the sender's buffer in bytes, published with copy_done. Both sides
+    // compare it against recv_bytes, so a size mismatch fails on both ranks
+    // instead of leaving the receiver waiting.
+    size_t send_bytes = 0;
+
+    // Receiver's buffer, published under the mutex. All MT ranks live in the same
+    // process, so the sender can copy into it directly - same as the group path.
+    void *recv_ptr = nullptr;
+    // Size of the receiver's buffer in bytes, published with recv_ptr
+    size_t recv_bytes = 0;
+#ifdef CCL_ENABLE_SYCL
+    // Receiver's "my deps are done, my buffer is ready" event, and the sender's
+    // resulting copy event. Both are published under the mutex.
+    sycl::event recv_ready, copy_event;
+#endif // CCL_ENABLE_SYCL
 };
 
 // === Simplified group buffer management ===
@@ -75,26 +88,21 @@ public:
     std::unordered_map<int, rank_info_vec_t> rank_info_vec_globs;
     std::unordered_map<int, std::vector<char>> all_hostnames_raw_globs;
     std::unordered_map<int, std::unordered_map<int, std::vector<void *>>> hash_table;
-    std::unordered_map<int, std::unordered_map<int, std::vector<void *>>> pt2pt_hash_table;
-#ifdef CCL_ENABLE_SYCL
-    sycl::event copy_event;
-#endif // CCL_ENABLE_SYCL
-    std::unordered_map<int, handshake_data> handshakes;
-    std::unordered_map<uint64_t, op_id_entry> op_id_map;
-#ifdef CCL_ENABLE_SYCL
-    std::unordered_map<int, sycl::event> receiver_ready_events_map;
-#endif // CCL_ENABLE_SYCL
+    // === Non-group pt2pt rendezvous, keyed per (global_id, src, dst) ===
+    // unordered_map is node-based, so references handed out by
+    // get_pt2pt_rendezvous() stay valid across later insertions; only the
+    // lookup/insert itself needs the mutex.
+    std::unordered_map<uint64_t, pt2pt_rendezvous_entry> pt2pt_rendezvous;
+    std::mutex pt2pt_rendezvous_mutex;
     // === Simplified group buffer management ===
     std::vector<std::vector<std::vector<group_buffer_entry>>> group_buffers;
     std::mutex allocation_mutex;
     std::mutex barrier_waits_mutex;
     std::mutex rank_info_mutex;
     std::mutex hostnames_mutex;
-#ifdef CCL_ENABLE_SYCL
-    std::mutex events_mutex;
-#endif
 
-    bool is_multi_thread_instance = false;
+    // Set by initExt() on one thread and read by others, so atomic.
+    std::atomic<bool> is_multi_thread_instance{ false };
     // int current_global_id = ccl_comm::invalid_id;
     std::unordered_map<int, std::unique_ptr<pthread_barrier_t>> barrier_waits;
 
@@ -102,107 +110,28 @@ public:
     shared_resources(const shared_resources &) = delete;
     shared_resources &operator=(const shared_resources &) = delete;
 
-    ~shared_resources() {
-        hash_table.clear();
-        pt2pt_hash_table.clear();
-        barrier_waits.clear();
-        rank_info_vec_globs.clear();
-        barrier_initialized_flags.clear();
-        resource_mutexes.clear();
-        all_hostnames_raw_globs.clear();
-    }
-#ifdef CCL_ENABLE_SYCL
-    void set_receiver_ready_event(int op_id, const sycl::event &evt) {
-        std::lock_guard<std::mutex> lk(events_mutex);
-        receiver_ready_events_map[op_id] = evt;
-    }
+    ~shared_resources();
 
-    sycl::event get_receiver_ready_event(int op_id) {
-        std::lock_guard<std::mutex> lk(events_mutex);
-        return receiver_ready_events_map.at(op_id);
-    }
-#endif // CCL_ENABLE_SYCL
-    void resize_rank_info_vec_glob(size_t new_size, int global_id) {
-        std::lock_guard<std::mutex> lock(rank_info_mutex);
-        rank_info_vec_globs[global_id].resize(new_size);
-    }
+    // Rendezvous slot for one pt2pt direction: src -> dst within `global_id`.
+    // Both peers of a pair derive the same key, and distinct pairs get distinct
+    // keys, so concurrent pt2pt operations on one communicator cannot alias.
+    pt2pt_rendezvous_entry &get_pt2pt_rendezvous(int global_id, int src, int dst);
 
-    void resize_all_hostnames_raw(size_t new_size, int global_id) {
-        std::lock_guard<std::mutex> lock(hostnames_mutex);
-        all_hostnames_raw_globs[global_id].resize(new_size);
-    }
+    void resize_rank_info_vec_glob(size_t new_size, int global_id);
 
-    std::mutex &get_resource_mutex(int global_id) {
-        static std::mutex mu;
-        std::lock_guard<std::mutex> guard(mu);
-        return resource_mutexes[global_id];
-    }
+    void resize_all_hostnames_raw(size_t new_size, int global_id);
 
-    std::vector<char> &get_all_hostnames_raw_glob(int global_id) {
-        std::lock_guard<std::mutex> lock(hostnames_mutex);
-        return all_hostnames_raw_globs[global_id];
-    }
+    std::mutex &get_resource_mutex(int global_id);
 
-    rank_info_vec_t &get_rank_info_vec_glob(int global_id) {
-        std::lock_guard<std::mutex> lock(rank_info_mutex);
-        return rank_info_vec_globs[global_id];
-    }
+    std::vector<char> &get_all_hostnames_raw_glob(int global_id);
 
-    void init_barrier_wait(int threads_num, int global_id) {
-        pthread_barrier_t *barrier_ptr = nullptr;
-        {
-            std::lock_guard<std::mutex> guard(barrier_waits_mutex);
-            if (barrier_initialized_flags.find(global_id) == barrier_initialized_flags.end() ||
-                !barrier_initialized_flags[global_id]) {
-                barrier_waits[global_id] = std::make_unique<pthread_barrier_t>();
-                int rc = pthread_barrier_init(barrier_waits[global_id].get(), nullptr, threads_num);
-                CCL_THROW_IF_NOT(rc == 0, "pthread_barrier_init failed, rc: ", rc);
-                barrier_initialized_flags[global_id] = true;
-            }
-            barrier_ptr = barrier_waits[global_id].get();
-        }
+    rank_info_vec_t &get_rank_info_vec_glob(int global_id);
 
-        pthread_barrier_wait(barrier_ptr);
-    }
+    void init_barrier_wait(int threads_num, int global_id);
 
-    pthread_barrier_t* get_barrier(int global_id) {
-        std::lock_guard<std::mutex> guard(barrier_waits_mutex);
-        auto it = barrier_waits.find(global_id);
-        CCL_THROW_IF_NOT(it != barrier_waits.end() && it->second,
-                         "barrier_waits is not initialized for global_id ",
-                         global_id);
-        return it->second.get();
-    }
+    pthread_barrier_t *get_barrier(int global_id);
 
-    int get_node_rank(int ranks[2], int pair_comm_size) {
-        // Possibly this calculation has to be universalized
-        return ranks[0] * pair_comm_size + ranks[1];
-    }
-
-    int get_shared_op_id(int global_id, bool is_sender) {
-        auto &entry = op_id_map[global_id];
-
-        if (is_sender) {
-            // sender path: create & broadcast
-            {
-                std::unique_lock<std::mutex> lk(entry.m);
-                entry.id = next_op_id.fetch_add(1, std::memory_order_relaxed);
-                entry.ready = true;
-            } // lock is automatically released here
-            entry.cv.notify_one(); // wake exactly one waiting receiver
-            return entry.id;
-        }
-        else {
-            // receiver path: wait until sender sets it
-            std::unique_lock<std::mutex> lk(entry.m);
-            entry.cv.wait(lk, [&] {
-                return entry.ready;
-            });
-            int id = entry.id;
-            entry.ready = false; // reset so the same entry can be reused
-            return id;
-        }
-    }
+    int get_node_rank(int ranks[2], int pair_comm_size);
 };
 
 } // namespace ccl

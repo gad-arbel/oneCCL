@@ -151,8 +151,13 @@ struct Broadcast {
                             ll_pattern_data.process_update(
                                 pattern_type::collective, global_current_id, rank, -1, n_steps);
                         }
-                        check_zero_buffers_gpu(
-                            ll_pattern_data, it, barrier_data, ipcbuf0, ipcbuf1, tmp_buf_size);
+                        check_zero_buffers_gpu(ll_pattern_data,
+                                               it,
+                                               barrier_data,
+                                               ipcbuf0,
+                                               ipcbuf1,
+                                               tmp_buf_size,
+                                               pattern_type::collective);
                     });
             });
 

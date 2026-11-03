@@ -21,10 +21,11 @@
 #include <unistd.h>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <string>
 #include <system_error>
 
 #include <sycl/sycl.hpp>
-#include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/oneapi/experimental/enqueue_functions.hpp>
 #include "common/log/log.hpp"
 #include "umf/ipc.hpp"
@@ -298,11 +299,8 @@ std::array<T *, N> get_ipc_ptrs(std::shared_ptr<ccl_comm> comm,
 }
 #endif // CCL_ENABLE_UMF
 
-void pipe_prep(size_t min_msg_count,
-               size_t max_msg_count,
-               size_t dsize,
-               size_t pipeline_chunk_size,
-               size_t &nchunks);
+// max_msg_count: the largest block in elements
+void pipe_prep(size_t max_msg_count, size_t dsize, size_t pipeline_chunk_size, size_t &nchunks);
 
 sycl::event pipe_sendrecv(sycl::queue q,
                           const void *send_buf,
@@ -352,7 +350,11 @@ sycl::event gpu_recv_plain(sycl::queue &q,
                            const ccl::vector_class<sycl::event> &deps,
                            bool use_rdma);
 
-void do_ipc_exchangeExt(
+// Returns this exchange's entry (node rank -> pointers). Inserts by other communicators can
+// rehash hash_table but never move its elements, so the entry can be read without the lock
+// from the end of this call's barrier until this communicator's next exchange on the same id.
+// With is_pt2pt there is no barrier, and the caller must synchronize before reading (MLSL-5024).
+const std::unordered_map<int, std::vector<void *>> &do_ipc_exchangeExt(
     ccl_comm *comm,
     std::unordered_map<int, std::unordered_map<int, std::vector<void *>>> &hash_table,
     ccl_stream *stream,
@@ -360,20 +362,24 @@ void do_ipc_exchangeExt(
     int exchange_id = 0,
     bool is_pt2pt = false);
 
+// Collects the peers' IPC pointers for handle_index from an entry returned by do_ipc_exchangeExt.
 template <typename T, int N>
-std::array<T *, N> get_ipc_ptrsExt(
-    ccl::shared_resources &resources,
-    std::shared_ptr<ccl_comm> comm,
-    std::unordered_map<int, std::unordered_map<int, std::vector<void *>>> &hash_table,
-    const int comm_index,
-    const int handle_index,
-    void *local_ptr,
-    int exchange_id = 0,
-    std::shared_ptr<ccl_comm> even_comm = nullptr,
-    std::shared_ptr<ccl_comm> pair_comm = nullptr) {
+std::array<T *, N> get_ipc_ptrsExt(ccl::shared_resources &resources,
+                                   std::shared_ptr<ccl_comm> comm,
+                                   const std::unordered_map<int, std::vector<void *>> &exchange,
+                                   const int comm_index,
+                                   const int handle_index,
+                                   void *local_ptr,
+                                   std::shared_ptr<ccl_comm> even_comm = nullptr,
+                                   std::shared_ptr<ccl_comm> pair_comm = nullptr) {
     std::array<T *, N> remote_ptrs = {};
     const int rank = comm->rank();
     const int size = comm->size();
+
+    // The loop below indexes remote_ptrs by rank, so the array must cover the
+    // whole comm. Checked unconditionally: CCL_ASSERT is compiled out in release
+    // builds, where an undersized N would silently corrupt the caller's stack.
+    CCL_THROW_IF_NOT(size <= N, "get_ipc_ptrsExt: comm size ", size, " exceeds array size ", N);
 
     remote_ptrs[rank] = (T *)local_ptr;
     for (int i = 1; i < size; i++) {
@@ -385,12 +391,18 @@ std::array<T *, N> get_ipc_ptrsExt(
             peer_rank_node = resources.get_node_rank(ranks, pair_comm->size());
             // peer_rank_node = get_node_rank(ranks, pair_comm->size());
         }
-        if (hash_table.find(exchange_id) != hash_table.end() &&
-            hash_table[exchange_id].find(peer_rank_node) != hash_table[exchange_id].end()) {
-            const auto &ptr = hash_table[exchange_id][peer_rank_node][handle_index];
-            remote_ptrs[peer_rank] = (T *)ptr;
+        const auto peer = exchange.find(peer_rank_node);
+        if (peer != exchange.end() && handle_index < (int)peer->second.size()) {
+            remote_ptrs[peer_rank] = (T *)peer->second[handle_index];
         }
-        CCL_ASSERT(remote_ptrs[peer_rank] != NULL);
+        // A missing pointer would otherwise reach a GPU kernel as NULL in release builds.
+        CCL_THROW_IF_NOT(remote_ptrs[peer_rank] != NULL,
+                         "get_ipc_ptrsExt: no IPC pointer from node rank ",
+                         peer_rank_node,
+                         " for handle ",
+                         handle_index,
+                         ", comm id ",
+                         comm->global_current_id);
     }
     return remote_ptrs;
 }
@@ -415,6 +427,21 @@ std::array<void *, MAX_NODE_RANKS> get_remote_large_tmp_buf(int index, ccl_comm 
 
 size_t get_tmp_buf_size_per_rank();
 
+// The large tmp buffer is sized in whole pages, so a segment taken from the allocation is always
+// a multiple of this. The simple ring kernels corrupt data for a segment that is not - pass this
+// as the alignment of any segment they are given.
+constexpr size_t large_tmp_buf_align = 4096;
+
+// Bytes of one pipeline slot of the large tmp buffer for the simple ring kernels.
+// `requested` is the value of `env_name`, the per-collective
+// CCL_SYCL_*_SIMPLE_RING_SEGMENT_SIZE (0 = CCL_SYCL_TMP_BUF_SIZE / pipeline_depth). The result
+// is rounded down to `align_bytes` and clamped so that segment * pipeline_depth fits the
+// allocation.
+size_t get_simple_ring_segment_size(const char* env_name,
+                                    size_t requested,
+                                    int pipeline_depth,
+                                    size_t align_bytes);
+
 std::vector<sycl::event> get_sycl_events(const ccl::vector_class<ccl::event> &deps);
 
 sycl::event invoke_p2p_barrier(const std::shared_ptr<ccl_comm> comm,
@@ -431,6 +458,35 @@ int get_num_lce();
 sycl::queue get_mce_queue(sycl::queue q);
 
 sycl::queue get_lce_queue(sycl::queue q, int index);
+
+// In-order queue pinned to one copy engine.
+struct pinned_copy_queue {
+    std::optional<sycl::queue> queue; // empty if no such engine is available
+    int ordinal = -1;
+    int index = -1;
+    const char *fallback_reason = nullptr;
+};
+
+// last engine of the largest copy-only group; `last` needs two or more
+enum class copy_engine_pick { last, last_or_only };
+
+// The queue that `stream` keeps in `slot`, made on first use. Empty with a fallback_reason if
+// it cannot be made; Level Zero errors are logged, not thrown.
+const pinned_copy_queue &get_stream_copy_engine_queue(ccl_stream *stream,
+                                                      std::shared_ptr<pinned_copy_queue> &slot,
+                                                      copy_engine_pick pick);
+
+// CRI copy-engine collectives: queue for the self copy (local send block -> local recv block),
+// so it runs on its own copy engine in parallel with the remote copies on stream's queue. Empty
+// to keep the self copy on stream's queue: other devices, self copies below min_bytes (the
+// collective's CCL_SYCL_<COLL>_SELF_COPY_THRESHOLD; 0 = never), recording, multi-thread
+// communicators, a fallback_reason from the caller, or no second copy engine.
+// On CRI the decision is logged at debug level.
+std::optional<sycl::queue> get_self_copy_queue(ccl_stream *stream,
+                                               const char *collective,
+                                               size_t self_bytes,
+                                               size_t min_bytes,
+                                               const char *fallback_reason = nullptr);
 
 sycl::queue &get_default_queue();
 
@@ -580,7 +636,7 @@ ccl::event invoke_collective(L lambda, ccl::datatype dtype) {
             e = lambda.template operator()<sycl::half>();
 #else
             CCL_THROW(
-                "The Sycl compilers do not support Sycl::vec kernels with float16, please switch to ESIMD kernels, or build oneCCL with the latest version of cmake and oneAPI compiler");
+                "The Sycl compilers do not support Sycl::vec kernels with float16, please build oneCCL with the latest version of cmake and oneAPI compiler");
 #endif
             break;
         case ccl::datatype::bfloat16:
@@ -588,7 +644,7 @@ ccl::event invoke_collective(L lambda, ccl::datatype dtype) {
             e = lambda.template operator()<sycl::ext::oneapi::bfloat16>();
 #else
             CCL_THROW(
-                "The Sycl compilers do not support Sycl::vec kernels with bfloat16, please switch to ESIMD kernels, or build oneCCL with oneAPI compiler that is newer than 2024.2.0");
+                "The Sycl compilers do not support Sycl::vec kernels with bfloat16, please build oneCCL with oneAPI compiler that is newer than 2024.2.0");
 #endif
             break;
         case ccl::datatype::int8: e = lambda.template operator()<int8_t>(); break;
@@ -614,7 +670,7 @@ sycl::event invoke_collective_sycl(L lambda, ccl::datatype dtype) {
             e = lambda.template operator()<sycl::half>();
 #else
             CCL_THROW(
-                "The Sycl compilers do not support Sycl::vec kernels with float16, please switch to ESIMD kernels, or build oneCCL with the latest version of cmake and oneAPI compiler");
+                "The Sycl compilers do not support Sycl::vec kernels with float16, please build oneCCL with the latest version of cmake and oneAPI compiler");
 #endif
             break;
         case ccl::datatype::bfloat16:
@@ -622,7 +678,7 @@ sycl::event invoke_collective_sycl(L lambda, ccl::datatype dtype) {
             e = lambda.template operator()<sycl::ext::oneapi::bfloat16>();
 #else
             CCL_THROW(
-                "The Sycl compilers do not support Sycl::vec kernels with bfloat16, please switch to ESIMD kernels, or build oneCCL with oneAPI compiler that is newer than 2024.2.0");
+                "The Sycl compilers do not support Sycl::vec kernels with bfloat16, please build oneCCL with oneAPI compiler that is newer than 2024.2.0");
 #endif
             break;
         case ccl::datatype::int8: e = lambda.template operator()<int8_t>(); break;
@@ -650,7 +706,7 @@ sycl::event invoke_scaleout_collective(L lambda, ccl::datatype dtype) {
             e = lambda.template operator()<sycl::half>();
 #else
             CCL_THROW(
-                "The Sycl compilers do not support Sycl::vec kernels with float16, please switch to ESIMD kernels, or build oneCCL with the latest version of cmake and oneAPI compiler");
+                "The Sycl compilers do not support Sycl::vec kernels with float16, please build oneCCL with the latest version of cmake and oneAPI compiler");
 #endif
             break;
         case ccl::datatype::bfloat16:
@@ -658,7 +714,7 @@ sycl::event invoke_scaleout_collective(L lambda, ccl::datatype dtype) {
             e = lambda.template operator()<sycl::ext::oneapi::bfloat16>();
 #else
             CCL_THROW(
-                "The Sycl compilers do not support Sycl::vec kernels with bfloat16, please switch to ESIMD kernels, or build oneCCL with oneAPI compiler that is newer than 2024.2.0");
+                "The Sycl compilers do not support Sycl::vec kernels with bfloat16, please build oneCCL with oneAPI compiler that is newer than 2024.2.0");
 #endif
             break;
         case ccl::datatype::int8: e = lambda.template operator()<int8_t>(); break;
@@ -672,22 +728,6 @@ sycl::event invoke_scaleout_collective(L lambda, ccl::datatype dtype) {
         default: CCL_THROW("unsupported datatype ", dtype); break;
     }
     return e;
-}
-
-// call by ESIMD kernel
-template <size_t align, typename L>
-auto invoke_esimd_function(L lambda, int world) {
-    switch (world) {
-        case 2: lambda.template operator()<2, align>(); break;
-        case 4: lambda.template operator()<4, align>(); break;
-        case 6: lambda.template operator()<6, align>(); break;
-        case 8: lambda.template operator()<8, align>(); break;
-        case 10: lambda.template operator()<10, align>(); break;
-        case 12: lambda.template operator()<12, align>(); break;
-        case 14: lambda.template operator()<14, align>(); break;
-        case 16: lambda.template operator()<16, align>(); break;
-        default: break;
-    }
 }
 
 //
@@ -704,7 +744,7 @@ sycl::event invoke_pcie_type(L lambda, int NRanks, ccl::datatype dtype) {
             e = lambda.template operator()<sycl::half, Proto>(NRanks);
 #else
             CCL_THROW(
-                "The Sycl compilers do not support Sycl::vec kernels with float16, please switch to ESIMD kernels, or build oneCCL with the latest version of cmake and oneAPI compiler");
+                "The Sycl compilers do not support Sycl::vec kernels with float16, please build oneCCL with the latest version of cmake and oneAPI compiler");
 #endif
             break;
         case ccl::datatype::bfloat16:
@@ -712,7 +752,7 @@ sycl::event invoke_pcie_type(L lambda, int NRanks, ccl::datatype dtype) {
             e = lambda.template operator()<sycl::ext::oneapi::bfloat16, Proto>(NRanks);
 #else
             CCL_THROW(
-                "The Sycl compilers do not support Sycl::vec kernels with bfloat16, please switch to ESIMD kernels, or build oneCCL with oneAPI compiler that is newer than 2024.2.0");
+                "The Sycl compilers do not support Sycl::vec kernels with bfloat16, please build oneCCL with oneAPI compiler that is newer than 2024.2.0");
 #endif
             break;
         case ccl::datatype::float32: e = lambda.template operator()<float, Proto>(NRanks); break;
@@ -780,6 +820,20 @@ inline bool can_use_full_vector(const void *send_buf,
                                 const int alignment = 4) {
     return dsize >= 4 || is_aligned(send_buf, recv_buf, count, dsize, alignment) &&
                              ccl::global_data::env().sycl_full_vector;
+}
+
+// A rank's block starts at buf + offsets[r], so an aligned base buffer does not
+// make every block aligned: a 2-byte dtype with an odd count leaves every other
+// block start 2-byte aligned, and a vector store there writes the wrong place.
+inline bool offsets_aligned(const void *buf,
+                            const ccl::vector_class<size_t> &offsets,
+                            const int alignment = 4) {
+    for (const size_t offset : offsets) {
+        if (((size_t)buf + offset) % alignment) {
+            return false;
+        }
+    }
+    return true;
 }
 
 inline sycl::event get_last_event(const sycl::queue &q) {
@@ -888,12 +942,81 @@ inline size_t calculate_chunking_pack_count(size_t chunk_size,
     else {
         // make sure chunk can pack the whole dtype element
         int align_typesize = std::max(4, typesize);
-        chunk_size = chunk_size / align_typesize * align_typesize;
-        max_pack_count = chunk_size / typesize;
-        CCL_ASSERT(max_pack_count > 0);
+        max_pack_count = chunk_size / align_typesize * align_typesize / typesize;
+        CCL_THROW_IF_NOT(max_pack_count > 0,
+                         "chunk size ",
+                         chunk_size,
+                         " bytes cannot hold one element of ",
+                         typesize,
+                         " bytes; it must be at least ",
+                         align_typesize);
     }
     nchunks = (count + max_pack_count - 1) / max_pack_count;
     return nchunks;
+}
+
+// Segment size requested of the simple ring. The narrow (4 byte) vector path corrupts data once
+// a rank's slice is split across segments, so it drops the request and takes the default of one
+// whole pipeline slot.
+inline size_t simple_ring_segment_request(const char *env_name,
+                                          size_t requested,
+                                          bool use_full_vector) {
+    if (use_full_vector || requested == 0) {
+        return requested;
+    }
+    LOG_WARN_ONCE("the narrow vector path runs the simple ring unsegmented, ignoring ",
+                  env_name,
+                  " = ",
+                  requested,
+                  "; ");
+    return 0;
+}
+
+// True when every chunk of this decomposition keeps the full vector width. A chunk shifts the
+// buffers and shortens the per-rank slice, so one spec can mix both widths within a collective.
+inline bool chunks_use_full_vector(size_t chunk_size,
+                                   const void *send_buf,
+                                   const void *recv_buf,
+                                   size_t count,
+                                   int typesize,
+                                   int nranks) {
+    if (count == 0) {
+        return true;
+    }
+    size_t max_pack_count;
+    const size_t nchunks = calculate_chunking_pack_count(chunk_size, count, typesize, max_pack_count);
+    size_t offset = 0;
+    for (size_t iter = 0; iter < nchunks; iter++) {
+        const size_t pack_count = (iter < nchunks - 1) ? max_pack_count : count - offset;
+        if (!can_use_full_vector((const char *)send_buf + offset * typesize,
+                                 (const char *)recv_buf + offset * typesize,
+                                 pack_count / nranks,
+                                 typesize)) {
+            return false;
+        }
+        offset += pack_count;
+    }
+    return true;
+}
+
+// Calls run_chunk(offset, pack_count) for each chunk_size-byte slice of count elements.
+// Callers do their IPC exchange once beforehand and run only the kernels per chunk.
+template <typename F>
+ccl::event for_each_chunk(size_t chunk_size, size_t count, int typesize, F &&run_chunk) {
+    if (count == 0) {
+        return run_chunk(size_t{ 0 }, size_t{ 0 });
+    }
+    size_t max_pack_count;
+    const size_t nchunks = calculate_chunking_pack_count(chunk_size, count, typesize, max_pack_count);
+    ccl::event e;
+    size_t offset = 0;
+    for (size_t iter = 0; iter < nchunks; iter++) {
+        const size_t pack_count = (iter < nchunks - 1) ? max_pack_count : count - offset;
+        LOG_DEBUG("chunk ", iter, "/", nchunks, " offset: ", offset, " count: ", pack_count);
+        e = run_chunk(offset, pack_count);
+        offset += pack_count;
+    }
+    return e;
 }
 
 inline bool transport_rdma_enabled() {

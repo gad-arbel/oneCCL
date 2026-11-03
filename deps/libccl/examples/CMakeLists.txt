@@ -30,9 +30,9 @@ else()
     message(FATAL_ERROR "Please define CCL_ROOT environment variable")
 endif()
 
-if (DEFINED ENV{I_MPI_ROOT})
-    set(I_MPI_ROOT "$ENV{I_MPI_ROOT}")
-endif()
+find_package(MPI REQUIRED)
+# Installing onto itself with a build RPATH deletes the binary (#962).
+set(CMAKE_SKIP_RPATH TRUE)
 
 if (DEFINED ENV{ONEAPI_ROOT})
     set(ONEAPI_ROOT "$ENV{ONEAPI_ROOT}")

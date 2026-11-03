@@ -35,6 +35,10 @@ public:
     sycl_scaleout_tune_attr allreduce()      const;
     sycl_scaleout_tune_attr reduce_scatter() const;
     sycl_scaleout_tune_attr alltoall()       const;
+    sycl_scaleout_tune_attr alltoallv()      const;
+    sycl_scaleout_tune_attr scatter()        const;
+    sycl_scaleout_tune_attr broadcast()      const;
+    sycl_scaleout_tune_attr reduce()         const;
 
     sycl_policy::policy_query query;
 };

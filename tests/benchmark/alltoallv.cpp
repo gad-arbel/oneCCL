@@ -15,7 +15,7 @@
 */
 
 #include "common.h"
-
+#include <mutex>
 #include <vector>
 
 // seed for initData() function, which is used to fill the send buffer
@@ -23,6 +23,21 @@
 #define PRIME_SEED 33
 
 namespace {
+
+/* In-place AllToAllV results cannot be verified by this benchmark:
+ * the per-peer displacements are non-uniform, so the "expected" buffer
+ * cannot be built from the send buffer. Nonetheless the in-place case
+ * is still possible to run for BW measurement w/o data validation
+ */
+void AllToAllVNoDataValidation() {
+    if (!is_main_thread)
+        return;
+    static std::once_flag flag;
+    std::call_once(flag, [] {
+        PRINT("# AllToAllV: in-place results are not validated "
+              "(errors reported as N/A for in-place runs)\n");
+    });
+}
 
 /* We initialize per-peer send_counts and recv_counts by evenly splitting
  * total_count across all rank-pairs, then distributing the remainder so
@@ -71,6 +86,7 @@ testResult_t AllToAllVInitData(struct threadArgs *args, onecclDataType_t type,
                                int in_place) {
     size_t const total_count = args->nbytes / word_size(type);
     int const nranks = args->nProcs * args->nThreads * args->nGpus;
+    args->reportErrors = in_place ? 0 : 1;
     size_t const type_size = word_size(type);
 
     for (int i = 0; i < args->nGpus; i++) {
@@ -85,7 +101,8 @@ testResult_t AllToAllVInitData(struct threadArgs *args, onecclDataType_t type,
                       ->memset(args->recvbuffs[i], 0, args->expectedBytes)
                       .wait());
 
-        void *data_to_init = args->sendbuffs[i];
+        void *data_to_init =
+            (in_place != 0) ? args->recvbuffs[i] : args->sendbuffs[i];
         TESTCHECK(initData(args->queues[i], data_to_init, total_count, type,
                            PRIME_SEED * rep + rank, nranks));
 
@@ -101,7 +118,6 @@ testResult_t AllToAllVInitData(struct threadArgs *args, onecclDataType_t type,
         SYCLCHECK(args->queues[i]->wait());
     }
 
-    args->reportErrors = 1;
     return testSuccess;
 }
 
@@ -146,8 +162,6 @@ testResult_t AllToAllVRunTest(struct threadArgs *args, int /*root*/,
                               onecclDataType_t type, const char *typeName,
                               onecclRedOp_t /*op*/, const char * /*opName*/) {
     args->collTest = &allToAllVTest;
-    // alltoallv does not support in-place in this benchmark implementation
-    args->runInplace = 0;
     onecclDataType_t *run_types = nullptr;
     const char **run_typenames = nullptr;
     int type_count = 0;
@@ -160,6 +174,10 @@ testResult_t AllToAllVRunTest(struct threadArgs *args, int /*root*/,
         type_count = test_typenum;
         run_types = test_types;
         run_typenames = test_typenames;
+    }
+
+    if (args->runInplace == 1) {
+        AllToAllVNoDataValidation();
     }
 
     for (int i = 0; i < type_count; i++) {

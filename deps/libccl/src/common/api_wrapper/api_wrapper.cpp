@@ -60,6 +60,7 @@ void api_wrappers_init() {
     CCL_THROW_IF_NOT((mpi_inited || ofi_inited), "could not initialize the requested transport library");
 
 #if defined(CCL_ENABLE_SYCL) && defined(CCL_ENABLE_ZE)
+    ccl::global_data::get().ze_init_error.clear();
     if (ccl::global_data::env().backend == backend_mode::native &&
         ccl::global_data::env().ze_enable) {
         LOG_INFO("initializing level-zero api");
@@ -68,14 +69,22 @@ void api_wrappers_init() {
                 ccl::global_data::get().ze_data.reset(new ze::global_data_desc);
             }
             catch (const ccl::exception& e) {
+                // keep the level-zero error, not the location prefix of the exception
+                const std::string what = e.what();
+                const std::string marker = "EXCEPTION: ";
+                const size_t pos = what.find(marker);
+                ccl::global_data::get().ze_init_error =
+                    (pos == std::string::npos) ? what : what.substr(pos + marker.size());
                 LOG_INFO("could not initialize level-zero: ", e.what());
             }
             catch (...) {
+                ccl::global_data::get().ze_init_error = "unknown error";
                 LOG_INFO("could not initialize level-zero: unknown error");
             }
         }
     }
     else {
+        ccl::global_data::get().ze_init_error = "level-zero is disabled";
         LOG_INFO("could not initialize level-zero api");
     }
 #if defined(CCL_ENABLE_UMF)
@@ -139,15 +148,15 @@ int load_library(lib_info_t& info) {
     }
     link_map* lmap = nullptr;
     if (dlinfo(info.handle, RTLD_DI_LINKMAP, &lmap) != 0) {
-        LOG_WARN("dlinfo failed for library: ", info.path);
+        LOG_DEBUG("dlinfo failed for library: ", info.path);
     }
     else if (lmap && lmap->l_name && lmap->l_name[0] != '\0')
     {
-        LOG_INFO("Loaded library. path: ", lmap->l_name);
+        LOG_DEBUG("Loaded library. path: ", lmap->l_name);
     }
     else
     {
-        LOG_WARN("Library path is empty for: ", info.path);
+        LOG_DEBUG("Library path is empty for: ", info.path);
     }
 
     auto ops = reinterpret_cast<void**>((void*)info.ops);

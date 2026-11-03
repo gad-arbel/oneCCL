@@ -193,10 +193,12 @@ template <typename T> class TriangleUtility {
 };
 
 // =============================================================================
-// validate_allreduce<T>(result_data, reduction_op, world_size)
+// check_reduced_element<T>(actual, index, fill_size, reduction_op, world_size,
+//                          coll)
 //
-// Recomputes the expected AllReduce result per element and compares against
-// result_data[]. Two code paths:
+// Recomputes the expected reduction of element [index] of buffers that
+// TriangleUtility::fill_buffer filled with fill_size elements on every rank,
+// and compares it against actual. Two code paths:
 //
 //   Integer (!is_fp_like): accumulates in T to match hardware wrapping;
 //     uses ASSERT_EQ.
@@ -204,152 +206,183 @@ template <typename T> class TriangleUtility {
 //     type-sized tolerance (sizeof==2: 0.01, sizeof==4: 1e-4, sizeof==8: 1e-9).
 // =============================================================================
 template <typename T>
+void check_reduced_element(T actual, size_t index, size_t fill_size,
+                           onecclRedOp_t reduction_op, int world_size,
+                           const char *coll) {
+    // Using same logic as TriangleUtility::fill_buffer to compute the
+    // expected value per rank
+    if constexpr (!TriangleUtility<T>::is_fp_like) {
+        // Integer path: accumulate in T (not double) to match hardware
+        // semantics. double loses precision for 64-bit values near 2^53,
+        // and Prod in double overflows; T gives natural wrapping like GPU.
+        T expected;
+        switch (reduction_op) {
+        case onecclSum:
+        case onecclAvg:
+            expected = static_cast<T>(0);
+            break;
+        case onecclMax:
+            expected = std::numeric_limits<T>::min();
+            break;
+        case onecclMin:
+            expected = std::numeric_limits<T>::max();
+            break;
+        case onecclProd:
+            expected = static_cast<T>(1);
+            break;
+        default:
+            expected = static_cast<T>(0);
+            break;
+        }
+
+        for (int r = 0; r < world_size; ++r) {
+            // Cast through T to simulate the truncation fill_buffer applied
+            // when storing.
+            T rank_val = static_cast<T>(TriangleUtility<T>::get_expected_val(
+                index, r, world_size, fill_size));
+            switch (reduction_op) {
+            case onecclSum:
+            case onecclAvg: {
+                // Unsigned cast avoids C++ signed-overflow UB.
+                // effective_max guarantees no actual overflow for Sum,
+                // so the result is mathematically identical to signed.
+                using U = std::make_unsigned_t<T>;
+                expected = static_cast<T>(static_cast<U>(expected) +
+                                          static_cast<U>(rank_val));
+                break;
+            }
+            case onecclProd: {
+                // Prod CAN overflow (effective_max only bounds per-rank
+                // values, not their product). Unsigned multiplication
+                // gives well-defined modular wraparound matching GPU.
+                using U = std::make_unsigned_t<T>;
+                expected = static_cast<T>(static_cast<U>(expected) *
+                                          static_cast<U>(rank_val));
+                break;
+            }
+            case onecclMax:
+                expected = std::max(expected, rank_val);
+                break;
+            case onecclMin:
+                expected = std::min(expected, rank_val);
+                break;
+            default:
+                break;
+            }
+        }
+
+        if (reduction_op == onecclAvg) {
+            expected /= static_cast<T>(world_size);
+        }
+
+        if (actual != expected) {
+            ASSERT_EQ(actual, expected)
+                << "Data Corruption at index [" << index << "] for " << coll
+                << " Size " << fill_size << " (Type size: " << sizeof(T)
+                << " bytes)";
+        }
+    } else {
+        // FP path: accumulate in double for precision.
+        double expected = 0.0;
+        switch (reduction_op) {
+        case onecclSum:
+        case onecclAvg:
+            expected = 0.0;
+            break;
+        case onecclMax:
+            expected = -1e18;
+            break;
+        case onecclMin:
+            expected = 1e18;
+            break;
+        case onecclProd:
+            expected = 1.0;
+            break;
+        default:
+            break;
+        }
+
+        for (int r = 0; r < world_size; ++r) {
+            // Cast through T to simulate the rounding fill_buffer applied
+            // when storing.
+            double rank_val = static_cast<double>(
+                static_cast<T>(TriangleUtility<T>::get_expected_val(
+                    index, r, world_size, fill_size)));
+            switch (reduction_op) {
+            case onecclSum:
+            case onecclAvg:
+                expected += rank_val;
+                break;
+            case onecclProd:
+                expected *= rank_val;
+                break;
+            case onecclMax:
+                expected = std::max(expected, rank_val);
+                break;
+            case onecclMin:
+                expected = std::min(expected, rank_val);
+                break;
+            default:
+                break;
+            }
+        }
+
+        if (reduction_op == onecclAvg) {
+            expected /= static_cast<double>(world_size);
+        }
+
+        // Fixed absolute tolerance per type. Safe because TriangleUtility
+        // caps fp values to [0,1], so accumulated sums stay small.
+        //   sizeof==2 (float16/bfloat16): 0.01
+        //   sizeof==4 (float):            1e-4
+        //   sizeof==8 (double):           1e-9
+        const double tolerance = (sizeof(T) == 2)   ? 0.01
+                                 : (sizeof(T) == 4) ? 1e-4
+                                                    : 1e-9;
+        if (std::abs(static_cast<double>(actual) - expected) > tolerance) {
+            ASSERT_NEAR(static_cast<double>(actual), expected, tolerance)
+                << "Precision Mismatch at index [" << index << "] for " << coll
+                << " Size " << fill_size;
+        }
+    }
+}
+
+// validate_allreduce<T>(result_data, reduction_op, world_size)
+//
+// Checks every element of an AllReduce result; stops at the first mismatch.
+template <typename T>
 void validate_allreduce(const std::vector<T> &result_data,
                         onecclRedOp_t reduction_op, int world_size) {
 
     const size_t buf_size = result_data.size();
 
     for (size_t i = 0; i < buf_size; ++i) {
+        check_reduced_element<T>(result_data[i], i, buf_size, reduction_op,
+                                 world_size, "Allreduce");
+        if (::testing::Test::HasFatalFailure())
+            return;
+    }
+}
 
-        // Using same logic as TriangleUtility::fill_buffer to compute the
-        // expected value per rank
-        if constexpr (!TriangleUtility<T>::is_fp_like) {
-            // Integer path: accumulate in T (not double) to match hardware
-            // semantics. double loses precision for 64-bit values near 2^53,
-            // and Prod in double overflows; T gives natural wrapping like GPU.
-            T expected;
-            switch (reduction_op) {
-            case onecclSum:
-            case onecclAvg:
-                expected = static_cast<T>(0);
-                break;
-            case onecclMax:
-                expected = std::numeric_limits<T>::min();
-                break;
-            case onecclMin:
-                expected = std::numeric_limits<T>::max();
-                break;
-            case onecclProd:
-                expected = static_cast<T>(1);
-                break;
-            default:
-                expected = static_cast<T>(0);
-                break;
-            }
+// validate_reduce_scatter<T>(result_data, reduction_op, world_size, rank)
+//
+// Checks a ReduceScatter result: this rank's block of the reduced input, i.e.
+// elements rank * recvcount + i of the recvcount * world_size filled ones.
+// Stops at the first mismatch.
+template <typename T>
+void validate_reduce_scatter(const std::vector<T> &result_data,
+                             onecclRedOp_t reduction_op, int world_size,
+                             int rank) {
 
-            for (int r = 0; r < world_size; ++r) {
-                // Cast through T to simulate the truncation fill_buffer applied
-                // when storing.
-                T rank_val =
-                    static_cast<T>(TriangleUtility<T>::get_expected_val(
-                        i, r, world_size, buf_size));
-                switch (reduction_op) {
-                case onecclSum:
-                case onecclAvg: {
-                    // Unsigned cast avoids C++ signed-overflow UB.
-                    // effective_max guarantees no actual overflow for Sum,
-                    // so the result is mathematically identical to signed.
-                    using U = std::make_unsigned_t<T>;
-                    expected = static_cast<T>(static_cast<U>(expected) +
-                                              static_cast<U>(rank_val));
-                    break;
-                }
-                case onecclProd: {
-                    // Prod CAN overflow (effective_max only bounds per-rank
-                    // values, not their product). Unsigned multiplication
-                    // gives well-defined modular wraparound matching GPU.
-                    using U = std::make_unsigned_t<T>;
-                    expected = static_cast<T>(static_cast<U>(expected) *
-                                              static_cast<U>(rank_val));
-                    break;
-                }
-                case onecclMax:
-                    expected = std::max(expected, rank_val);
-                    break;
-                case onecclMin:
-                    expected = std::min(expected, rank_val);
-                    break;
-                default:
-                    break;
-                }
-            }
+    const size_t recvcount = result_data.size();
+    const size_t fill_size = recvcount * world_size;
 
-            if (reduction_op == onecclAvg) {
-                expected /= static_cast<T>(world_size);
-            }
-
-            if (result_data[i] != expected) {
-                ASSERT_EQ(result_data[i], expected)
-                    << "Data Corruption at index [" << i
-                    << "] for Allreduce Size " << buf_size
-                    << " (Type size: " << sizeof(T) << " bytes)";
-            }
-        } else {
-            // FP path: accumulate in double for precision.
-            double expected = 0.0;
-            switch (reduction_op) {
-            case onecclSum:
-            case onecclAvg:
-                expected = 0.0;
-                break;
-            case onecclMax:
-                expected = -1e18;
-                break;
-            case onecclMin:
-                expected = 1e18;
-                break;
-            case onecclProd:
-                expected = 1.0;
-                break;
-            default:
-                break;
-            }
-
-            for (int r = 0; r < world_size; ++r) {
-                // Cast through T to simulate the rounding fill_buffer applied
-                // when storing.
-                double rank_val = static_cast<double>(
-                    static_cast<T>(TriangleUtility<T>::get_expected_val(
-                        i, r, world_size, buf_size)));
-                switch (reduction_op) {
-                case onecclSum:
-                case onecclAvg:
-                    expected += rank_val;
-                    break;
-                case onecclProd:
-                    expected *= rank_val;
-                    break;
-                case onecclMax:
-                    expected = std::max(expected, rank_val);
-                    break;
-                case onecclMin:
-                    expected = std::min(expected, rank_val);
-                    break;
-                default:
-                    break;
-                }
-            }
-
-            if (reduction_op == onecclAvg) {
-                expected /= static_cast<double>(world_size);
-            }
-
-            // Fixed absolute tolerance per type. Safe because TriangleUtility
-            // caps fp values to [0,1], so accumulated sums stay small.
-            //   sizeof==2 (float16/bfloat16): 0.01
-            //   sizeof==4 (float):            1e-4
-            //   sizeof==8 (double):           1e-9
-            const double tolerance = (sizeof(T) == 2)   ? 0.01
-                                     : (sizeof(T) == 4) ? 1e-4
-                                                        : 1e-9;
-            if (std::abs(static_cast<double>(result_data[i]) - expected) >
-                tolerance) {
-                ASSERT_NEAR(static_cast<double>(result_data[i]), expected,
-                            tolerance)
-                    << "Precision Mismatch at index [" << i
-                    << "] for Allreduce Size " << buf_size;
-            }
-        }
+    for (size_t i = 0; i < recvcount; ++i) {
+        check_reduced_element<T>(result_data[i], rank * recvcount + i,
+                                 fill_size, reduction_op, world_size,
+                                 "ReduceScatter");
+        if (::testing::Test::HasFatalFailure())
+            return;
     }
 }
 
@@ -407,8 +440,8 @@ class CollectiveTest
 
         sycl_queue = create_sycl_queue(local_rank);
         size_t buff_size = (static_cast<long>(32 * 1024) * 1024);
-        send_buff_size = buff_size * sizeof(onecclInt64);
-        recv_buff_size = buff_size * world_size * sizeof(onecclInt64);
+        send_buff_size = buff_size * sizeof(int64_t);
+        recv_buff_size = buff_size * world_size * sizeof(int64_t);
         // Allocate send and recv buffers for the test run
         send_buff = sycl::malloc_device(send_buff_size, sycl_queue);
         ASSERT_NE(send_buff, nullptr)
@@ -422,6 +455,13 @@ class CollectiveTest
     }
 
     static void TearDownTestSuite() { onecclCommDestroy(comm); }
+
+    // The suite allocates the buffers once, so a case would otherwise validate
+    // bytes an earlier in-place case left behind.
+    void SetUp() override {
+        sycl_queue.memset(send_buff, 0, send_buff_size).wait();
+        sycl_queue.memset(recv_buff, 0, recv_buff_size).wait();
+    }
 
     static sycl::queue create_sycl_queue(int local_rank) {
         auto platforms = sycl::platform::get_platforms();
@@ -525,20 +565,28 @@ class CollectiveTest
         // sycl::free(recvbuff, sycl_queue);
     }
 
+    // Every element gets its own value (TriangleUtility), so data copied to
+    // the wrong offset within a rank's block is caught too. in_place starts
+    // with each rank's input in its own block of recvbuff.
     template <typename T>
     void perform_all_gather(onecclDataType_t datatype, size_t sendcount,
-                            size_t stress_iter = 1) {
-        std::vector<T> host_data(sendcount, static_cast<T>(rank + 1));
+                            size_t stress_iter = 1, bool in_place = false) {
+        std::vector<T> host_data(sendcount);
+        TriangleUtility<T>::fill_buffer(host_data.data(), sendcount, rank,
+                                        world_size);
 
         // Check if send\recv buffers are big enough
         ASSERT_TRUE(sendcount * sizeof(T) <= send_buff_size);
         ASSERT_TRUE((sendcount * world_size) * sizeof(T) <= recv_buff_size);
 
-        sycl_queue.memcpy(send_buff, host_data.data(), sendcount * sizeof(T))
+        void *send_ptr = in_place ? static_cast<char *>(recv_buff) +
+                                        (rank * sendcount * sizeof(T))
+                                  : send_buff;
+        sycl_queue.memcpy(send_ptr, host_data.data(), sendcount * sizeof(T))
             .wait();
         for (int iter = 0; iter < stress_iter; iter++) {
             onecclResult_t result = onecclAllGather(
-                send_buff, recv_buff, sendcount, datatype, comm, &sycl_queue);
+                send_ptr, recv_buff, sendcount, datatype, comm, &sycl_queue);
             ASSERT_EQ(result, onecclSuccess);
         }
 
@@ -548,8 +596,15 @@ class CollectiveTest
                     sendcount * world_size * sizeof(T))
             .wait();
         for (size_t i = 0; i < sendcount * world_size; ++i) {
-            auto source_rank = i / sendcount;
-            ASSERT_EQ(result_data[i], static_cast<T>(source_rank + 1));
+            int const source_rank = static_cast<int>(i / sendcount);
+            T const expected =
+                static_cast<T>(TriangleUtility<T>::get_expected_val(
+                    i % sendcount, source_rank, world_size, sendcount));
+            if (result_data[i] != expected) {
+                ASSERT_EQ(result_data[i], expected)
+                    << "Data Corruption at index [" << i
+                    << "] for AllGather Size " << sendcount;
+            }
         }
 
         // sycl::free(sendbuff, sycl_queue);
@@ -659,66 +714,41 @@ class CollectiveTest
         }
     }
 
+    // Every element gets its own value (TriangleUtility);
+    // validate_reduce_scatter checks this rank's block of the reduced input.
+    // in_place puts the result on that block of the input buffer (with
+    // stress_iter 1: a second iteration would reduce the first one's result).
     template <typename T>
     void perform_reduce_scatter(onecclDataType_t datatype,
                                 onecclRedOp_t reduction_op, size_t recvcount,
-                                size_t stress_iter = 1) {
+                                size_t stress_iter = 1, bool in_place = false) {
         size_t const sendcount = recvcount * world_size;
-        std::vector<T> host_data(sendcount, static_cast<T>(rank + 1));
+        std::vector<T> host_data(sendcount);
+        TriangleUtility<T>::fill_buffer(host_data.data(), sendcount, rank,
+                                        world_size);
 
         // Check if send\recv buffers are big enough
         ASSERT_TRUE(sendcount * sizeof(T) <= send_buff_size);
-        ASSERT_TRUE(recvcount * sizeof(T) <= recv_buff_size);
+        ASSERT_TRUE((in_place ? sendcount : recvcount) * sizeof(T) <=
+                    recv_buff_size);
 
-        sycl_queue.memcpy(send_buff, host_data.data(), sendcount * sizeof(T))
+        void *send_ptr = in_place ? recv_buff : send_buff;
+        void *recv_ptr = in_place ? static_cast<char *>(recv_buff) +
+                                        (rank * recvcount * sizeof(T))
+                                  : recv_buff;
+        sycl_queue.memcpy(send_ptr, host_data.data(), sendcount * sizeof(T))
             .wait();
         for (int iter = 0; iter < stress_iter; iter++) {
             onecclResult_t result =
-                onecclReduceScatter(send_buff, recv_buff, recvcount, datatype,
+                onecclReduceScatter(send_ptr, recv_ptr, recvcount, datatype,
                                     reduction_op, comm, &sycl_queue);
             ASSERT_EQ(result, onecclSuccess);
         }
 
         std::vector<T> result_data(recvcount);
-        sycl_queue.memcpy(result_data.data(), recv_buff, recvcount * sizeof(T))
+        sycl_queue.memcpy(result_data.data(), recv_ptr, recvcount * sizeof(T))
             .wait();
-
-        T expected_value = 0;
-        auto world_size_as_float = static_cast<float>(world_size);
-        for (const auto &reduce_scatter_result : result_data) {
-            switch (reduction_op) {
-            case onecclSum:
-                expected_value =
-                    static_cast<int>(static_cast<float>(1 + world_size) / 2 *
-                                     static_cast<float>(world_size));
-                ASSERT_EQ(reduce_scatter_result, expected_value);
-                break;
-            case onecclProd:
-                expected_value = 1;
-                for (int i = 1; i < world_size; ++i) {
-                    int const num = i + 1;
-                    expected_value *= num;
-                }
-                ASSERT_EQ(reduce_scatter_result, expected_value);
-                break;
-            case onecclMax:
-                expected_value = world_size;
-                ASSERT_EQ(reduce_scatter_result, expected_value);
-                break;
-            case onecclMin:
-                expected_value = 1;
-                ASSERT_EQ(reduce_scatter_result, expected_value);
-                break;
-            case onecclAvg:
-                expected_value =
-                    static_cast<T>((static_cast<float>(1 + world_size) / 2) *
-                                   world_size_as_float / world_size_as_float);
-                ASSERT_EQ(reduce_scatter_result, expected_value);
-                break;
-            default:
-                break;
-            }
-        }
+        validate_reduce_scatter<T>(result_data, reduction_op, world_size, rank);
 
         // sycl::free(sendbuff, sycl_queue);
         // sycl::free(recvbuff, sycl_queue);
@@ -867,10 +897,13 @@ class CollectiveTest
     //   result
     //                       mathematically and asserts element-by-element
     //                       equality.
+    //
+    // in_place uses recvbuff as the send buffer too (with stress_iter 1: a
+    // second iteration would reduce the first one's result).
     template <typename T>
     void perform_all_reduce(onecclDataType_t datatype,
                             onecclRedOp_t reduction_op, size_t buf_size,
-                            size_t stress_iter = 1) {
+                            size_t stress_iter = 1, bool in_place = false) {
         // Step 1: Fill host_send_buf with unique triangle-pattern values
         std::vector<T> host_send_buf(buf_size);
         TriangleUtility<T>::fill_buffer(host_send_buf.data(), buf_size, rank,
@@ -881,13 +914,14 @@ class CollectiveTest
         ASSERT_TRUE(buf_size * sizeof(T) <= recv_buff_size);
 
         // Step 2: Copy to GPU send buffer
-        sycl_queue.memcpy(send_buff, host_send_buf.data(), buf_size * sizeof(T))
+        void *send_ptr = in_place ? recv_buff : send_buff;
+        sycl_queue.memcpy(send_ptr, host_send_buf.data(), buf_size * sizeof(T))
             .wait();
 
         // Step 3: AllReduce
         for (int iter = 0; iter < stress_iter; iter++) {
             onecclResult_t result =
-                onecclAllReduce(send_buff, recv_buff, buf_size, datatype,
+                onecclAllReduce(send_ptr, recv_buff, buf_size, datatype,
                                 reduction_op, comm, &sycl_queue);
             ASSERT_EQ(result, onecclSuccess);
         }
@@ -976,6 +1010,9 @@ class StressTest : public CollectiveTest {};
 
 // Derived class specifically for running a single test case
 class SimpleCollectiveTest : public CollectiveTest {};
+
+// Focused regression fixture for AUTO rejecting the pipelined broadcast ring.
+class BroadcastAutoFallbackTest : public CollectiveTest {};
 
 sycl::queue CollectiveTest::sycl_queue;
 int CollectiveTest::rank;
@@ -1224,6 +1261,15 @@ TEST_P(CollectiveTest, BroadcastOperation) {
     default:
         FAIL() << "Unsupported type!";
     }
+}
+
+TEST_F(BroadcastAutoFallbackTest, FourMiBInt32) {
+    constexpr size_t bytes_per_kibibyte = 1024;
+    constexpr size_t bytes_per_mebibyte = 1024 * bytes_per_kibibyte;
+    constexpr size_t message_bytes = 4 * bytes_per_mebibyte;
+    constexpr size_t element_count = message_bytes / sizeof(int);
+
+    perform_broadcast<int>(onecclInt32, element_count);
 }
 
 TEST_P(CollectiveTest, AllGatherOperation) {
@@ -2397,10 +2443,206 @@ TEST_P(SimpleCollectiveTest, FinalizeMultipleQueuesEventLoop) {
     sycl::free(recvbuff, sycl_queue);
 }
 
+// =============================================================================
+// ChunkingTest: the large SYCL paths with CCL_SYCL_<COLL>_SIMPLE_CHUNK_SIZE and
+// CCL_SYCL_<COLL>_SIMPLE_RING_SEGMENT_SIZE set. libccl reads these once per
+// process, so ctest runs this suite once per setting (tests/CMakeLists.txt).
+// The helpers fill every element with its own value, so a chunk copied to the
+// wrong offset or stride is caught.
+//
+// Parameters: datatype, reduction (unused, always sum), buffer size, and
+// in place (1) or out of place (0) in the slot CollectiveTest uses for
+// stress_iter.
+// =============================================================================
+class ChunkingTest : public CollectiveTest {};
+
+// Counts are not a multiple of any tested chunk or segment size, and large
+// enough for the simple (non-LL) path at 2 ranks for every type.
+INSTANTIATE_TEST_SUITE_P(
+    SyclChunkingTests, ChunkingTest,
+    ::testing::Combine(::testing::Values(onecclInt32, onecclFloat16,
+                                         onecclFloat32, onecclFloat64),
+                       ::testing::Values(onecclSum),
+                       ::testing::Values(2097157UL, 3000017UL),
+                       ::testing::Values(0UL, 1UL)));
+
+TEST_P(ChunkingTest, AllReduce) {
+    auto params = GetParam();
+    onecclDataType_t const datatype = std::get<0>(params);
+    size_t const buf_size = std::get<2>(params);
+    bool const in_place = std::get<3>(params) != 0;
+
+    std::cout << "Test Params - DataType: " << to_string(datatype)
+              << ", Buffer Size: " << buf_size << ", In Place: " << in_place
+              << '\n';
+
+    switch (datatype) {
+    case onecclInt32:
+        perform_all_reduce<int>(datatype, onecclSum, buf_size, 1, in_place);
+        break;
+    case onecclFloat16:
+        perform_all_reduce<sycl::half>(datatype, onecclSum, buf_size, 1,
+                                       in_place);
+        break;
+    case onecclFloat32:
+        perform_all_reduce<float>(datatype, onecclSum, buf_size, 1, in_place);
+        break;
+    case onecclFloat64:
+        perform_all_reduce<double>(datatype, onecclSum, buf_size, 1, in_place);
+        break;
+    default:
+        FAIL() << "Unsupported type!";
+    }
+}
+
+TEST_P(ChunkingTest, ReduceScatter) {
+    auto params = GetParam();
+    onecclDataType_t const datatype = std::get<0>(params);
+    size_t const buf_size = std::get<2>(params);
+    bool const in_place = std::get<3>(params) != 0;
+
+    std::cout << "Test Params - DataType: " << to_string(datatype)
+              << ", Buffer Size: " << buf_size << ", In Place: " << in_place
+              << '\n';
+
+    switch (datatype) {
+    case onecclInt32:
+        perform_reduce_scatter<int>(datatype, onecclSum, buf_size, 1, in_place);
+        break;
+    case onecclFloat16:
+        perform_reduce_scatter<sycl::half>(datatype, onecclSum, buf_size, 1,
+                                           in_place);
+        break;
+    case onecclFloat32:
+        perform_reduce_scatter<float>(datatype, onecclSum, buf_size, 1,
+                                      in_place);
+        break;
+    case onecclFloat64:
+        perform_reduce_scatter<double>(datatype, onecclSum, buf_size, 1,
+                                       in_place);
+        break;
+    default:
+        FAIL() << "Unsupported type!";
+    }
+}
+
+TEST_P(ChunkingTest, AllGather) {
+    auto params = GetParam();
+    onecclDataType_t const datatype = std::get<0>(params);
+    size_t const buf_size = std::get<2>(params);
+    bool const in_place = std::get<3>(params) != 0;
+
+    std::cout << "Test Params - DataType: " << to_string(datatype)
+              << ", Buffer Size: " << buf_size << ", In Place: " << in_place
+              << '\n';
+
+    switch (datatype) {
+    case onecclInt32:
+        perform_all_gather<int>(datatype, buf_size, 1, in_place);
+        break;
+    case onecclFloat16:
+        perform_all_gather<sycl::half>(datatype, buf_size, 1, in_place);
+        break;
+    case onecclFloat32:
+        perform_all_gather<float>(datatype, buf_size, 1, in_place);
+        break;
+    case onecclFloat64:
+        perform_all_gather<double>(datatype, buf_size, 1, in_place);
+        break;
+    default:
+        FAIL() << "Unsupported type!";
+    }
+}
+
+TEST_P(ChunkingTest, AllToAll) {
+    auto params = GetParam();
+    onecclDataType_t const datatype = std::get<0>(params);
+    size_t const buf_size = std::get<2>(params);
+    bool const in_place = std::get<3>(params) != 0;
+
+    std::cout << "Test Params - DataType: " << to_string(datatype)
+              << ", Buffer Size: " << buf_size << ", In Place: " << in_place
+              << '\n';
+
+    if (in_place) {
+        GTEST_SKIP_("in-place alltoall is not supported by libccl");
+    }
+    switch (datatype) {
+    case onecclInt32:
+        perform_all_to_all<int>(datatype, buf_size);
+        break;
+    case onecclFloat16:
+        perform_all_to_all<sycl::half>(datatype, buf_size);
+        break;
+    case onecclFloat32:
+        perform_all_to_all<float>(datatype, buf_size);
+        break;
+    case onecclFloat64:
+        perform_all_to_all<double>(datatype, buf_size);
+        break;
+    default:
+        FAIL() << "Unsupported type!";
+    }
+}
+
+// The 2-rank reduce_scatter ring picks the copy-engine pipeline from the full
+// per-rank size (64 MB and up), not from the chunk.
+TEST_P(ChunkingTest, ReduceScatterLarge) {
+    auto params = GetParam();
+    onecclDataType_t const datatype = std::get<0>(params);
+    size_t const buf_size = std::get<2>(params);
+    bool const in_place = std::get<3>(params) != 0;
+
+    if (datatype != onecclFloat32 || buf_size != 2097157UL) {
+        GTEST_SKIP_("run once, for float32");
+    }
+    size_t const recvcount = 16777259; // 64 MB of float32 per rank
+    if (recvcount * world_size * sizeof(float) > send_buff_size) {
+        GTEST_SKIP_("send buffer too small for this rank count");
+    }
+
+    std::cout << "Test Params - DataType: " << to_string(datatype)
+              << ", Buffer Size: " << recvcount << ", In Place: " << in_place
+              << '\n';
+
+    perform_reduce_scatter<float>(datatype, onecclSum, recvcount, 1, in_place);
+}
+
+// An invalid CCL_SYCL_ALLREDUCE_SIMPLE_CHUNK_SIZE: the large allreduce must
+// fail with an error that ctest checks for the variable name. Gated on the
+// marker, not on the variable being set: other runs set a valid value.
+constexpr const char *EXPECT_CHUNK_REJECT = "ONECCL_TEST_EXPECT_CHUNK_REJECT";
+
+class ChunkingInvalidTest : public ChunkingTest {};
+
+INSTANTIATE_TEST_SUITE_P(SyclChunkingInvalidTests, ChunkingInvalidTest,
+                         ::testing::Combine(::testing::Values(onecclFloat32),
+                                            ::testing::Values(onecclSum),
+                                            ::testing::Values(4194304UL),
+                                            ::testing::Values(0UL)));
+
+TEST_P(ChunkingInvalidTest, AllReduceRejected) {
+    if (std::getenv(EXPECT_CHUNK_REJECT) == nullptr) {
+        GTEST_SKIP_("needs ONECCL_TEST_EXPECT_CHUNK_REJECT and an invalid "
+                    "CCL_SYCL_ALLREDUCE_SIMPLE_CHUNK_SIZE");
+    }
+    // 16 MB of float32: the simple (non-LL) path
+    size_t const buf_size = std::get<2>(GetParam());
+    std::vector<float> host_data(buf_size, 1.0F);
+    sycl_queue.memcpy(send_buff, host_data.data(), buf_size * sizeof(float))
+        .wait();
+
+    onecclResult_t result =
+        onecclAllReduce(send_buff, recv_buff, buf_size, onecclFloat32,
+                        onecclSum, comm, &sycl_queue);
+    EXPECT_EQ(result, onecclPluginException);
+}
+
 int main(int argc, char **argv) {
 
     ::testing::InitGoogleTest(&argc, argv);
-    MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, nullptr);
+    int provided = 0;
+    MPI_Init_thread(nullptr, nullptr, MPI_THREAD_MULTIPLE, &provided);
     int const result = RUN_ALL_TESTS();
     MPI_Finalize();
 

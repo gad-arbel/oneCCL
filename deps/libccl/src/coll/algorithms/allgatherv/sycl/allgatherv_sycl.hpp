@@ -18,28 +18,6 @@
 
 #include "coll/algorithms/utils/sycl_selection.hpp"
 
-#ifdef CCL_ENABLE_ESIMD
-
-#define SYCL_ALLGATHERV_FUNCTIONS(MSGSIZE) \
-    void init_allgatherv_##MSGSIZE(ccl::datatype dtype, \
-                                   sycl::queue& queue, \
-                                   ccl_comm* comm, \
-                                   ccl_stream* stream, \
-                                   uint32_t rank_in, \
-                                   uint32_t world_in); \
-    ccl::event run_allgatherv_##MSGSIZE(ccl::datatype dtype, \
-                                        sycl::queue& q, \
-                                        const void* send_buf, \
-                                        size_t send_count, \
-                                        void* rev_buf, \
-                                        const ccl::vector_class<size_t>& recv_counts, \
-                                        bool& done);
-
-SYCL_ALLGATHERV_FUNCTIONS(small)
-SYCL_ALLGATHERV_FUNCTIONS(medium)
-
-#endif // CCL_ENABLE_ESIMD
-
 namespace ccl {
 namespace v1 {
 

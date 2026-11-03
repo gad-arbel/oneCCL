@@ -14,6 +14,7 @@
  limitations under the License.
 */
 
+#include <algorithm>
 #include <numeric>
 
 #include "exec/exec.hpp"
@@ -55,7 +56,13 @@ atl_attr_t ccl_executor::generate_atl_attr(const ccl::env_data& env) {
     attr.in.enable_hmem = env.enable_hmem;
     attr.in.enable_sync_coll = env.enable_sync_coll;
     attr.in.enable_extra_ep = env.enable_extra_ep;
-    attr.in.ep_count = calculate_atl_ep_count(env.worker_count);
+    /* A floor, not an override: the worker path derives its own endpoint indices from
+     * calculate_atl_ep_count() in create_sched_queue(), and each nic needs an endpoint of its own to
+     * be reachable at all - endpoint i binds provider i % <nics opened>, OFI having no other nic
+     * selector. */
+    size_t worker_ep_count = calculate_atl_ep_count(env.worker_count);
+    size_t nic_ep_count = static_cast<size_t>(std::max(env.mnic_count, ssize_t{ 1 }));
+    attr.in.ep_count = std::max(worker_ep_count, nic_ep_count);
     attr.in.mnic_type = env.mnic_type;
     attr.in.mnic_name = env.mnic_name_raw;
     attr.in.mnic_count = env.mnic_count;

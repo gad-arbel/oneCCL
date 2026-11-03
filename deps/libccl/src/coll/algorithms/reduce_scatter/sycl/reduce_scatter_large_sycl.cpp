@@ -14,77 +14,11 @@
  limitations under the License.
 */
 
-#ifdef CCL_ENABLE_ESIMD
-#include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl.hpp"
-
-#define REDUCE_SCATTER_LARGE_API_DECL(TYPE) \
-    void init_reduce_scatter_large_##TYPE(ccl::datatype dtype, \
-                                          sycl::queue &queue, \
-                                          ccl_comm *comm, \
-                                          ccl_stream *stream, \
-                                          uint32_t rank_in, \
-                                          uint32_t world_in); \
-    ccl::event run_reduce_scatter_large_##TYPE(ccl::datatype dtype, \
-                                               sycl::queue &queue, \
-                                               const void *send_buf, \
-                                               void *recv_buf, \
-                                               size_t recv_count, \
-                                               ccl::reduction reduction, \
-                                               const ccl::vector_class<ccl::event> &deps, \
-                                               bool &done);
-
-REDUCE_SCATTER_LARGE_API_DECL(fp16);
-REDUCE_SCATTER_LARGE_API_DECL(bf16);
-REDUCE_SCATTER_LARGE_API_DECL(fp32);
-REDUCE_SCATTER_LARGE_API_DECL(int32);
-
-#define SWITCH_INIT_TYPE(TYPE, ccl_type) \
-    case ccl_type: init_reduce_scatter_large_##TYPE(dtype, queue, comm, stream, rank_in, world_in); break;
-
-void init_reduce_scatter_large(ccl::datatype dtype,
-                               sycl::queue &queue,
-                               ccl_comm *comm,
-                               ccl_stream *stream,
-                               uint32_t rank_in,
-                               uint32_t world_in) {
-    switch (dtype) {
-        SWITCH_INIT_TYPE(fp16, ccl::datatype::float16)
-        SWITCH_INIT_TYPE(bf16, ccl::datatype::bfloat16)
-        SWITCH_INIT_TYPE(fp32, ccl::datatype::float32)
-        SWITCH_INIT_TYPE(int32, ccl::datatype::int32)
-        default: assert(0);
-    }
-}
-
-#define SWITCH_RUN_TYPE(TYPE, ccl_type) \
-    case ccl_type: \
-        e = run_reduce_scatter_large_##TYPE(dtype, queue, send_buf, recv_buf, recv_count, reduction, deps, done); \
-        break;
-
-ccl::event run_reduce_scatter_large(ccl::datatype dtype,
-                                    sycl::queue &queue,
-                                    const void *send_buf,
-                                    void *recv_buf,
-                                    size_t recv_count,
-                                    ccl::reduction reduction,
-                                    const ccl::vector_class<ccl::event> &deps,
-                                    bool &done) {
-    ccl::event e;
-    switch (dtype) {
-        SWITCH_RUN_TYPE(fp16, ccl::datatype::float16)
-        SWITCH_RUN_TYPE(bf16, ccl::datatype::bfloat16)
-        SWITCH_RUN_TYPE(fp32, ccl::datatype::float32)
-        SWITCH_RUN_TYPE(int32, ccl::datatype::int32)
-        default: assert(0);
-    }
-    return e;
-}
-#endif // CCL_ENABLE_ESIMD
-
 #include "coll/algorithms/utils/sycl_custom_preop.hpp"
 #include "coll/algorithms/utils/sycl_selection.hpp"
 #include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_impl.hpp"
 #include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_ring.hpp"
+#include "coll/selection/policy/policy_env.hpp"
 
 ccl::event reduce_scatter_large(const void *send_buf,
                                 void *recv_buf,
@@ -110,6 +44,15 @@ ccl::event reduce_scatter_large(const void *send_buf,
     std::shared_ptr<ccl_comm> node_comm = comm->get_node_comm();
     std::shared_ptr<ccl_comm> pair_comm = comm->get_pair_comm();
     std::shared_ptr<ccl_comm> even_comm = comm->get_even_comm();
+    const size_t dsize = ccl::global_data::get().dtypes->get(dtype).size();
+    static const simple_chunk_size_table_t simple_chunk_sizes =
+        parse_simple_chunk_size_spec(CCL_SYCL_REDUCE_SCATTER_SIMPLE_CHUNK_SIZE,
+                                     ccl::global_data::env().sycl_reduce_scatter_simple_chunk_size);
+    // the policy knob `simple_chunk_size`, when set for this call, replaces the spec
+    const size_t chunk_size =
+        ccl::selection::call_env().sycl_reduce_scatter_simple_chunk_size_override
+            ? ccl::selection::call_env().sycl_reduce_scatter_simple_chunk_size_override
+            : select_simple_chunk_size(simple_chunk_sizes, recv_count * p2p_comm->size() * dsize);
 
     // BMG path
     if (is_arc_card(ccl::global_data::get().ze_data->devices[0].family)) {
@@ -150,21 +93,25 @@ ccl::event reduce_scatter_large(const void *send_buf,
             }
             const ccl::vector_class<ccl::event> &transport_deps =
                 reduce_has_pre_operation ? transport_deps_local : deps;
-            auto lambda = [&]<typename T>() {
-                return reduce_scatter_large_su_ring<T>(
-                    transport_send_buf, recv_buf, recv_count, dtype, transport_reduction,
-                    comm, p2p_comm, global_stream, sycl_ptrs, transport_deps);
-            };
-            sycl::event e = invoke_collective_sycl(lambda, dtype);
+            // chunks are column slices of every rank block, so the ring reads a recv_count stride
+            ccl::event e = for_each_chunk(chunk_size, recv_count, dsize, [&](size_t offset, size_t pack_count) {
+                auto lambda = [&]<typename T>() {
+                    return reduce_scatter_large_su_ring<T>(
+                        (const char *)transport_send_buf + offset * dsize, (char *)recv_buf + offset * dsize,
+                        pack_count, recv_count, dtype, transport_reduction, comm, p2p_comm, global_stream,
+                        sycl_ptrs, transport_deps);
+                };
+                sycl::event e = invoke_collective_sycl(lambda, dtype);
+                return ccl::event::create_from_native(e);
+            });
             if (preop_staging_buf) {
                 comm->put_scaleout_device_buf(preop_staging_buf);
             }
-            return ccl::event::create_from_native(e);
+            return e;
         }
         // else: fall through to the non-BMG path below.
     }
 
-    const size_t dsize = ccl::global_data::get().dtypes->get(dtype).size();
     // use full vector (>= 8 bytes) if buffers and data size are 4 byte aligned
     bool use_full_vector = can_use_full_vector(send_buf, recv_buf, recv_count, dsize);
     // TODO : generalize constraints for different hardware.
@@ -251,32 +198,40 @@ ccl::event reduce_scatter_large(const void *send_buf,
         }
     }
 
-    auto lambda = [&]<typename T>() {
-        if (use_full_vector) {
-            return reduce_scatter_large_impl<T, true>(send_buf,
-                                                      recv_buf,
-                                                      recv_count,
-                                                      dtype,
-                                                      reduction,
-                                                      comm,
-                                                      global_stream,
-                                                      sycl_ptrs,
-                                                      deps,
-                                                      is_tmp_used);
-        }
-        else {
-            return reduce_scatter_large_impl<T, false>(send_buf,
-                                                       recv_buf,
-                                                       recv_count,
-                                                       dtype,
-                                                       reduction,
-                                                       comm,
-                                                       global_stream,
-                                                       sycl_ptrs,
-                                                       deps,
-                                                       is_tmp_used);
-        }
-    };
-
-    return invoke_collective(lambda, dtype);
+    return for_each_chunk(chunk_size, recv_count, dsize, [&](size_t offset, size_t pack_count) {
+        const size_t offset_bytes = offset * dsize;
+        // tmp-buffer peers are not user buffers, so they keep their base
+        sycl_ptrs_type chunk_ptrs = is_tmp_used ? sycl_ptrs : offset_sycl_ptrs(sycl_ptrs, offset_bytes, 0);
+        const void *chunk_send_buf = (const char *)send_buf + offset_bytes;
+        void *chunk_recv_buf = (char *)recv_buf + offset_bytes;
+        auto lambda = [&]<typename T>() {
+            if (use_full_vector) {
+                return reduce_scatter_large_impl<T, true>(chunk_send_buf,
+                                                          chunk_recv_buf,
+                                                          pack_count,
+                                                          recv_count,
+                                                          dtype,
+                                                          reduction,
+                                                          comm,
+                                                          global_stream,
+                                                          chunk_ptrs,
+                                                          deps,
+                                                          is_tmp_used);
+            }
+            else {
+                return reduce_scatter_large_impl<T, false>(chunk_send_buf,
+                                                           chunk_recv_buf,
+                                                           pack_count,
+                                                           recv_count,
+                                                           dtype,
+                                                           reduction,
+                                                           comm,
+                                                           global_stream,
+                                                           chunk_ptrs,
+                                                           deps,
+                                                           is_tmp_used);
+            }
+        };
+        return invoke_collective(lambda, dtype);
+    });
 }

@@ -96,6 +96,7 @@ public:
 
 #if defined(CCL_ENABLE_ZE) && defined(CCL_ENABLE_SYCL)
     std::unique_ptr<ze::global_data_desc> ze_data;
+    std::string ze_init_error;
     std::unique_ptr<ccl_proxy_service> proxy_service;
 #endif // CCL_ENABLE_ZE && CCL_ENABLE_SYCL
 

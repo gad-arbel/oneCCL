@@ -42,9 +42,12 @@ enum class ccl_proxy_op_type : uint8_t {
     none,
     allreduce_ring,
     allreduce_direct,
+    allreduce_rabenseifner,
     reduce_scatter_ring,
     allgatherv_ring,
     alltoall_pairwise,
+    alltoallv_pairwise,
+    broadcast_direct,
 
     // Keep this last - used for array sizing
     _count
@@ -54,16 +57,19 @@ enum class ccl_proxy_op_type : uint8_t {
 
 // Groups proxy service infrastructure resources passed to algorithm implementations
 struct ccl_proxy_context {
-    ccl_cmd_ring_producer* producer;  // Command ring producer for device operations
-    ccl_proxy_staging* staging;       // Staging copy manager for pipelined operations
-    sycl::queue* queue;               // Proxy-thread in-order queue (device buffer allocation, etc.)
-    size_t num_work_groups;           // Number of work-groups for multi-WG kernel (0 = single-WG)
+    ccl_cmd_ring_producer* producer; // Command ring producer for device operations
+    ccl_proxy_staging* staging; // Staging copy manager for pipelined operations
+    sycl::queue* queue; // Proxy-thread in-order queue (device buffer allocation, etc.)
+    size_t num_work_groups; // Number of work-groups for multi-WG kernel (0 = single-WG)
 
     ccl_proxy_context(ccl_cmd_ring_producer* prod,
                       ccl_proxy_staging* stg,
                       sycl::queue* q,
                       size_t num_wg = 1)
-        : producer(prod), staging(stg), queue(q), num_work_groups(num_wg) {}
+            : producer(prod),
+              staging(stg),
+              queue(q),
+              num_work_groups(num_wg) {}
 };
 
 /* ======== Host-side algorithm operation descriptor ======== */
@@ -80,17 +86,27 @@ struct ccl_proxy_op {
     // additional fields
     void* aux_dev; // auxiliary device pointer (e.g. for allreduce recv buffer)
     size_t pipeline_chunk_size;
-    size_t num_work_groups; // Number of work-groups for multi-WG persistent kernel (0 = auto-detect)
+    size_t
+        num_work_groups; // Number of work-groups for multi-WG persistent kernel (0 = auto-detect)
 
-    // Per-rank element counts. Used by allgatherv, where blocks may differ in size.
+    // Per-rank element counts. Used by allgatherv, where blocks may differ in size,
+    // and by alltoallv as its recv_counts.
     // Empty means every rank contributes the same block (derived from op.count).
     std::vector<size_t> recv_counts;
 
     // Byte offsets into dst for each rank's block. Used by allgatherv, where the
     // caller (e.g. hierarchical multi-node allgatherv) may place blocks at
-    // global-rank-based offsets that are not a simple prefix sum of recv_counts.
+    // global-rank-based offsets that are not a simple prefix sum of recv_counts,
+    // and by alltoallv as its recv_displs.
     // Empty means the algorithm computes a contiguous prefix-sum layout itself.
-    std::vector<size_t> offsets;
+    std::vector<size_t> recv_offsets;
+
+    // Send-side counterparts of recv_counts / recv_offsets: per-rank element counts
+    // and byte offsets into src. Used by alltoallv, whose per-peer transfer sizes and
+    // buffer offsets are not derivable from op.count. The collectives with a uniform
+    // send block leave these empty.
+    std::vector<size_t> send_counts;
+    std::vector<size_t> send_offsets;
 
     // Sync-only kernel: the persistent kernel performs no device compute and is
     // used purely as a start/exit synchronization point (e.g. allreduce_direct,
@@ -98,17 +114,18 @@ struct ccl_proxy_op {
     // (1 work-group, one sub-group wide) instead of the full-width heuristic.
     bool sync_only;
 
-    // First peer index of the pairwise exchange loop. Used by alltoall, where the
+    // First peer index of the pairwise exchange loop. Used by alltoall(v), where the
     // ranks in [0, peer_start) are handled outside the proxy (scale-up phase or
     // self-copy on the caller's queue). The numa-pairwise variant passes
     // p2p_comm->size(), the scatter variant passes 0 or 1 depending on whether the
     // self-copy is fused into the exchange.
     int peer_start;
 
+    // Root rank in op.comm. Used by rooted proxy operations such as broadcast.
+    int root;
+
     // Monotonic generation assigned by proxy_service at submit time. Shared as
     // the single source of truth between the proxy op and its persistent kernel
     // so they rendezvous on the lifecycle handshake without any state reset.
     uint32_t generation;
-
-    // note: add your additional fields as needed
 };

@@ -34,7 +34,15 @@ target_compile_definitions(mini_json_test PRIVATE
     MINI_JSON_POLICY_PATH="${POLICY_JSON_PATH}")
 target_link_libraries(mini_json_test PRIVATE gtest gtest_main pthread ccl)
 
+# Header-only parser: no link against ccl internals needed.
+add_executable(parse_utils_test parse_utils_test.cpp)
+target_include_directories(parse_utils_test PRIVATE
+    ${LIBCCL_SRC_DIR}
+    ${GTEST_DIR}/include)
+target_link_libraries(parse_utils_test PRIVATE gtest gtest_main pthread)
+
 enable_testing()
 add_test(NAME mini_json_test COMMAND mini_json_test)
+add_test(NAME parse_utils_test COMMAND parse_utils_test)
 
-install(TARGETS mini_json_test RUNTIME DESTINATION tests/unit OPTIONAL)
+install(TARGETS mini_json_test parse_utils_test RUNTIME DESTINATION tests/unit OPTIONAL)

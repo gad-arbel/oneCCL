@@ -27,6 +27,9 @@ target_link_libraries(oneCCL2 PRIVATE "${COVERAGE_CXX_FLAGS}")
 # Add common compatiblity flags
 target_compile_options(oneCCL2 PRIVATE "${COMMON_CXX_FLAGS}")
 
+# Add warning flags
+target_compile_options(oneCCL2 PRIVATE "${ONECCL_WARNING_COMPILE_FLAGS}")
+
 # Add additional performance flags
 target_compile_options(oneCCL2 PRIVATE "${EXTRA_CXX_FLAGS}")
 target_link_options(oneCCL2 PRIVATE "${EXTRA_CXX_FLAGS}")

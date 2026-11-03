@@ -16,6 +16,7 @@ if (${CMAKE_PROJECT_NAME} STREQUAL ${PROJECT_NAME})
     set(COMMON_CMAKE_DIR ${PROJECT_SOURCE_DIR}/../../cmake)
     include(${COMMON_CMAKE_DIR}/helpers.cmake)
     define_compute_backend()
+    find_package(MPI REQUIRED)
 endif()
 
 if (NOT PV_ENVIRONMENT)
@@ -26,18 +27,12 @@ endif()
 
 set(EXAMPLES_INC_DIRS ${EXAMPLES_DIR}/include)
 message(STATUS "EXAMPLES_INC_DIRS: ${EXAMPLES_INC_DIRS}")
-message(STATUS "EXAMPLES_LIB_DIRS: ${EXAMPLES_LIB_DIRS}")
 include_directories(${EXAMPLES_INC_DIRS})
-link_directories(${EXAMPLES_LIB_DIRS})
 
 set(REG_TESTS_DIR ${PROJECT_SOURCE_DIR})
 set(REG_TESTS_INC_DIR ${REG_TESTS_DIR}/include)
 message(STATUS "REG_TESTS_INC_DIR: ${REG_TESTS_INC_DIR}")
 include_directories(${REG_TESTS_INC_DIR})
-
-if (DEFINED ENV{I_MPI_ROOT})
-    set(I_MPI_ROOT "$ENV{I_MPI_ROOT}")
-endif()
 
 if (DEFINED ENV{CCL_ROOT})
     set(CCL_ROOT "$ENV{CCL_ROOT}")

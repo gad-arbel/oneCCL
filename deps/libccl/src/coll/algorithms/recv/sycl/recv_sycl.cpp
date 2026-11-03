@@ -45,6 +45,7 @@ static ccl::event recv_sycl_single_node(sycl::queue& q,
                                         ccl_stream* global_stream,
                                         const pt2pt_attr& attr,
                                         const std::vector<ccl::event>& deps,
+                                        bool pt2pt_read,
                                         bool& done) {
     ccl_comm* node_comm = comm->get_node_comm().get();
     auto node_peer_rank = node_comm->get_rank_from_global(peer_rank);
@@ -111,13 +112,12 @@ static ccl::event recv_sycl_single_node(sycl::queue& q,
     if (is_arc_card(ccl::ze::get_device_family(global_stream->get_ze_device())) &&
         !group_impl::is_group_active()) {
         if (count * ccl::get_datatype_size(dtype) >
-             ccl::global_data::env().sycl_pt2pt_simple_threshold) {
+            ccl::global_data::env().sycl_pt2pt_simple_threshold) {
             if (ccl::global_data::env().sycl_pt2pt_copy_engine) {
                 return recv_memcpy(
                     recv_buf, count, dtype, peer_rank, comm, global_stream, deps, done);
             }
-            return recv_simple(
-                recv_buf, count, dtype, peer_rank, comm, global_stream, deps, done);
+            return recv_simple(recv_buf, count, dtype, peer_rank, comm, global_stream, deps, done);
         }
         ccl::event e = recv_ll(recv_buf, count, dtype, peer_rank, comm, global_stream, deps, done);
         return e;
@@ -135,7 +135,7 @@ static ccl::event recv_sycl_single_node(sycl::queue& q,
 
     ccl::utils::pt2pt_handle_exchange_info info{ node_peer_rank,
                                                  ccl::utils::pt2pt_handle_exchange_role::receiver };
-    if (!ccl::global_data::env().sycl_pt2pt_read) {
+    if (!pt2pt_read) {
         info.role = ccl::utils::pt2pt_handle_exchange_role::sender;
     }
 
@@ -160,7 +160,7 @@ static ccl::event recv_sycl_single_node(sycl::queue& q,
     auto sycl_deps = get_sycl_events(deps);
 
     // Read mode => remote pointer -> local buffer
-    if (ccl::global_data::env().sycl_pt2pt_read) {
+    if (pt2pt_read) {
         LOG_DEBUG("recv_sycl_single_node: read mode enabled");
 
         // in read mode we have to wait for confirmation from sender
@@ -222,8 +222,8 @@ static ccl::event recv_sycl_single_node(sycl::queue& q,
 
 static ccl::event recv_mt_sycl_single_node(sycl::queue& q,
                                            void* recv_buf,
-                                           size_t /*recv_count*/,
-                                           ccl::datatype /*dtype*/,
+                                           size_t recv_count,
+                                           ccl::datatype dtype,
                                            int peer_rank,
                                            ccl_comm* comm,
                                            ccl_stream* global_stream,
@@ -279,45 +279,42 @@ static ccl::event recv_mt_sycl_single_node(sycl::queue& q,
         return ccl::event::create_from_native(e);
     }
 
-    // get the operation ID from the shared handshake
-    int op_id = g.get_shared_op_id(comm->global_current_id, false);
-
-    // publish our pointer in pt2pt_hash_table
-    do_ipc_exchangeExt(comm,
-                       g.pt2pt_hash_table,
-                       global_stream,
-                       { recv_buf },
-                       comm->global_current_id,
-                       true /* is_pt2pt */
-    );
+    // Rendezvous slot for this direction only, so a concurrent pt2pt pair on the
+    // same communicator cannot pick up our buffer or the wrong copy event.
+    auto& rendezvous = g.get_pt2pt_rendezvous(global_id, src, dst);
 
     // produce a device event that signals "my dependencies are done, my buffer is ready"
     auto sycl_deps = get_sycl_events(deps);
     sycl::event recv_ready_event = submit_wait_on_events(q, sycl_deps);
 
-    // store that in shared_resources so the sender can wait on it
-    g.set_receiver_ready_event(op_id, recv_ready_event);
-
-    // wait for the host handshake (a host-level signal that the copy is done)
+    sycl::event sender_copy_event;
     {
-        auto& handshake = g.handshakes[op_id];
-        // We mark that we have published our pointer
-        {
-            std::lock_guard<std::mutex> lk(handshake.m);
-            handshake.recv_published = true;
-            handshake.cv.notify_one();
-        }
+        // publish our buffer and readiness event for the sender of this pair
+        std::unique_lock<std::mutex> lk(rendezvous.m);
+        rendezvous.recv_ptr = recv_buf;
+        rendezvous.recv_bytes = ccl::get_datatype_size(dtype) * recv_count;
+        rendezvous.recv_ready = recv_ready_event;
+        rendezvous.recv_published = true;
+        rendezvous.cv.notify_one();
 
-        // Wait until the sender says "copy_done" (a host-level guarantee)
-        std::unique_lock<std::mutex> lk(handshake.m);
-        while (!handshake.copy_done) {
-            handshake.cv.wait(lk);
-        }
-        handshake.copy_done = false; // reset
+        // wait until the sender has submitted its copy (a host-level guarantee)
+        rendezvous.cv.wait(lk, [&] {
+            return rendezvous.copy_done;
+        });
+        rendezvous.copy_done = false; // reset so the entry can be reused
+        CCL_THROW_IF_NOT(rendezvous.send_bytes == rendezvous.recv_bytes,
+                         "send/recv size mismatch, send bytes=",
+                         rendezvous.send_bytes,
+                         " recv bytes=",
+                         rendezvous.recv_bytes,
+                         " src=",
+                         src,
+                         " dst=",
+                         dst);
+        sender_copy_event = rendezvous.copy_event;
     }
 
     // combine the final copy_event from the sender with our local deps
-    sycl::event sender_copy_event = g.copy_event;
     sycl_deps = get_sycl_events(deps);
     sycl_deps.push_back(sender_copy_event);
     sycl::event ret_sycl_event = submit_wait_on_events(q, sycl_deps);
@@ -344,9 +341,11 @@ ccl::event recv_sycl(sycl::queue q,
         is_single_card = topo_manager.is_single_card;
     }
 
+    // decided per comm, not stored in env: a sticky global flag makes peers that
+    // used different comms before pick different read/write modes and hang
+    const bool pt2pt_read = ccl::global_data::env().sycl_pt2pt_read || is_single_card;
     if (is_single_card) {
         LOG_DEBUG("recv_sycl: read mode enabled: tiles on the same card are detected");
-        ccl::global_data::env().sycl_pt2pt_read = 1;
     }
 
     if (is_single_node) {
@@ -356,8 +355,17 @@ ccl::event recv_sycl(sycl::queue q,
         }
         else if (!group_impl::is_group_active() ||
                  group_impl::use_group_scale_up(comm, peer_rank, global_stream)) {
-            ccl::event e = recv_sycl_single_node(
-                q, recv_buf, count, dtype, peer_rank, comm, global_stream, attr, deps, done);
+            ccl::event e = recv_sycl_single_node(q,
+                                                 recv_buf,
+                                                 count,
+                                                 dtype,
+                                                 peer_rank,
+                                                 comm,
+                                                 global_stream,
+                                                 attr,
+                                                 deps,
+                                                 pt2pt_read,
+                                                 done);
             if (done) {
                 return e;
             }

@@ -24,3 +24,8 @@ constexpr size_t MAX_RANKS_PER_PLANE = 8;
 constexpr size_t MAX_TILES = MAX_RANKS_PER_CARD;
 constexpr size_t MAX_GPUS = MAX_RANKS_PER_PLANE;
 constexpr size_t MAX_NODE_RANKS = MAX_RANKS_PER_CARD * MAX_RANKS_PER_PLANE;
+
+// Independent channels (work-groups) a collective may run concurrently over the pairwise
+// barrier. A storage bound, not a channel count - it sizes the per-peer flag and counter cells
+// coll_init() sets up, and an algorithm picks its own count within it.
+constexpr size_t MAX_P2P_CHANNELS = 8;

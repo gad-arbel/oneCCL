@@ -19,14 +19,26 @@
 // JSON-based algorithm/protocol selection engine.
 //
 // Design:
-//   - The engine loads a JSON policy file (path from CCL_SELECTION_POLICY env
+//   - The engine loads a JSON policy file (path from CCL_SELECTION_POLICY_PATH env
 //     var) and answers `resolve(collective, runtime_param)` with a leaf
 //     decision (algorithm name + optional protocol name + optional knobs).
 //   - Selection fields (inputs the traverser matches on):
-//       msg_size, count, comm_size, phase, p2p_domain, dtype, atl_transport,
-//       has_p2p_access, is_multi_thread, is_arc, is_recording
+//       msg_size, send_msg_size, count, comm_size, phase, p2p_domain, dtype, has_p2p_access,
+//       is_multi_thread, is_arc, is_recording, transport, direct_gpu_rdma, use_copy_engine
 //   - Terminal leaves (outputs):
 //       protocol=<name> (optional wrapper) -> algorithm=<name>
+//   - Leaf knobs: `"<name>=<value>": {}` children of an algorithm node, handed
+//     back in LeafDecision::params; read them with LeafDecision::knob*().
+//   - global_config: top-level `"global_config": { "CCL_<VAR>": <value> }`.
+//     Each key names a CCL_* environment variable. While env_data::parse() runs,
+//     the value replaces that variable's env_data field, also when the
+//     environment sets it (env_overrides(); see policy_env.hpp). Only
+//     variables env_data::parse() reads can be set; nothing is setenv()'d.
+//   - Known knobs are listed in policy_knobs.hpp; the engine warns at load
+//     about unknown or invalid ones (and keeps them).
+//   - Numbers in the policy (filter values, knobs, global_config) accept a
+//     K/M/G/T (x1000) or Kb/Mb/Gb/Tb (x1024) suffix, case-insensitive:
+//     8M = 8000000, 8Mb = 8388608. Environment variables keep their own parsing.
 //   - Traversal is depth-first, ordered by the JSON's insertion order (first
 //     matching sibling wins; `<param>=any` acts as the else branch).
 //
@@ -38,8 +50,8 @@
 #include <vector>
 
 #include "coll/algorithms/algorithm_utils.hpp"  // ccl_coll_type
-
-struct ccl_selector_param;
+#include "common/utils/parse_utils.hpp"
+#include "coll/selection/policy/selection_engine_input.hpp"
 
 namespace ccl {
 namespace selection {
@@ -51,6 +63,30 @@ struct LeafDecision {
     std::string algorithm;                // required, e.g. "ring"
     std::optional<std::string> protocol;  // optional, e.g. "sycl_ll" / "sycl_simple"
     std::unordered_map<std::string, std::string> params;  // "k"="2", etc.
+
+    // Typed knob reads; nullopt if the knob is absent or doesn't parse.
+    std::optional<std::string> knob(const std::string& name) const {
+        const auto it = params.find(name);
+        if (it == params.end())
+            return std::nullopt;
+        return it->second;
+    }
+    std::optional<std::uint64_t> knob_size(const std::string& name) const {
+        const auto v = knob(name);
+        return v ? utils::parse_size(*v) : std::nullopt;
+    }
+    std::optional<std::int64_t> knob_int(const std::string& name) const {
+        const auto v = knob(name);
+        return v ? utils::parse_int(*v) : std::nullopt;
+    }
+    std::optional<double> knob_double(const std::string& name) const {
+        const auto v = knob(name);
+        return v ? utils::parse_double(*v) : std::nullopt;
+    }
+    std::optional<bool> knob_bool(const std::string& name) const {
+        const auto v = knob(name);
+        return v ? utils::parse_bool(*v) : std::nullopt;
+    }
 };
 
 // -----------------------------------------------------------------------------
@@ -70,11 +106,12 @@ public:
     // so matches() is a switch, not a chain of string compares.
     enum class Field {
         // Numeric fields (Predicate::integer or Predicate::power_of_two).
-        msg_size, count, comm_size,
+        msg_size, send_msg_size, count, comm_size,
         // Enum-like string fields (Predicate::enum_val).
-        phase, p2p_domain, dtype, atl_transport,
-        // Boolean tri-state fields on ccl_selector_param.
-        has_p2p_access, is_multi_thread, is_arc, is_recording,
+        phase, p2p_domain, dtype, transport,
+        // Optional-bool fields on selection_engine_input (nullopt → never matches).
+        has_p2p_access, is_multi_thread, is_arc, is_recording, direct_gpu_rdma,
+        use_copy_engine,
         // Terminals — traversal handles these directly.
         protocol, algorithm,
         // Not-a-filter leaf-scoped knob (e.g. `k=2`).
@@ -103,8 +140,8 @@ public:
 
     bool is_wildcard() const { return pred_ == Predicate::wildcard; }
 
-    // Evaluate this branch against the runtime param bundle.
-    bool matches(const ccl_selector_param& param) const;
+    // Evaluate this branch against the runtime input.
+    bool matches(const selection_engine_input& input) const;
 
 private:
     std::string param_;
@@ -150,31 +187,28 @@ public:
 
     // True when at least one collective root OR global_config key was loaded.
     // Callers can early-out on the no-policy case with a single boolean load
-    // — cheaper than has_rules_for()/global_option() which do hashmap lookups.
+    // — cheaper than has_rules_for(), which does a hashmap lookup.
     bool is_loaded() const noexcept { return loaded_; }
 
     // Whether any rules are registered for `collective` (e.g. "allgather").
     bool has_rules_for(const std::string& collective) const;
 
-    // Read a value from the file's top-level `"global_config": { ... }` block.
-    // Returns nullopt if the file wasn't loaded, has no `global_config`, or the
-    // key is absent. Used for global directives that steer the runtime
-    // *outside* the tree traversal (e.g. p2p_domain_level, log_selections). The
-    // key namespace is intentionally separate from selection-field names
-    // to keep global config from being confused with tree filters.
-    std::optional<std::string> global_option(const std::string& key) const;
+    // global_config entries named after a CCL_* environment variable, e.g.
+    // "CCL_SYCL_TMP_BUF_SIZE": "512Mb". The env parser uses them in place of
+    // the environment. Empty when no policy is loaded.
+    std::unordered_map<std::string, std::string> env_overrides() const;
 
     // Walk the tree for `collective` and return a decision if traversal
     // reaches a terminal, or nullopt if no branch matched at some level or
     // the collective is absent from the file.
     std::optional<LeafDecision> resolve(const std::string& collective,
-                                        const ccl_selector_param& param) const;
+                                        const selection_engine_input& input) const;
 
     // ccl_coll_type overload. Owns the ctype → policy-key mapping (notably
     // ccl_coll_allgatherv → "allgather"), so callers don't each have to
     // remember it. Returns nullopt for absent-in-policy or unmapped types.
     std::optional<LeafDecision> resolve(ccl_coll_type ctype,
-                                        const ccl_selector_param& param) const;
+                                        const selection_engine_input& input) const;
 
 private:
     std::unordered_map<std::string, std::unique_ptr<SelectionNode>> roots_;
@@ -188,10 +222,13 @@ private:
 // Global singleton accessor.
 // -----------------------------------------------------------------------------
 //
-// The engine is lazy-initialised: the first call reads CCL_SELECTION_POLICY,
-// loads the file if the env var is set, and caches the result. Thread-safe
-// (Meyers singleton with once_flag for load).
+// The engine is loaded once per process, thread-safe. In SYCL+ZE builds
+// env_data::parse() loads it first, through policy_env_overrides(path);
+// otherwise the first call here loads CCL_SELECTION_POLICY_PATH.
 SelectionEngine& global_engine();
+
+// Policy root name of a collective ("allgather" for allgatherv).
+const char* ctype_to_policy_key(ccl_coll_type ctype);
 
 }  // namespace selection
 }  // namespace ccl

@@ -147,6 +147,9 @@ void ccl_comm::create_topo_subcommsExt(int size, int rank) {
 
     node_comm->is_uniform = true;
     r2r_comm->is_uniform = true;
+
+    node_comm->p2p_level = ccl_p2p_domain_level::p2p_node;
+    r2r_comm->p2p_level = ccl_p2p_domain_level::p2p_node;
 }
 
 ccl_comm* ccl_comm::create_subcommExt(const std::vector<int>& colors, int rank, int key) const {
@@ -358,6 +361,9 @@ ccl_comm* ccl_comm::create_subcomm_split_mt(int color, int key) const {
     new_comm->node_comm->is_uniform = true;
     new_comm->r2r_comm->is_uniform = true;
 
+    new_comm->node_comm->p2p_level = ccl_p2p_domain_level::p2p_node;
+    new_comm->r2r_comm->p2p_level = ccl_p2p_domain_level::p2p_node;
+
     // Initialize SYCL kernel shared buffers for the split comm.
     // Each split group has its own global_current_id with barriers sized to split_size,
     // so only threads in this group participate in coll_initExt barriers.
@@ -393,11 +399,6 @@ void ccl_comm::initExt(int size,
     enable_multi_thread_instance = true;
     // Set the flag in shared_data for group operations
     ccl::global_data::get().shared_data->is_multi_thread_instance = true;
-#if defined(CCL_ENABLE_SYCL) && defined(CCL_ENABLE_ESIMD)
-    // TODO: choose more correct place for falling back
-    CCL_THROW_IF_NOT(ccl::global_data::env().sycl_esimd == 0,
-                     "esimd kernels are not support by multi-threading case");
-#endif // CCL_ENABLE_SYCL && CCL_ENABLE_ESIMD
     comm_rank = rank;
     comm_size = size;
 

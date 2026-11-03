@@ -15,11 +15,15 @@
 */
 
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
+#include "coll/algorithms/utils/barrier_data.hpp"
 #include "coll/algorithms/broadcast/sycl/broadcast_sycl.hpp"
 #include "coll/algorithms/broadcast/sycl/broadcast_scaleout_scatter_allgather.hpp"
 #include "coll/algorithms/scatter/sycl/scatter_sycl.hpp"
 #include "coll/algorithms/allgatherv/sycl/allgatherv_sycl.hpp"
 #include "common/log/log.hpp"
+#include "proxy/proxy.hpp"
+
+#include <atomic>
 
 namespace ccl {
 namespace v1 {
@@ -32,9 +36,10 @@ namespace {
 
 // Truth-mode switch for benchmarking the requested algorithm without silent
 // fallback. When enabled, unsupported shapes throw instead of returning
-// done=false to legacy.
+// done=false to legacy. Applies only with ENABLE=1.
 bool sag_force_enabled() {
-    return ccl::global_data::env().sycl_broadcast_scatter_allgather_force;
+    return ccl::global_data::env().sycl_broadcast_scatter_allgather_enable == 1 &&
+           ccl::global_data::env().sycl_broadcast_scatter_allgather_force;
 }
 
 // Optional safety guard: cap this algorithm to local node sizes where it is
@@ -101,16 +106,9 @@ ccl::event broadcast_scaleout_scatter_allgather(sycl::queue& q,
         return ev;
     }
 
+    // The message-size check is done by the resolver.
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     const size_t elem_size = ccl_dtype.size();
-    const size_t total_bytes = count * elem_size;
-
-    // In normal mode, the configured threshold selects between SAG and the
-    // lower-overhead legacy path. Force mode bypasses this selection gate.
-    if (!force_sag &&
-        total_bytes < ccl::global_data::env().sycl_broadcast_scatter_allgather_threshold) {
-        return ev; // caller falls back
-    }
 
     // The current rank-to-domain math is intentionally conservative: it supports
     // block-ordered domains such as node-level ppn blocks or equal-sized sub-node
@@ -140,6 +138,10 @@ ccl::event broadcast_scaleout_scatter_allgather(sycl::queue& q,
     const size_t my_chunk_offset_bytes = static_cast<size_t>(my_p2p_rank) * chunk_max * elem_size;
     void* my_chunk_ptr = ptr_offset(recv_buf, my_chunk_offset_bytes);
 
+    // Select the proxy path once for the rail operation.
+    const bool proxy_requested = ccl::global_data::env().sycl_enable_broadcast_scaleout_proxy;
+    const bool use_proxy = proxy_requested && ccl::global_data::get().proxy_service->is_started();
+
     // Convert incoming dependencies into a local event chain we can move between phases.
     // This preserves caller ordering while letting each phase depend on the previous one.
     std::vector<sycl::event> dep_events = get_sycl_events(deps);
@@ -157,7 +159,7 @@ ccl::event broadcast_scaleout_scatter_allgather(sycl::queue& q,
     if (i_am_on_root_domain) {
         bool scatter_done = false;
         // SAG explicitly uses pre-exchanged tmp buffers for its local scatter.
-        sycl_scaleup_options scatter_attr{/*force_tmp=*/true};
+        sycl_scaleup_options scatter_attr{ /*force_tmp=*/true };
         ccl::event scatter_ev =
             scatter_sycl_single_domain(q,
                                        send_buf, // full source buffer (only meaningful on root)
@@ -189,6 +191,26 @@ ccl::event broadcast_scaleout_scatter_allgather(sycl::queue& q,
     //   root_domain_idx). Destination(s) are the ranks on the other domains.
     // -----------------------------------------------------------------
     {
+        // If requested and available, move the blocking ATL rail operation off
+        // the caller's queue host_task. The sync-only persistent kernel preserves
+        // scatter -> rail -> allgather ordering in the queue/graph.
+        if (proxy_requested && !use_proxy) {
+            // One line per rank is enough to explain a missing proxy proof
+            // without adding noise for every benchmark iteration.
+            static std::atomic<bool> inactive_marker_emitted{ false };
+            bool expected = false;
+            if (inactive_marker_emitted.compare_exchange_strong(expected, true)) {
+                LOG_WARN("BCAST_SAG_PROXY_THREAD_INACTIVE: broadcast proxy requested but "
+                         "the proxy service is not started; using host_task rail fallback");
+            }
+        }
+        LOG_DEBUG("broadcast scatter-allgather rail: count ",
+                  my_chunk_count,
+                  " root ",
+                  root_domain_idx,
+                  " use_proxy: ",
+                  use_proxy);
+
         bool rail_done = false;
         ccl::event rail_ev = broadcast_scaleout_sycl(
             q,
@@ -200,7 +222,9 @@ ccl::event broadcast_scaleout_scatter_allgather(sycl::queue& q,
             r2r_comm.get(),
             chain,
             /*original_deps=*/false,
-            rail_done);
+            rail_done,
+            /*is_cpu_buffers=*/false,
+            use_proxy);
 
         if (!rail_done) {
             sag_throw_if_forced(force_sag, "rail broadcast phase did not complete");
@@ -234,7 +258,7 @@ ccl::event broadcast_scaleout_scatter_allgather(sycl::queue& q,
     bool ag_done = false;
     // Use pre-exchanged tmp buffers so the final local allgather does not
     // perform a blocking host-side IPC exchange for the receive buffer.
-    sycl_scaleup_options ag_attr{/*force_tmp=*/true};
+    sycl_scaleup_options ag_attr{ /*force_tmp=*/true };
     ccl::event ag_ev = allgather_scaleup_sycl(q,
                                               my_chunk_ptr, // each rank sends its chunk
                                               my_chunk_count,
@@ -252,6 +276,17 @@ ccl::event broadcast_scaleout_scatter_allgather(sycl::queue& q,
     if (!ag_done) {
         sag_throw_if_forced(force_sag, "local allgather phase did not complete");
         return ev; // allgather bailed → caller falls back
+    }
+
+    // One INFO marker per rank/process establishes that the complete SAG path
+    // was selected. The proxy-specific marker is emitted by the proxy upcall,
+    // so the performance runner can distinguish proxy execution from the
+    // intentional caller-host_task baseline and from a top-level fallback.
+    static std::atomic<bool> sag_marker_emitted{ false };
+    bool expected = false;
+    if (sag_marker_emitted.compare_exchange_strong(expected, true)) {
+        LOG_INFO("BCAST_SAG_ACTIVE: Scatter-Rail-AllGather selected; rail path: ",
+                 use_proxy ? "proxy_thread" : "caller_host_task");
     }
 
     done = true;

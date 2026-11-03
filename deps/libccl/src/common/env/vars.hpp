@@ -214,13 +214,21 @@ constexpr const char* CCL_ATL_CACHE = "CCL_ATL_CACHE";
 /**
  * @brief Set this environment variable to specify OFI domain names for rank-specific domain selection.
  *
- * @details Comma-separated list of OFI domain names to be used for selecting specific
- * domains based on local rank index. The i-th local rank will use the i-th domain name
- * from the provided list. This allows for explicit control over which OFI domains
- * are used by different ranks, enabling optimized fabric resource utilization.
+ * @details A comma-separated list with one entry per local rank: local rank i takes the i-th entry.
+ * An entry is either a single domain name or a ':'-separated group of them.
  *
- * Example: "mlx5_0,mlx5_1,mlx5_2,mlx5_3" - assigns different InfiniBand devices
- * to ranks based on their local index.
+ * Single names - one domain per local rank: local rank i pins the i-th name. Example:
+ * "mlx5_0,mlx5_1,mlx5_2,mlx5_3" assigns a different InfiniBand device to each local rank.
+ *
+ * ':'-separated groups - one group per local rank: a group opens one provider per name, so a group of
+ * several names has that rank drive several NICs. Example:
+ * "mlx5_0:mlx5_1,mlx5_0:mlx5_1,mlx5_2:mlx5_3,mlx5_2:mlx5_3" gives the first two local ranks mlx5_0
+ * and mlx5_1, the next two mlx5_2 and mlx5_3. The group is an ordered list: provider i is the i-th
+ * name written, and endpoint i selects provider i % <NICs opened>, so the order is the endpoint-to-NIC
+ * mapping as well as the NIC set. Such a group is the provider list itself rather than a filter over
+ * one, so it replaces CCL_MNIC / CCL_MNIC_NAME / CCL_MNIC_COUNT / CCL_MNIC_OFFSET, which are then
+ * ignored. All groups must be the same size, none may name a domain twice, and there must be one group
+ * per local rank - each fatal at init, the address exchange being per provider index.
  *
  * By-default: "not-specified"
  */
@@ -698,26 +706,6 @@ constexpr const char* CCL_OFI_INIT_ENABLE_HOSTNAME_SHARING = "CCL_OFI_INIT_ENABL
  * @addtogroup OneCCLvars
  * @{
  */
-/**
- * @brief Set this environment variable to specify the OCCP (oneCCL Communication Protocol) server hostname.
- *
- * @details
- * 
- * Syntax
- * CCL_OCCP_SERVER_HOSTNAME="<hostname>"
- *
- * Arguments
- * "<hostname>"	Description
- * 	- HOSTNAME	The hostname or IP address where the OCCP server should run or connect to
- *
- * Description
- * Set this environment variable to specify the hostname for the OCCP server used for 
- * rank coordination and endpoint exchange in oneCCL OFI transport.
- *
- * By-default: "localhost"
- */
-constexpr const char* CCL_OCCP_SERVER_HOSTNAME = "CCL_OCCP_SERVER_HOSTNAME";
-
 /**
  * @brief Set this environment variable to specify the number of I/O threads for the OCCP server.
  *

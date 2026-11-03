@@ -20,9 +20,11 @@
 #include <mutex>
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
 #include "common/global/global.hpp"
+#include "coll/selection/policy/policy_env.hpp"
 #include "common/log/log.hpp"
 #include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_large_sycl_ring.hpp"
 #include "coll/algorithms/alltoallv/sycl/alltoallv_sycl.hpp"
+#include "coll/algorithms/alltoallv/sycl/alltoallv_large_sycl_no_ipc.hpp"
 
 template <typename DataType, size_t vec_size>
 class oneccl_alltoallv_write_aligned {};
@@ -96,6 +98,12 @@ void calculate_peel_counts(const std::array<DataType *, MAX_NODE_RANKS> &buf_to_
                      "alignment must be a multiple of DataType size");
 
     for (size_t i = 0; i < comm_size; ++i) {
+        // check if counts > 0 at first
+        if (counts[i] == 0) {
+            peel_front_count[i] = 0;
+            continue;
+        }
+        CCL_THROW_IF_NOT(buf_to_peel[i], "non-zero count requires a valid buffer");
         // calculate aligned pointers
         uintptr_t ptr_val = reinterpret_cast<uintptr_t>(buf_to_peel[i]);
         // the first vector is always peeled
@@ -149,6 +157,10 @@ bool check_all_aligned(size_t *peel_front_count,
         // additional precondition check
         CCL_THROW_IF_NOT(peel_front_count[i] <= max_peel_loop_count,
                          "peeling more elements than the upper limit");
+        // a peer with nothing to transfer imposes no alignment requirement
+        if (counts[i] == 0) {
+            continue;
+        }
         size_t peel_front_bytes = peel_front_count[i] * sizeof(DataType);
         bool is_rank_aligned = (peel_front_bytes == alignment_bytes);
         // each per-rank count must be a whole number of vectors, otherwise the
@@ -172,6 +184,7 @@ bool check_all_aligned(size_t *peel_front_count,
 template <size_t vec_size, typename DataType>
 std::vector<sycl::event> alltoallv_vec_write_aligned_with_ce(
     sycl::queue &queue,
+    ccl_stream *global_stream,
     const std::shared_ptr<ccl_comm> node_comm,
     const std::array<DataType *, MAX_NODE_RANKS> &send_bufs,
     const std::vector<size_t> &send_counts,
@@ -180,22 +193,35 @@ std::vector<sycl::event> alltoallv_vec_write_aligned_with_ce(
     const size_t rank,
     const size_t comm_size,
     sycl::event &dep) {
-    sycl::event e;
+    std::vector<sycl::event> events;
     const bool use_barrier = ccl::global_data::env().sycl_alltoall_use_barrier;
     const bool is_cpu_barrier = ccl::global_data::env().sycl_ccl_barrier;
+
+    // CRI: the self copy (i == 0) runs on its own copy engine, next to the peer copies on queue.
+    // In-place alltoallv falls back before reaching here.
+    std::optional<sycl::queue> self_copy_q =
+        get_self_copy_queue(global_stream,
+                            "alltoallv",
+                            send_counts[rank] * sizeof(DataType),
+                            ccl::selection::call_env().sycl_alltoallv_self_copy_threshold);
+
     for (uint32_t i = 0; i < comm_size; i++) {
         // scatter the ranks
         uint32_t peer = (rank + i) % comm_size;
-        e = queue.submit([=](sycl::handler &h) {
-            h.depends_on(dep);
-            h.memcpy(recv_write_ptrs[peer],
-                     (char *)send_bufs[rank] + send_offsets[peer],
-                     send_counts[peer] * sizeof(DataType));
-        });
+        if (send_counts[peer] > 0) {
+            sycl::queue &copy_q = (peer == rank && self_copy_q) ? *self_copy_q : queue;
+            events.push_back(copy_q.submit([=](sycl::handler &h) {
+                h.depends_on(dep);
+                h.memcpy(recv_write_ptrs[peer],
+                        (char *)send_bufs[rank] + send_offsets[peer],
+                        send_counts[peer] * sizeof(DataType));
+            }));
+        }
+        
         if (use_barrier)
             invoke_p2p_barrier(node_comm, queue, {}, is_cpu_barrier);
     }
-    return { e };
+    return events;
 }
 
 template <size_t vec_size, typename DataType>
@@ -240,8 +266,10 @@ std::vector<sycl::event> alltoallv_vec_write_aligned_with_eu(
         h.parallel_for(nd_range, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(sg_size)]] {
             for (uint32_t i = 0; i < comm_size; i++) {
                 uint32_t peer = (rank + i) % comm_size;
-                copy_kernel_wrap<DataType, new_vec_size, new_vec_size>(
-                    recv_buf_ptrs[peer], send_ptr + offset[peer], count[peer], 1);
+                if (count[peer] > 0) {
+                    copy_kernel_wrap<DataType, new_vec_size, new_vec_size>(
+                        recv_buf_ptrs[peer], send_ptr + offset[peer], count[peer], 1);
+                }
             }
         });
     });
@@ -251,6 +279,7 @@ std::vector<sycl::event> alltoallv_vec_write_aligned_with_eu(
 template <size_t vec_size, typename DataType>
 std::vector<sycl::event> alltoallv_vec_write_aligned(
     sycl::queue &queue,
+    ccl_stream *global_stream,
     const std::shared_ptr<ccl_comm> node_comm,
     const std::array<DataType *, MAX_NODE_RANKS> &send_bufs,
     const std::vector<size_t> &send_counts,
@@ -262,7 +291,7 @@ std::vector<sycl::event> alltoallv_vec_write_aligned(
     sycl::event &dep) {
     CCL_THROW_IF_NOT(vec_size > 0, "vec_size has to be a positive value");
 
-    bool is_arc = is_arc_card(ccl::global_data::get().ze_data->devices[0].family);
+    bool is_arc = is_arc_card(global_stream->get_device_family());
     // for BMG on PCIe systems
     if (is_arc) {
         return alltoallv_vec_write_aligned_with_eu<vec_size, DataType>(queue,
@@ -310,6 +339,7 @@ std::vector<sycl::event> alltoallv_vec_write_aligned(
 template <size_t vec_size, typename DataType>
 std::vector<sycl::event> alltoallv_vec_write(
     sycl::queue &queue,
+    ccl_stream *global_stream,
     const std::shared_ptr<ccl_comm> node_comm,
     const std::array<DataType *, MAX_NODE_RANKS> &send_bufs,
     const std::vector<size_t> &send_counts,
@@ -323,12 +353,15 @@ std::vector<sycl::event> alltoallv_vec_write(
     CCL_THROW_IF_NOT(vec_size > 0, "vec_size has to be a positive value");
     constexpr size_t vec_size_bytes = vec_size * sizeof(DataType);
 
-    bool is_arc = is_arc_card(ccl::global_data::get().ze_data->devices[0].family);
+    bool is_arc = is_arc_card(global_stream->get_device_family());
     if (is_arc) {
-        const bool use_memcpy = ccl::global_data::env().sycl_alltoall_copy_engine;
+        // auto keeps the copy engine
+        const bool use_memcpy = ccl::selection::call_env().sycl_alltoall_copy_engine_mode !=
+                                ccl::copy_engine_kernel;
         // copy engine can handle alignment internally
         if (use_memcpy) {
             return alltoallv_vec_write_aligned_with_ce<vec_size, DataType>(queue,
+                                                                           global_stream,
                                                                            node_comm,
                                                                            send_bufs,
                                                                            send_counts,
@@ -368,6 +401,7 @@ std::vector<sycl::event> alltoallv_vec_write(
         // fallback to simpler implementation for performance reasons
         LOG_DEBUG("alltoallv_vec_write: all ranks are aligned, using aligned implementation");
         return alltoallv_vec_write_aligned<vec_size, DataType>(queue,
+                                                               global_stream,
                                                                node_comm,
                                                                send_bufs,
                                                                send_counts,
@@ -786,6 +820,7 @@ std::vector<sycl::event> alltoallv_vec_read(
 template <size_t vec_size, typename DataType>
 std::vector<sycl::event> alltoallv_large_vec_size_impl(
     sycl::queue &queue,
+    ccl_stream *global_stream,
     const std::shared_ptr<ccl_comm> node_comm,
     const std::array<DataType *, MAX_NODE_RANKS> &send_bufs,
     const std::vector<size_t> &send_counts,
@@ -815,6 +850,7 @@ std::vector<sycl::event> alltoallv_large_vec_size_impl(
         }
         case ccl_sycl_alltoall_protocol::write: {
             return alltoallv_vec_write<vec_size>(queue,
+                                                 global_stream,
                                                  node_comm,
                                                  send_bufs,
                                                  send_counts,
@@ -854,17 +890,58 @@ ccl::event alltoallv_large_impl(const void *send_buf,
 
     sycl::queue q = global_stream->get_native_stream();
 
-    std::vector<void *> ptrs{ (void *)send_buf, (T *)recv_buf }; // index 0 and 1
+    const bool is_arc = is_arc_card(ccl::ze::get_device_family(global_stream->get_ze_device()));
+    const bool is_p2p = node_comm->get_topo_manager().has_p2p_access();
+
+    // Without p2p access the peers' user buffers cannot be IPC-mapped, so the data
+    // has to be staged through the persistent per-rank tmp buffers
+    if (is_arc && !is_p2p) {
+        LOG_DEBUG("alltoallv_large selects simple (no IPC) kernel, max count: ",
+                  options.max_count);
+        sycl::event sycl_e = alltoallv_large_no_ipc_tmp_buf<T>(q,
+                                                               send_buf,
+                                                               send_counts.data(),
+                                                               send_displs.data(),
+                                                               recv_buf,
+                                                               recv_counts.data(),
+                                                               recv_displs.data(),
+                                                               options.max_count,
+                                                               dtype,
+                                                               comm,
+                                                               node_comm,
+                                                               global_stream,
+                                                               deps);
+        return ccl::event::create_from_native(sycl_e);
+    }
+
+    size_t total_recv_count = std::accumulate(recv_counts.begin(), recv_counts.end(), 0ul);
+    size_t total_send_count = std::accumulate(send_counts.begin(), send_counts.end(), 0ul);
+    // Never hand a null pointer to the IPC exchange
+    // A placeholder for a null send_buf/recv_buf. Use the comm's tmp buf: it is a
+    // real device allocation in this comm's context and is already usable by
+    // the IPC exchange, so we avoid a context-bound private allocation
+    // Never read/written: all kernels are gated on counts[peer] > 0.
+    void *send_base = total_send_count > 0 && send_buf ? (void *)send_buf : nullptr;
+    void *recv_base = total_recv_count > 0 && recv_buf ? recv_buf : nullptr;
+    if (!send_base && recv_base)
+        send_base = recv_base;
+    else if (!recv_base && send_base)
+        recv_base = send_base;
+    else if (!send_base && !recv_base)
+        send_base = recv_base = node_comm->get_ipc_dummy_buf(q);
+    CCL_THROW_IF_NOT(send_base && recv_base, "alltoallv: no valid pointer for IPC exchange");
+
+    std::vector<void *> ptrs{ send_base, recv_base }; // index 0 and 1
 
     // ptrs indices start at 2 + i
     // recv_buf offsets for write
     for (size_t i = 0; i < comm_size; ++i)
-        ptrs.push_back((char *)recv_buf + recv_displs[i]);
+        ptrs.push_back(recv_counts[i] == 0 ? recv_base : (char *)recv_base + recv_displs[i]);
 
     // ptrs indices start at 2 + comm_size + i
     // send_buf offsets for read
     for (size_t i = 0; i < comm_size; ++i)
-        ptrs.push_back((char *)send_buf + send_displs[i]);
+        ptrs.push_back(send_counts[i] == 0 ? send_base : (char *)send_base + send_displs[i]);
 
     std::array<T *, MAX_NODE_RANKS> send_pointers;
     std::array<T *, MAX_NODE_RANKS> recv_pointers;
@@ -875,39 +952,47 @@ ccl::event alltoallv_large_impl(const void *send_buf,
 
     if (comm->is_multi_thread_instance() == true) {
         LOG_DEBUG("alltoallv_large running do_ipc_exchangeExt for ptrs");
-        do_ipc_exchangeExt(
-            comm, g->hash_table, global_stream, ptrs, comm->global_current_id);
+        const auto &exchange =
+            do_ipc_exchangeExt(comm, g->hash_table, global_stream, ptrs, comm->global_current_id);
         send_pointers = get_ipc_ptrsExt<T, MAX_NODE_RANKS>(*g.get(),
                                                            node_comm,
-                                                           g->hash_table,
+                                                           exchange,
                                                            0,
                                                            0,
-                                                           (void *)send_buf,
-                                                           comm->global_current_id,
+                                                           send_base,
                                                            comm->get_even_comm(),
                                                            comm->get_pair_comm());
         recv_pointers = get_ipc_ptrsExt<T, MAX_NODE_RANKS>(*g.get(),
                                                            node_comm,
-                                                           g->hash_table,
+                                                           exchange,
                                                            0,
                                                            1,
-                                                           (void *)recv_buf,
-                                                           comm->global_current_id,
+                                                           recv_base,
                                                            comm->get_even_comm(),
                                                            comm->get_pair_comm());
 
         // recv_write_ptrs[peer] == peer_recv_buf + peer_recv_displs[rank]
         recv_write_ptrs = get_ipc_ptrsExt<T, MAX_NODE_RANKS>(
-            *g.get(), node_comm, g->hash_table, 0, 2 + rank,
-            (char *)recv_buf + recv_displs[rank],
-            comm->global_current_id, comm->get_even_comm(), comm->get_pair_comm());
+            *g.get(),
+            node_comm,
+            exchange,
+            0,
+            2 + rank,
+            recv_counts[rank] == 0 ? recv_base : (char *)recv_base + recv_displs[rank],
+            comm->get_even_comm(),
+            comm->get_pair_comm());
 
         // send_read_ptrs[peer] == peer_send_buf + peer_send_displs[rank]
         send_read_ptrs = get_ipc_ptrsExt<T, MAX_NODE_RANKS>(
-            *g.get(), node_comm, g->hash_table, 0, 2 + comm_size + rank,
-            (char *)send_buf + send_displs[rank],
-            comm->global_current_id, comm->get_even_comm(), comm->get_pair_comm());
-        
+            *g.get(),
+            node_comm,
+            exchange,
+            0,
+            2 + comm_size + rank,
+            send_counts[rank] == 0 ? (void *)send_base : (char *)send_base + send_displs[rank],
+            comm->get_even_comm(),
+            comm->get_pair_comm());
+
         if (comm->is_multi_thread_instance()) {
             pthread_barrier_wait(
                 ccl::global_data::get().shared_data->get_barrier(comm->global_current_id));
@@ -919,16 +1004,16 @@ ccl::event alltoallv_large_impl(const void *send_buf,
 
         {
             auto [sched, exchange_entry] = do_ipc_exchange(comm, global_stream, ptrs);
-            send_pointers = get_ipc_ptrs<T, MAX_NODE_RANKS>(node_comm, 0, (void *)send_buf, sched);
-            recv_pointers = get_ipc_ptrs<T, MAX_NODE_RANKS>(node_comm, 1, (void *)recv_buf, sched);
+            send_pointers = get_ipc_ptrs<T, MAX_NODE_RANKS>(node_comm, 0, send_base, sched);
+            recv_pointers = get_ipc_ptrs<T, MAX_NODE_RANKS>(node_comm, 1, recv_base, sched);
 
             // recv_write_ptrs[peer] == peer_recv_buf + peer_recv_displs[rank]
             recv_write_ptrs = get_ipc_ptrs<T, MAX_NODE_RANKS>(
-                node_comm, 2 + rank, (char *)recv_buf + recv_displs[rank], sched);
+                node_comm, 2 + rank, recv_counts[rank] == 0 ? recv_base : (char *)recv_base + recv_displs[rank], sched);
 
             // send_read_ptrs[peer] == peer_send_buf + peer_send_displs[rank]
             send_read_ptrs = get_ipc_ptrs<T, MAX_NODE_RANKS>(
-                node_comm, 2 + comm_size + rank, (char *)send_buf + send_displs[rank], sched);
+                node_comm, 2 + comm_size + rank, send_counts[rank] == 0 ? (void *)send_base : (char *)send_base + send_displs[rank], sched);
         }
     }
     auto dep = invoke_barrier(node_comm, q, dep_events, is_cpu_barrier);
@@ -936,8 +1021,15 @@ ccl::event alltoallv_large_impl(const void *send_buf,
     constexpr size_t vec_size =
         std::max(static_cast<size_t>(8 / sizeof(T)), static_cast<size_t>(1));
 
+    // Always invoke, even when the rank has nothing to send/recv: the write
+    // path (alltoallv_vec_write_aligned_with_ce) issues invoke_p2p_barrier
+    // once per peer in the node_comm regardless of per-peer counts, so every
+    // rank must call it the same number of times or the barrier never
+    // completes and the group hangs. Per-peer work is already guarded with
+    // count[peer] > 0 .
     std::vector<sycl::event> kernel_events =
         alltoallv_large_vec_size_impl<vec_size>(q,
+                                                global_stream,
                                                 node_comm,
                                                 send_pointers,
                                                 send_counts,

@@ -31,9 +31,7 @@ namespace v1 {
 //   3) local ALLGATHER - every p2p domain pools its chunks into recv_buf.
 //
 // Returns done=false to tell the caller "not applicable, fall back to
-// the default chunked broadcast_sycl_multi_domain path." Reasons this
-// returns done=false include unsupported communicator shape, size below
-// the configured threshold, uneven chunks, or the optional max-ppn guard.
+// the default chunked broadcast_sycl_multi_domain path."
 //
 // Gated on is_arc_card() at the caller - non-ARC families (PVC, Xeon
 // Max) use the original path.

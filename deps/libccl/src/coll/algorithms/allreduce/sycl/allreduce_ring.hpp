@@ -18,6 +18,7 @@
 
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
 #include "coll/algorithms/utils/sycl_selection.hpp"
+#include "coll/algorithms/utils/host_task.hpp"
 
 #include "proxy/proxy.hpp"
 #include "proxy/proxy_types.hpp"
@@ -99,7 +100,7 @@ inline sycl::event allreduce_ring_nonblocking(sycl::queue &q,
     void *recv_local_buf = (char *)recv_buf + rank * main_block_count * ccl_dtype.size();
 
     sycl_scaleout_tune_attr rs_tune_attr = tune_attr;
-    rs_tune_attr.set_algo(ccl::sycl_policy::algorithm::ring);
+    rs_tune_attr.set_algo(ccl::sycl_policy::scaleout_algo::ring);
     sycl::event rs_event = reduce_scatter_ring_nonblocking_impl<T>(q,
                                                                    send_buf,
                                                                    recv_local_buf,
@@ -122,7 +123,7 @@ inline sycl::event allreduce_ring_nonblocking(sycl::queue &q,
 
     void *send_local_buf = recv_local_buf;
     sycl_scaleout_tune_attr ag_tune_attr = tune_attr;
-    ag_tune_attr.set_algo(ccl::sycl_policy::algorithm::ring);
+    ag_tune_attr.set_algo(ccl::sycl_policy::scaleout_algo::ring);
     std::vector<size_t> offsets;
     sycl::event ag_event = allgatherv_ring_nonblocking<T>(q,
                                                           send_local_buf,
@@ -326,11 +327,8 @@ inline sycl::event allreduce_scaleout_sycl_proxy_ring(
 
     // Free the large-block fallback allocation once the kernel has finished.
     if (to_free) {
-        scaleout_event = q.submit([=](sycl::handler& h) {
-            h.depends_on(scaleout_event);
-            h.host_task([=]() {
-                sycl::free(aux_buffer, q);
-            });
+        scaleout_event = ccl_host_task(q, {scaleout_event}, [=]() {
+            sycl::free(aux_buffer, q);
         });
     }
 

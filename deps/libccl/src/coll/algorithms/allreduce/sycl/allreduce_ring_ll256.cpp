@@ -215,7 +215,6 @@ sycl::event arc_ll256_allreduce(const void *src,
     }
 
     sycl_e = q.submit([&](auto &h) {
-        //using namespace sycl::ext::intel::experimental::esimd;
 
         int local_world_rank = comm_rank;
         int local_world_size = comm_size;

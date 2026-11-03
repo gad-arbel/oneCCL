@@ -28,6 +28,7 @@ ccl::event alltoall_large_copy_engine(sycl::queue &q,
                                       const std::array<void *, MAX_NODE_RANKS> &send_bufs,
                                       std::array<void *, MAX_NODE_RANKS> &recv_bufs,
                                       const size_t count,
+                                      const size_t block_stride,
                                       ccl::datatype dtype,
                                       std::vector<size_t> &offsets,
                                       const size_t rank,
@@ -42,6 +43,8 @@ ccl::event alltoall_large_copy_engine(sycl::queue &q,
     const size_t dsize = ccl_dtype.size();
 
     size_t data_size = count * dsize;
+    // rank blocks sit block_stride elements apart, which exceeds count when chunked
+    const size_t stride_bytes = block_stride * dsize;
     LOG_DEBUG("rank(",
               rank,
               "/",
@@ -55,8 +58,8 @@ ccl::event alltoall_large_copy_engine(sycl::queue &q,
               "}");
 
     // copy self data: in alltoall, rank R sends chunk R of send_buf to itself
-    const void *self_src_addr = (uint8_t *)send_bufs[rank] + rank * data_size;
-    void *self_dest_addr = (uint8_t *)recv_bufs[rank] + rank * data_size;
+    const void *self_src_addr = (uint8_t *)send_bufs[rank] + rank * stride_bytes;
+    void *self_dest_addr = (uint8_t *)recv_bufs[rank] + rank * stride_bytes;
     LOG_TRACE("copy self data ",
               data_size,
               " bytes from {",
@@ -79,10 +82,10 @@ ccl::event alltoall_large_copy_engine(sycl::queue &q,
         int from_rank = (rank - step - 1 + comm_size) % comm_size;
 
         // write protocol: push my send data into remote rank's recv buffer
-        const void *send_addr = (uint8_t *)send_bufs[rank] + to_rank * data_size;
+        const void *send_addr = (uint8_t *)send_bufs[rank] + to_rank * stride_bytes;
 
         // destination: to_rank's recv buffer at my rank's offset
-        void *dest_addr = (uint8_t *)recv_bufs[to_rank] + rank * data_size;
+        void *dest_addr = (uint8_t *)recv_bufs[to_rank] + rank * stride_bytes;
         LOG_DEBUG("Rank(",
                   rank,
                   ") write ",

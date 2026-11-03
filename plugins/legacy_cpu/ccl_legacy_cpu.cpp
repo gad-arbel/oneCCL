@@ -44,8 +44,8 @@ class CommunicatorLegacyCpu {
     ccl::communicator comm;
 
     CommunicatorLegacyCpu(int rank, int size, ccl::kvs::address_type address)
-        : rank(rank), size(size), comm(std::move(ccl::create_communicator(
-                                      size, rank, kvs_for[address]))) {}
+        : rank(rank), size(size),
+          comm(ccl::create_communicator(size, rank, kvs_for[address])) {}
 
     // Construction using external ccl::communicator, for example as a result of
     // a split
@@ -179,7 +179,8 @@ onecclResult_t oneccl_allgather_impl(const void *sendbuff, void *recvbuff,
             static itt::Task allgather("CPU::AllGather");
 
             allgather.start();
-            size_t const comm_size = comm_legacy->comm.size();
+            size_t const comm_size =
+                static_cast<size_t>(comm_legacy->comm.size());
             std::vector<size_t> const recvcounts(comm_size, sendcount);
             ccl::allgatherv(sendbuff, sendcount, recvbuff, recvcounts,
                             convert(datatype), comm_legacy->comm)
@@ -197,7 +198,8 @@ onecclResult_t oneccl_alltoall_impl(const void *sendbuff, void *recvbuff,
             static itt::Task alltoall("CPU::AllToAll");
 
             alltoall.start();
-            size_t const comm_size = comm_legacy->comm.size();
+            size_t const comm_size =
+                static_cast<size_t>(comm_legacy->comm.size());
             std::vector<size_t> const recvcounts(comm_size, sendcount);
             ccl::alltoall(sendbuff, recvbuff, sendcount, convert(datatype),
                           comm_legacy->comm)
@@ -217,7 +219,8 @@ onecclResult_t oneccl_alltoallv_impl(const void *sendbuff,
             static itt::Task alltoallv("CPU::AllToAllV");
 
             alltoallv.start();
-            size_t const comm_size = comm_legacy->comm.size();
+            size_t const comm_size =
+                static_cast<size_t>(comm_legacy->comm.size());
             std::vector<size_t> send_counts_vec(send_counts,
                                                 send_counts + comm_size);
             std::vector<size_t> recv_counts_vec(recv_counts,

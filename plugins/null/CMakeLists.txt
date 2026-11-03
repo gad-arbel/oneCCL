@@ -18,6 +18,9 @@ if(ONECCL_ENABLE_ITT)
   target_link_libraries(ccl_null PRIVATE "${COVERAGE_CXX_FLAGS}" ittnotify)
 endif()
 
+# Add warning flags
+target_compile_options(ccl_null PRIVATE "${ONECCL_WARNING_COMPILE_FLAGS}")
+
 # Resolve dependencies next to the plugin without LD_LIBRARY_PATH
 set_target_properties(ccl_null PROPERTIES INSTALL_RPATH "\$ORIGIN")
 

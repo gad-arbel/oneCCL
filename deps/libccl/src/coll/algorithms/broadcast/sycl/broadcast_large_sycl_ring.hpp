@@ -147,6 +147,14 @@ ccl::event broadcast_large_impl_ring_copy_engine(
         use_auto_threshold_override ? threshold_auto_override_bytes
                                     : ccl::global_data::env().sycl_broadcast_chunking_threshold;
     const broadcast_ring_slice_plan plan{ count, dsize, world, chunking_threshold };
+    LOG_DEBUG("broadcast ring path: copy_engine, world=",
+              world,
+              ", bytes=",
+              count * dsize,
+              ", slice_bytes=",
+              plan.max_slice_count * dsize,
+              ", slices=",
+              plan.nslices);
 
     // Hop distance of this rank from root (0 = root, 1 = first relay, N-1 = last receiver).
     const int hop_dist = (rank - p2p_root + world) % world;
@@ -257,6 +265,14 @@ ccl::event broadcast_large_impl_ring_copy_kernel(const void* send_buf,
         use_auto_threshold_override ? threshold_auto_override_bytes
                                     : ccl::global_data::env().sycl_broadcast_chunking_threshold;
     const broadcast_ring_slice_plan plan{ count, dsize, world, chunking_threshold };
+    LOG_DEBUG("broadcast ring path: copy_kernel, world=",
+              world,
+              ", bytes=",
+              count * dsize,
+              ", slice_bytes=",
+              plan.max_slice_count * dsize,
+              ", slices=",
+              plan.nslices);
 
     // Kernel launch geometry — mirrors the allgatherv ring (one work-group sized
     // by sycl_work_group_size, kernel_threads chosen from slice element count).

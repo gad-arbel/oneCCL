@@ -17,6 +17,8 @@
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
 #include "coll/algorithms/broadcast/sycl/broadcast_sycl.hpp"
 #include "coll/algorithms/broadcast/sycl/broadcast_scaleout_scatter_allgather.hpp"
+#include "coll/algorithms/broadcast/sycl/broadcast_large_ce.hpp" // for broadcast_large_ze_copy_engine_with_exchange
+#include "coll/algorithms/utils/sycl_policy_resolver_scaleout.hpp"
 #include "coll/algorithms/utils/sycl_policy_resolver_scaleup.hpp"
 #include "coll/algorithms/utils/barrier_data.hpp"  // use_recording_path
 #include "common/log/log.hpp"
@@ -48,12 +50,8 @@ ccl::event broadcast_scaleup_single_rank(const void* send_buf,
     return ccl::event::create_from_native(sycl_e);
 }
 
-// Arc RT256 ring. Caller must have already checked `should_attempt_rt_ring`.
-// On unaligned buffers sets done=false and returns empty — a hard bail; the
-// caller must NOT fall through to the vec path (the whole scaleup returns as
-// not-done). On done=true, the kernel ran. On done=false with aligned buffers,
-// the kernel soft-bailed and the caller may fall through to vec.
-ccl::event broadcast_scaleup_rt_ring(const void* send_buf,
+// Arc RT256 ring.
+ccl::event broadcast_scaleup_ll_ring(const void* send_buf,
                                      void* recv_buf,
                                      size_t count,
                                      ccl::datatype dtype,
@@ -61,16 +59,10 @@ ccl::event broadcast_scaleup_rt_ring(const void* send_buf,
                                      ccl_comm* comm,
                                      std::shared_ptr<ccl_comm> p2p_comm,
                                      ccl_stream* global_stream,
-                                     bool& done,
-                                     bool& hard_bail) {
-    auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
-    if (!is_aligned(send_buf, recv_buf, count, ccl_dtype.size(), 4)) {
-        done = false;
-        hard_bail = true;
-        return {};
-    }
-    LOG_DEBUG("invoking broadcast RT256 kernel broadcast_rt_ring, count:", count, " datatype: ", dtype);
-    ccl::event e = broadcast_rt_ring(
+                                     bool& done) {
+    LOG_DEBUG(
+        "invoking broadcast RT256 kernel broadcast_ll_ring, count:", count, " datatype: ", dtype);
+    ccl::event e = broadcast_ll_ring(
         send_buf, recv_buf, count, dtype, root, comm, p2p_comm, global_stream, done);
     LOG_DEBUG("invoking broadcast RT256 kernel, recv_count:", count, " datatype: ", dtype, " done");
     return e;
@@ -87,11 +79,11 @@ ccl::event broadcast_scaleup_default(sycl::queue& /*q*/,
                                  std::shared_ptr<ccl_comm> p2p_comm,
                                  ccl_stream* global_stream,
                                  const ccl::vector_class<ccl::event>& deps,
-                                 bool is_large) {
+                                 ccl::sycl_policy::scaleup_algo algo) {
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     const size_t total_bytes = count * ccl_dtype.size();
     ccl::event e;
-    if (!is_large) {
+    if (algo == ccl::sycl_policy::scaleup_algo::small) {
 #ifdef CCL_ENABLE_ITT
         ccl::profile::itt::task_begin(
             "broadcast_small", "send_size", total_bytes, comm->unique_id());
@@ -122,6 +114,37 @@ ccl::event broadcast_scaleup_default(sycl::queue& /*q*/,
     return e;
 }
 
+// l0_copy_engine: append the copies to an L0 copy engine command list
+ccl::event broadcast_scaleup_l0_copy_engine(sycl::queue& q,
+                                            const void* send_buf,
+                                            void* recv_buf,
+                                            size_t count,
+                                            ccl::datatype dtype,
+                                            int root,
+                                            ccl_comm* comm,
+                                            std::shared_ptr<ccl_comm> p2p_comm,
+                                            ccl_stream* global_stream,
+                                            const ccl::vector_class<ccl::event>& deps) {
+#ifdef CCL_ENABLE_ITT
+    ccl::profile::itt::task_begin("broadcast_large_ce",
+                                  "send_size",
+                                  count * ccl::global_data::get().dtypes->get(dtype).size(),
+                                  comm->unique_id());
+#endif // CCL_ENABLE_ITT
+    LOG_DEBUG("Broadcast Large - using L0 copy engine");
+    ccl::event e = broadcast_large_ze_copy_engine_with_exchange(
+        q, send_buf, recv_buf, count, dtype, root, comm, p2p_comm, global_stream, deps);
+    LOG_DEBUG("broadcast selects large copy engine kernel: count: ",
+              count,
+              " datatype: ",
+              dtype,
+              " done");
+#ifdef CCL_ENABLE_ITT
+    ccl::profile::itt::task_end();
+#endif // CCL_ENABLE_ITT
+    return e;
+}
+
 }  // namespace
 
 namespace ccl {
@@ -145,31 +168,27 @@ ccl::event broadcast_scaleup_sycl(sycl::queue& q,
     }
 
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
-    const size_t total_bytes = count * ccl_dtype.size();
-    const bool is_large = total_bytes > ccl::global_data::env().sycl_broadcast_small_threshold;
 
     const auto tune = ccl::sycl_policy_resolver::scaleup_resolver{
         ccl::sycl_policy::policy_query(
-            ccl_coll_broadcast, total_bytes, ccl_dtype,
+            ccl_coll_broadcast, count, ccl_dtype,
             /*r2r_size=*/0, comm->size(), use_recording_path(q))
             .with_comm(comm)
             .with_p2p_comm(p2p_comm.get())
             .with_stream(global_stream)
     }.broadcast();
 
-    // Arc RT256 first: may hard-bail (unaligned), succeed (done=true), or
-    // soft-bail (done=false → fall through to default).
     if (tune.protocol == ccl::sycl_policy::scaleup_protocol::ll) {
-        bool hard_bail = false;
-        auto ev = broadcast_scaleup_rt_ring(send_buf, recv_buf, count, dtype, root,
-                                            comm, p2p_comm, global_stream, done, hard_bail);
-        if (hard_bail) return ev;      // caller falls back — do NOT try default
-        if (done) return ev;
-        // rt_ring soft-bailed; continue to default below.
+        return broadcast_scaleup_ll_ring(
+            send_buf, recv_buf, count, dtype, root, comm, p2p_comm, global_stream, done);
     }
-
+    if (tune.protocol == ccl::sycl_policy::scaleup_protocol::copy_engine &&
+        tune.algo == ccl::sycl_policy::scaleup_algo::l0_copy_engine) {
+        return broadcast_scaleup_l0_copy_engine(
+            q, send_buf, recv_buf, count, dtype, root, comm, p2p_comm, global_stream, deps);
+    }
     return broadcast_scaleup_default(q, send_buf, recv_buf, count, dtype, root,
-                                 comm, p2p_comm, global_stream, deps, is_large);
+                                     comm, p2p_comm, global_stream, deps, tune.algo);
 }
 
 static bool do_fallback_to_scheduler(size_t size) {
@@ -200,15 +219,24 @@ ccl::event broadcast_sycl_multi_domain(sycl::queue& q,
                   count * ccl_dtype.size(),
                   " is above scaleout SYCL threshold = ",
                   ccl::global_data::env().sycl_broadcast_scaleout_threshold,
-                  " or sycl::esimd mode is enabled, or other conditions not met -- falling back");
+                  " or other conditions not met -- falling back");
         done = false;
         return ev;
     }
 
-    // Master switch: only ENABLE=1 considers Scatter-AllGather (SAG).
-    // FORCE=1 is a truth-mode benchmark knob: fail loudly instead of hiding fallback.
-    if (ccl::global_data::env().sycl_broadcast_scatter_allgather_enable == 1) {
-        const bool force_sag = ccl::global_data::env().sycl_broadcast_scatter_allgather_force;
+    // Scatter-AllGather when the selector picks it: ENABLE=1 and (FORCE=1 or size >= THRESHOLD).
+    const auto tune = ccl::sycl_policy_resolver::scaleout_resolver{
+        ccl::sycl_policy::policy_query(ccl_coll_broadcast, count, ccl_dtype,
+            r2r_comm->size(), global_comm->size(), use_recording_path(q))
+            .with_p2p_comm(p2p_comm.get())
+    }.broadcast();
+
+    if (tune.algo() == ccl::sycl_policy::scaleout_algo::scatter_allgather) {
+        // FORCE applies only with ENABLE=1, as in the C++ selector; a JSON policy
+        // can pick scatter_allgather with ENABLE=0.
+        const auto& env = ccl::global_data::env();
+        const bool force_sag = env.sycl_broadcast_scatter_allgather_enable == 1 &&
+                               env.sycl_broadcast_scatter_allgather_force;
         const bool sag_preconditions =
             is_arc_card(ccl::ze::get_device_family(global_stream->get_ze_device())) &&
             p2p_comm->size() >= 2 && r2r_comm->size() >= 2;
@@ -303,7 +331,7 @@ ccl::event broadcast_sycl_multi_domain(sycl::queue& q,
                                          done);
 
             if (!done) {
-                LOG_INFO("broadcast_sycl scale-out phase was not done -- falling back");
+                LOG_DEBUG("broadcast_sycl scale-out phase was not done -- falling back");
                 // fallback
                 return ev;
             }
@@ -333,7 +361,7 @@ ccl::event broadcast_sycl_multi_domain(sycl::queue& q,
                                         done);
 
             if (!done) {
-                LOG_INFO("broadcast_sycl scale-up phase was not done -- falling back");
+                LOG_DEBUG("broadcast_sycl scale-up phase was not done -- falling back");
                 // fallback
                 return ev;
             }

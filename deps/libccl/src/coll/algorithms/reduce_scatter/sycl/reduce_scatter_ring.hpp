@@ -19,6 +19,7 @@
 #include "coll/algorithms/utils/sycl_coll_base.hpp"
 #include "coll/algorithms/utils/sycl_selection.hpp"
 #include "coll/algorithms/utils/sycl_reductions.hpp"
+#include "coll/algorithms/utils/host_task.hpp"
 #include "coll/algorithms/reduce_scatter/sycl/reduce_scatter_sycl.hpp"
 #include "coll/coll_util.hpp"
 
@@ -291,7 +292,8 @@ inline sycl::event reduce_scatter_ring_nonblocking_impl(sycl::queue &q,
 
     // calculate the number of chunks required for pipeline
     size_t nchunks;
-    pipe_prep(main_block_count, last_block_count, ccl_dtype.size(), pipeline_chunk_size, nchunks);
+    // the last block is the largest one: main_block_count + count % world
+    pipe_prep(last_block_count, ccl_dtype.size(), pipeline_chunk_size, nchunks);
     LOG_DEBUG("Reduce_scatter ring block_count: ",
               main_block_count,
               " nchunks: ",
@@ -376,11 +378,8 @@ inline sycl::event reduce_scatter_ring_nonblocking_impl(sycl::queue &q,
 
     if (world > 2 || in_place) {
         if (to_free) {
-            sycl_e = q.submit([=](sycl::handler &h) {
-                h.depends_on(sycl_e);
-                h.host_task([=]() {
-                    sycl::free(buffers[0], q);
-                });
+            sycl_e = ccl_host_task(q, {sycl_e}, [=]() {
+                sycl::free(buffers[0], q);
             });
         }
         else {
@@ -682,11 +681,8 @@ inline sycl::event reduce_scatter_scaleout_sycl_proxy_ring(
 
     // Free the large-block fallback allocation once the kernel has finished.
     if (to_free) {
-        scaleout_event = q.submit([=](sycl::handler& h) {
-            h.depends_on(scaleout_event);
-            h.host_task([=]() {
-                sycl::free(aux_buffer, q);
-            });
+        scaleout_event = ccl_host_task(q, {scaleout_event}, [=]() {
+            sycl::free(aux_buffer, q);
         });
     }
 

@@ -50,7 +50,6 @@ option(BUILD_FT "Build functional tests" TRUE)
 option(BUILD_UT "Build unit tests" TRUE)
 option(BUILD_REG_TESTS "Build regression tests" TRUE)
 option(BUILD_CONFIG "Build cmake configs" TRUE)
-option(BUNDLE_MPI "Install the bundled Intel MPI into the package" FALSE)
 option(ENABLE_MPI_TESTS "Enable MPI tests support" TRUE)
 option(ENABLE_SYCL_INTEROP_EVENT "Enable SYCL interop event support" TRUE)
 option(ENABLE_OFI_HMEM "Enable OFI HMEM support" TRUE)
@@ -59,7 +58,6 @@ option(ENABLE_ITT "Enable ITT profiling support" TRUE)
 option(ENABLE_PROFILING "Enable profiling support" TRUE)
 option(ENABLE_PMIX "Enable PMIX support" TRUE)
 option(ENABLE_UMF "Enable UMF support" TRUE)
-option(ENABLE_ESIMD "Enable ESIMD support" FALSE)
 option(ENABLE_STUB_BACKEND "Enable stub backend" TRUE)
 option(ENABLE_LINKER_RUNPATH "Enable linker runpath flags" FALSE)
 option(ENABLE_OMP "Enable openMP extension for intra-node collectives" TRUE)
@@ -70,6 +68,13 @@ option(ENABLE_EXTERN_TEMPLATE_INST "Emit extern template declarations + compile 
 set(SYCL_DEVICE_CODE_SPLIT "" CACHE STRING
     "SYCL -fsycl-device-code-split mode: per_kernel | per_source | off (empty = historical default: per_kernel in Release, driver default otherwise)")
 set_property(CACHE SYCL_DEVICE_CODE_SPLIT PROPERTY STRINGS "" per_kernel per_source off)
+set(LINKER_RUNPATH_EXTRA_DIRS "" CACHE STRING
+    "CMake list of directories relative to $ORIGIN, each added as $ORIGIN/<dir> after $ORIGIN to the runpath when ENABLE_LINKER_RUNPATH is set (e.g. ../../.. when installed to lib/ccl/cpu/lib). Through the top-level ExternalProject only one directory can be passed")
+foreach(dir ${LINKER_RUNPATH_EXTRA_DIRS})
+    if(IS_ABSOLUTE "${dir}" OR dir MATCHES ":")
+        message(FATAL_ERROR "LINKER_RUNPATH_EXTRA_DIRS: '${dir}' must be a single directory relative to $ORIGIN")
+    endif()
+endforeach()
 
 option(USE_CODECOV_FLAGS "Calculate code coverage" FALSE)
 option(WITH_ASAN "Use address sanitizer, can only be used in Debug build" FALSE)
@@ -89,7 +94,6 @@ message(STATUS "CXX compiler : ${CMAKE_CXX_COMPILER}")
 message(STATUS "Build examples: ${BUILD_EXAMPLES}")
 message(STATUS "Build functional tests: ${BUILD_FT}")
 message(STATUS "Build cmake configs: ${BUILD_CONFIG}")
-message(STATUS "Bundle Intel MPI in package: ${BUNDLE_MPI}")
 message(STATUS "Enable MPI tests support: ${ENABLE_MPI_TESTS}")
 message(STATUS "Enable SYCL interop event support: ${ENABLE_SYCL_INTEROP_EVENT}")
 message(STATUS "Enable OFI HMEM support: ${ENABLE_OFI_HMEM}")
@@ -98,10 +102,10 @@ message(STATUS "Enable ITT profiling support: ${ENABLE_ITT}")
 message(STATUS "Enable CCL profiling support: ${ENABLE_PROFILING}")
 message(STATUS "Enable PMIX support: ${ENABLE_PMIX}")
 message(STATUS "Enable UMF support: ${ENABLE_UMF}")
-message(STATUS "Enable ESIMD support: ${ENABLE_ESIMD}")
 message(STATUS "Enable DRM support: ${ENABLE_DRM}")
 message(STATUS "Enable stub backend: ${ENABLE_STUB_BACKEND}")
 message(STATUS "Enable linker rpath flags: ${ENABLE_LINKER_RUNPATH}")
+message(STATUS "Linker runpath extra dirs: ${LINKER_RUNPATH_EXTRA_DIRS}")
 message(STATUS "Enable openMP extension for intra-node collectives: ${ENABLE_OMP}")
 if ("${SYCL_DEVICE_CODE_SPLIT}" STREQUAL "")
     message(STATUS "SYCL device-code-split request: (unset; defaults to per_kernel in Release, driver default otherwise)")
@@ -133,24 +137,22 @@ set(CCL_INSTALL_KERNELS "${CMAKE_INSTALL_PREFIX}/lib/ccl/kernels")
 # setup dependency directories
 set(DEPS_DIR "${PROJECT_SOURCE_DIR}/deps")
 
+# libccl needs only the MPI headers at build time; it dlopens libmpi.so.12
+# at runtime (see src/common/api_wrapper/mpi_api_wrapper.cpp).
 if ("${MPI_DIR}" STREQUAL "")
     set(MPI_INCLUDE_DIR "${DEPS_DIR}/mpi/include/")
-    set(MPI_LIB_DIR "${DEPS_DIR}/mpi/lib/")
 else()
     set(MPI_INCLUDE_DIR "${MPI_DIR}/include/")
-    set(MPI_LIB_DIR "${MPI_DIR}/lib/")
 endif()
 message(STATUS "MPI_INCLUDE_DIR: ${MPI_INCLUDE_DIR}")
-message(STATUS "MPI_LIB_DIR: ${MPI_LIB_DIR}")
 
+# Only libfabric headers are needed at build time; the library itself is
+# dlopen'ed at runtime (see src/common/api_wrapper/ofi_api_wrapper.cpp).
 if ("${LIBFABRIC_DIR}" STREQUAL "")
     set(LIBFABRIC_INCLUDE_DIR "${DEPS_DIR}/ofi/include")
-    set(LIBFABRIC_LIB_DIR "${DEPS_DIR}/ofi/lib/")
 else()
     set(LIBFABRIC_INCLUDE_DIR "${LIBFABRIC_DIR}/include/")
-    set(LIBFABRIC_LIB_DIR "${LIBFABRIC_DIR}/lib")
 endif()
-message(STATUS "LIBFABRIC_LIB_DIR: ${LIBFABRIC_LIB_DIR}")
 message(STATUS "LIBFABRIC_INCLUDE_DIR: ${LIBFABRIC_INCLUDE_DIR}")
 
 set(HWLOC_INCLUDE_DIR "${DEPS_DIR}/hwloc/include/")
@@ -158,10 +160,30 @@ set(HWLOC_LIB_DIR "${DEPS_DIR}/hwloc/lib/")
 message(STATUS "HWLOC_INCLUDE_DIR: ${HWLOC_INCLUDE_DIR}")
 message(STATUS "HWLOC_LIB_DIR: ${HWLOC_LIB_DIR}")
 
-set(ITT_INCLUDE_DIR "${DEPS_DIR}/itt/include")
-set(ITT_LIB_DIR "${DEPS_DIR}/itt/lib64")
-message(STATUS "ITT_INCLUDE_DIR: ${ITT_INCLUDE_DIR}")
-message(STATUS "ITT_LIB_DIR: ${ITT_LIB_DIR}")
+# ITT is built from the deps/ittapi submodule of the outer oneCCL repo.
+# Added before the warning flags below, so they do not apply to ittapi sources.
+if (ENABLE_ITT)
+    if ("${ITTAPI_DIR}" STREQUAL "")
+        get_filename_component(ITTAPI_DIR "${PROJECT_SOURCE_DIR}/../ittapi" ABSOLUTE)
+    endif()
+    # Normalize so a relative -DITTAPI_DIR= resolves the same way for the
+    # EXISTS check below and for add_subdirectory() further down.
+    get_filename_component(ITTAPI_DIR "${ITTAPI_DIR}" ABSOLUTE BASE_DIR "${CMAKE_BINARY_DIR}")
+    if (NOT EXISTS "${ITTAPI_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "ITT profiling support needs the ittapi sources.\n"
+            "Expected to find: ${ITTAPI_DIR}/CMakeLists.txt\n"
+            "If you build deps/libccl standalone (outside the oneCCL v2 repo):\n"
+            "  Pass -DITTAPI_DIR=<path to a cloned https://github.com/intel/ittapi>.\n"
+            "  Or pass -DENABLE_ITT=OFF.\n"
+            "If you build deps/libccl inside the outer oneCCL v2 repo:\n"
+            "  Initialize the submodule from the repo root: git submodule update --init deps/ittapi.\n"
+            "  Or configure the outer build with -DONECCL_ENABLE_ITT=OFF.")
+    endif()
+    add_subdirectory(${ITTAPI_DIR} ittapi EXCLUDE_FROM_ALL)
+    set(ITT_INCLUDE_DIR "${ITTAPI_DIR}/include")
+    message(STATUS "ITT_INCLUDE_DIR: ${ITT_INCLUDE_DIR}")
+endif()
 
 set(LEVEL_ZERO_INCLUDE_DIR "${DEPS_DIR}/level_zero/include/")
 message(STATUS "LEVEL_ZERO_INCLUDE_DIR: ${LEVEL_ZERO_INCLUDE_DIR}")
@@ -306,11 +328,6 @@ if (ENABLE_UMF)
     message(STATUS "Enable UMF support")
 endif()
 
-if (ENABLE_ESIMD)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DCCL_ENABLE_ESIMD=1") # Define it for the compiler
-    message(STATUS "Enable ESIMD support")
-endif()
-
 if (ENABLE_DRM)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DCCL_ENABLE_DRM=1")
     message(STATUS "Enable DRM support")
@@ -368,8 +385,7 @@ enable_testing()
 
 set(EXTERNAL_LIBS "")
 
-set(EXAMPLES_INC_DIRS ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/examples/include ${MPI_INCLUDE_DIR})
-set(EXAMPLES_LIB_DIRS ${MPI_LIB_DIR})
+set(EXAMPLES_INC_DIRS ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/examples/include)
 
 # allow `deprecated`
 set(CMAKE_CLANG_FLAGS "${CMAKE_CLANG_FLAGS}")
@@ -396,7 +412,7 @@ file(GLOB spv_kernels "${PROJECT_SOURCE_DIR}/src/kernels/kernels.spv")
 endif()
 
 set(CCL_MAJOR_VERSION     "2022")
-set(CCL_MINOR_VERSION     "2")
+set(CCL_MINOR_VERSION     "3")
 set(CCL_UPDATE_VERSION    "0")
 set(CCL_PRODUCT_STATUS    "Gold")
 string(TIMESTAMP CCL_PRODUCT_BUILD_DATE "%Y-%m-%dT %H:%M:%SZ")
@@ -428,6 +444,10 @@ endif()
 add_subdirectory(src)
 
 if (ENABLE_MPI_TESTS)
+    if (BUILD_EXAMPLES OR BUILD_FT OR BUILD_REG_TESTS)
+        # examples and tests link the external MPI that launches them
+        find_package(MPI REQUIRED)
+    endif()
     if (BUILD_EXAMPLES)
         add_subdirectory(examples/benchmark)
         add_subdirectory(examples/common)

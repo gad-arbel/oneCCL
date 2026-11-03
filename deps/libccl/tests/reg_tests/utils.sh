@@ -143,7 +143,10 @@ function get_bench() {
     if [ ! -f "${benchmark_dir}/benchmark" ] || \
        ([ ! -f "${bench_latency}" ] && [ ! -f "${bench_bw}" ] && [ "${bench_type}" == "pt2pt" ] );
     then
-        cd "${examples_dir}"
+        cd "${examples_dir}" || {
+            echo "ERROR: examples dir not found: ${examples_dir}"
+            exit 1
+        }
 
         if [ "${backend}" == "sycl" ]
         then
@@ -151,18 +154,43 @@ function get_bench() {
             cmake_str="-DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCOMPUTE_BACKEND=dpcpp"
         fi
         mkdir -p "${build_dir}"
-        cd "${build_dir}"
+        cd "${build_dir}" || {
+            echo "ERROR: could not enter build dir: ${examples_dir}/${build_dir}"
+            exit 1
+        }
 
-        cmake .. $cmake_str &>> "${log_path}"
-        if [ "${bench_type}" == "pt2pt" ];
+        # Absolute path under dst_dir, separate from the test log so cmake/make
+        # output does not trip check_log (MLSL-4923).
+        build_log="${dst_dir}/$(basename "${log_path}" .log)_build.log"
+
+        cmake .. $cmake_str &> "${build_log}"
+        bench_build_rc=$?
+        if [ ${bench_build_rc} -eq 0 ]
         then
-            make -j ccl_latency &>> "${log_path}"
-            make -j ccl_bw &>> "${log_path}"
-        else
-            make -j benchmark &>> "${log_path}"
+            if [ "${bench_type}" == "pt2pt" ];
+            then
+                # Check each target separately (MLSL-4923).
+                make -j ccl_latency &>> "${build_log}"
+                bench_build_rc=$?
+                if [ ${bench_build_rc} -eq 0 ]
+                then
+                    make -j ccl_bw &>> "${build_log}"
+                    bench_build_rc=$?
+                fi
+            else
+                make -j benchmark &>> "${build_log}"
+                bench_build_rc=$?
+            fi
         fi
 
-        check_command_exit_code $? "Benchmark build failed"
+        # Echo it: the build log is not an uploaded artifact (MLSL-4923).
+        if [ ${bench_build_rc} -ne 0 ]
+        then
+            echo "ERROR: benchmark build failed (rc=${bench_build_rc}), log follows:"
+            cat "${build_log}" 2>/dev/null || echo "(no build log at ${build_log})"
+        fi
+
+        check_command_exit_code ${bench_build_rc} "Benchmark build failed"
 
         if [ "${bench_type}" == "pt2pt" ];
         then

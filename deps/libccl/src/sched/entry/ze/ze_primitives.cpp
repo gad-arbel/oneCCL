@@ -405,6 +405,7 @@ device_family get_device_family(ze_device_handle_t device) {
         case static_cast<enum_t>(device_id::id6): return device_family::family6;
         case static_cast<enum_t>(device_id::id7): return device_family::family7;
         case static_cast<enum_t>(device_id::id8): return device_family::family8;
+        case static_cast<enum_t>(device_id::id9): return device_family::family9;
         default: {
             LOG_DEBUG("get_device_family returns unknown device_family: ", id);
             return device_family::unknown;
@@ -746,7 +747,12 @@ std::string to_string(const zes_fabric_port_state_t& state) {
 bool is_arc_card(device_family family) {
     return family == ccl::device_family::family4 || family == ccl::device_family::family5 ||
            family == ccl::device_family::family6 || family == ccl::device_family::family7 ||
-           family == ccl::device_family::family8 || ccl::global_data::env().sycl_force_pcie;
+           family == ccl::device_family::family8 || family == ccl::device_family::family9 ||
+           ccl::global_data::env().sycl_force_pcie;
+}
+
+bool is_cri_card(device_family family) {
+    return family == ccl::device_family::family8 || family == ccl::device_family::family9;
 }
 
 // export control black list
@@ -900,9 +906,29 @@ void ze_wait_and_reset(ze_event_handle_t ev) {
 
 void* ze_ipc_mmap_device_allocation(ze_context_handle_t ctx,
                                     void* device_ptr,
-                                    size_t size_bytes) {
+                                    size_t size_bytes,
+                                    void** out_map_base,
+                                    size_t* out_map_size) {
+    CCL_THROW_IF_NOT(out_map_base && out_map_size, "ze_ipc_mmap: null out params");
+
+    /* The IPC handle must be taken on the allocation base, and the mapping covers the whole
+     * allocation: `device_ptr` is usually a USM-pool suballocation at a nonzero offset inside it,
+     * so mapping size_bytes from offset 0 would alias somebody else's memory. */
+    void* alloc_base = nullptr;
+    size_t alloc_size = 0;
+    ZE_CALL(zeMemGetAddressRange, (ctx, device_ptr, &alloc_base, &alloc_size));
+
+    const size_t offset = static_cast<char*>(device_ptr) - static_cast<char*>(alloc_base);
+    CCL_THROW_IF_NOT(offset + size_bytes <= alloc_size,
+                     "ze_ipc_mmap: ptr range exceeds its allocation: offset: ",
+                     offset,
+                     ", size: ",
+                     size_bytes,
+                     ", allocation size: ",
+                     alloc_size);
+
     ze_ipc_mem_handle_t ipc_handle{};
-    ZE_CALL(zeMemGetIpcHandle, (ctx, device_ptr, &ipc_handle));
+    ZE_CALL(zeMemGetIpcHandle, (ctx, alloc_base, &ipc_handle));
 
     int fd = -1;
     std::memcpy(&fd, &ipc_handle, sizeof(fd));
@@ -910,7 +936,7 @@ void* ze_ipc_mmap_device_allocation(ze_context_handle_t ctx,
         CCL_THROW("zeMemGetIpcHandle produced invalid fd");
     }
 
-    void* base = mmap(nullptr, size_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void* base = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
     /* Release the IPC handle immediately after mmap — the mapping stays valid without it,
      * and holding multiple handles simultaneously may cause driver issues. */
@@ -922,13 +948,25 @@ void* ze_ipc_mmap_device_allocation(ze_context_handle_t ctx,
         CCL_THROW("mmap failed: ", std::strerror(e));
     }
 
-    return base;
+    LOG_DEBUG("ze_ipc_mmap: ptr: ",
+              device_ptr,
+              ", allocation base: ",
+              alloc_base,
+              ", offset: ",
+              offset,
+              ", allocation size: ",
+              alloc_size,
+              ", mapping: ",
+              base);
+
+    *out_map_base = base;
+    *out_map_size = alloc_size;
+    return static_cast<char*>(base) + offset;
 }
 
-void ze_ipc_munmap_device_allocation(void* host_ptr,
-                                     size_t size_bytes) {
-    if (host_ptr && host_ptr != MAP_FAILED) {
-        if (munmap(host_ptr, size_bytes) != 0) {
+void ze_ipc_munmap_device_allocation(void* map_base, size_t map_size) {
+    if (map_base && map_base != MAP_FAILED) {
+        if (munmap(map_base, map_size) != 0) {
             // don't throw from cleanup
         }
     }

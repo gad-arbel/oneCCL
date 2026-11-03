@@ -20,6 +20,7 @@
 #include "coll/algorithms/utils/sycl_policy_resolver_scaleout.hpp"
 #include "coll/algorithms/utils/barrier_data.hpp"  // use_recording_path
 #include "coll/algorithms/utils/transmit/transmit.hpp"
+#include "proxy/proxy.hpp"
 
 namespace ccl {
 namespace v1 {
@@ -38,7 +39,10 @@ ccl::event alltoallv_scaleup_single_rank(const void* send_buf,
     sycl::event sycl_e;
     auto sycl_q = global_stream->get_native_stream();
     std::vector<sycl::event> dep_events = get_sycl_events(deps);
-    if (send_buf != recv_buf) {
+    if (send_buf == nullptr || recv_buf == nullptr) {
+        LOG_DEBUG("single rank: copying with nullptr buffers is not possible, coll: alltoallv");
+        sycl_e = submit_wait_on_events(sycl_q, dep_events);
+    } else if (send_buf != recv_buf) {
         LOG_DEBUG("single rank: out-of-place case, coll: alltoallv");
         sycl_e = sycl_q.submit([=](sycl::handler& h) {
             h.depends_on(dep_events);
@@ -79,7 +83,7 @@ ccl::event alltoallv_scaleup_arc_ll(sycl::queue& q,
     const size_t dt_sz = ccl_dtype.size();
     const int rank = p2p_comm->rank();
 
-    if (send_buf != recv_buf) {
+    if (send_buf != recv_buf && send_counts[rank] > 0) {
         q.memcpy((char*)recv_buf + recv_displs[rank],
                  (char*)send_buf + send_displs[rank],
                  send_counts[rank] * dt_sz);
@@ -121,7 +125,7 @@ ccl::event alltoallv_scaleup_default(const void* send_buf,
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     const size_t dt_sz = ccl_dtype.size();
     ccl::event e;
-    if (send_buf == recv_buf) {
+    if (send_buf && recv_buf && send_buf == recv_buf) {
         LOG_WARN_ONCE("|CCL_SYCL| oneCCL does not support in-place Alltoallv; falling back");
         done = false;
         return e;
@@ -165,21 +169,18 @@ ccl::event alltoallv_scaleup_sycl(sycl::queue& q,
                                              global_stream, deps);
     }
 
-    auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
-    (void)ccl_dtype;
     const bool has_all_vertices_connected = comm->get_topo_manager().has_all_vertices_connected();
     LOG_DEBUG("|CCL_SYCL| has_all_vertices_connected ", has_all_vertices_connected);
 
-    // `msg_bytes` here carries ELEMENTS (options.max_count), not bytes — the
-    // alltoallv gate compares element count directly against the threshold.
-    auto ccl_dtype_q = ccl::global_data::get().dtypes->get(dtype);
-    const auto tune = ccl::sycl_policy_resolver::scaleup_resolver{
-        ccl::sycl_policy::policy_query(
-            ccl_coll_alltoallv, options.max_count, ccl_dtype_q,
-            /*r2r_size=*/0, comm->size(), use_recording_path(q))
-            .with_comm(comm)
-            .with_stream(global_stream)
-    }.alltoallv();
+    // Alltoallv's threshold is in elements, not bytes.
+    auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
+    auto query = ccl::sycl_policy::policy_query(
+                     ccl_coll_alltoallv, options.max_count, ccl_dtype,
+                     /*r2r_size=*/0, comm->size(), use_recording_path(q))
+                     .with_comm(comm)
+                     .with_p2p_comm(p2p_comm.get(), /*p2p_access_from_all=*/true)
+                     .with_stream(global_stream);
+    const auto tune = ccl::sycl_policy_resolver::scaleup_resolver{query}.alltoallv();
 
     if (tune.protocol == ccl::sycl_policy::scaleup_protocol::ll) {
         bool fell_through = false;
@@ -190,61 +191,48 @@ ccl::event alltoallv_scaleup_sycl(sycl::queue& q,
         if (!fell_through) return ev;
     }
 
-#ifdef CCL_ENABLE_ESIMD
-    if (ccl::global_data::env().sycl_esimd) {
-        LOG_WARN(
-            "|CCL_SYCL| sycl ESIMD requested for alltoallv collective; ESIMD not supported, falling back to alltoallv sycl implementation");
-    }
-#endif // CCL_ENABLE_ESIMD
-
     return alltoallv_scaleup_default(send_buf, send_counts, send_displs, recv_buf, recv_counts,
                                  recv_displs, dtype, comm, global_stream, deps, options, done);
 }
 
-ccl::event alltoallv_sycl_multi_domain(sycl::queue& q,
-                                       const void* send_buf,
-                                       const ccl::vector_class<size_t>& send_counts,
-                                       const ccl::vector_class<size_t>& send_displs,
-                                       void* recv_buf,
-                                       const ccl::vector_class<size_t>& recv_counts,
-                                       const ccl::vector_class<size_t>& recv_displs,
-                                       ccl::datatype dtype,
-                                       ccl_comm* comm,
-                                       std::shared_ptr<ccl_comm> p2p_comm,
-                                       std::shared_ptr<ccl_comm> r2r_comm,
-                                       ccl_stream* global_stream,
-                                       const vector_class<event>& deps,
-                                       alltoallv_ctx* options,
-                                       bool& done) {
-    if (send_buf == recv_buf) {
-        LOG_WARN_ONCE("|CCL_SYCL| oneCCL does not support in-place Alltoallv; falling back");
-        done = false;
-        return ccl::event();
-    }
-
+ccl::event alltoallv_scaleout_only_sycl(sycl::queue& q,
+                                        const void* send_buf,
+                                        const ccl::vector_class<size_t>& send_counts,
+                                        const ccl::vector_class<size_t>& send_displs,
+                                        void* recv_buf,
+                                        const ccl::vector_class<size_t>& recv_counts,
+                                        const ccl::vector_class<size_t>& recv_displs,
+                                        ccl::datatype dtype,
+                                        ccl_comm* comm,
+                                        std::shared_ptr<ccl_comm> r2r_comm,
+                                        ccl_stream* global_stream,
+                                        const vector_class<event>& deps,
+                                        alltoallv_ctx& options,
+                                        bool& done) {
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     size_t dt_sz = ccl_dtype.size();
     uint32_t world = comm->size();
 
     sycl_scaleout_tune_attr scaleout_tune_attr = ccl::sycl_policy_resolver::scaleout_resolver{
-        ccl::sycl_policy::policy_query(ccl_coll_alltoallv, options->max_count * dt_sz, ccl_dtype,
-            /*r2r_size=*/0, comm->size(), use_recording_path(q))
-    }.alltoall();
+        ccl::sycl_policy::policy_query(ccl_coll_alltoallv, options.max_count, ccl_dtype,
+            comm->size(), comm->size(), use_recording_path(q))
+            .with_p2p_level(r2r_comm->get_p2p_level())
+    }.alltoallv();
 
-    if (scaleout_tune_attr.algo() == ccl::sycl_policy::algorithm::direct) {
-        options->copy_to_host = !ccl::global_data::env().sycl_enable_direct_gpu_rdma;
+    if (scaleout_tune_attr.algo() == ccl::sycl_policy::scaleout_algo::direct) {
+        options.copy_to_host = !ccl::global_data::env().sycl_enable_direct_gpu_rdma;
         {
             ze_device_handle_t ze_dev =
                 sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
             if (should_disable_rdma(ze_dev))
-                options->copy_to_host = true;
+                options.copy_to_host = true;
         }
 
-        if (options->copy_to_host) {
+        if (options.copy_to_host) {
             size_t host_buf_size = comm->get_scaleout_host_buf_size();
-            size_t size_to_compare = options->total_max_count * dt_sz;
+            size_t size_to_compare = options.total_max_count * dt_sz;
             if (host_buf_size < size_to_compare) {
-                options->is_pipeline = true;
+                options.is_pipeline = true;
             }
 
             LOG_DEBUG("scaleout alltoallv: global_bytes=",
@@ -252,10 +240,10 @@ ccl::event alltoallv_sycl_multi_domain(sycl::queue& q,
                       " host_buf_size=",
                       host_buf_size,
                       " is_pipeline=",
-                      options->is_pipeline);
+                      options.is_pipeline);
 
             // pipelined per-rank chunking for simple_direct algo
-            if (options->is_pipeline) {
+            if (options.is_pipeline) {
                 // use a separate copy queue to allow overlapping 1.copy+2.compute and 3.copy
                 auto copy_q =
                     sycl::queue(q.get_context(), q.get_device(), sycl::property::queue::in_order{});
@@ -284,8 +272,16 @@ ccl::event alltoallv_sycl_multi_domain(sycl::queue& q,
                     chunk_bytes = max_safe_chunk_bytes;
                 }
 
-                void* scaleout_send_buf = comm->get_scaleout_host_buf();
-                void* scaleout_recv_buf = (char*)scaleout_send_buf + world * chunk_bytes;
+                // total_send_count == 0 -> recv-only rank; total_recv_count == 0 -> send-only rank
+                size_t total_recv_count = std::accumulate(recv_counts.begin(), recv_counts.end(), 0ul);
+                size_t total_send_count = std::accumulate(send_counts.begin(), send_counts.end(), 0ul);
+                void* scaleout_send_buf = total_send_count > 0 ? comm->get_scaleout_host_buf() : nullptr;
+                void* scaleout_recv_buf = nullptr;
+                if (total_recv_count > 0) {
+                    scaleout_recv_buf = scaleout_send_buf ? 
+                                        (char*)scaleout_send_buf + world * chunk_bytes :
+                                        comm->get_scaleout_host_buf();
+                }
 
                 // how many bytes already transferred
                 std::vector<size_t> send_progress(world, 0);
@@ -305,9 +301,9 @@ ccl::event alltoallv_sycl_multi_domain(sycl::queue& q,
                 std::vector<ccl::event> copy_events;
 
                 // options stay the same for all iterations
-                options->chunk_bytes = chunk_bytes;
-                options->copy_to_host = false;
-                options->is_cpu_buffers = true;
+                options.chunk_bytes = chunk_bytes;
+                options.copy_to_host = false;
+                options.is_cpu_buffers = true;
                 std::vector<sycl::event> dep_events = get_sycl_events(deps);
 
                 // loop until all data is transferred
@@ -327,10 +323,15 @@ ccl::event alltoallv_sycl_multi_domain(sycl::queue& q,
                         }
                     }
                     if (!has_data_to_transfer) {
+                        if (!dep_events.empty()) {
+                            op_e = submit_wait_on_events(q, dep_events);
+                            dep_events.clear();
+                        }
                         break;
                     }
 
                     // 1: D2H copy, each rank copies a data chunk into the host_buf send area
+                    bool any_copy_submitted = false;
                     for (auto rank = 0; rank < world; rank++) {
                         if (chunk_send_bytes[rank] == 0)
                             continue;
@@ -340,8 +341,14 @@ ccl::event alltoallv_sycl_multi_domain(sycl::queue& q,
                                      (char*)send_buf + send_displs[rank] + send_progress[rank],
                                      chunk_send_bytes[rank]);
                         });
+                        any_copy_submitted = true;
                     }
-                    dep_events.clear();
+                    if (any_copy_submitted) 
+                        dep_events.clear();
+                    else if (!dep_events.empty()) {
+                        submit_wait_on_events(q, dep_events);
+                        dep_events.clear();
+                    }
 
                     // 2: direct alltoallv
 #ifdef CCL_ENABLE_ITT
@@ -364,7 +371,7 @@ ccl::event alltoallv_sycl_multi_domain(sycl::queue& q,
                                                           comm,
                                                           copy_events,
                                                           false,
-                                                          *options,
+                                                          options,
                                                           done);
 #ifdef CCL_ENABLE_ITT
                     ccl::profile::itt::task_end();
@@ -372,6 +379,7 @@ ccl::event alltoallv_sycl_multi_domain(sycl::queue& q,
                     copy_events.clear();
 
                     // 3: H2D copy received data from the staging recv area back into recv_buf
+                    any_copy_submitted = false;
                     for (auto rank = 0; rank < world; rank++) {
                         if (chunk_recv_bytes[rank] == 0)
                             continue;
@@ -381,8 +389,10 @@ ccl::event alltoallv_sycl_multi_domain(sycl::queue& q,
                                      (char*)scaleout_recv_buf + rank * chunk_bytes,
                                      chunk_recv_bytes[rank]);
                         });
+                        any_copy_submitted = true;
                     }
-                    copy_events.push_back(ccl::event::create_from_native(copy_e));
+                    if (any_copy_submitted)
+                        copy_events.push_back(ccl::event::create_from_native(copy_e));
 
                     // update progress
                     for (auto rank = 0; rank < world; rank++) {
@@ -392,14 +402,19 @@ ccl::event alltoallv_sycl_multi_domain(sycl::queue& q,
                 } // main for loop of sending msg
 
                 done = true;
-                auto sycl_deps = get_sycl_events(copy_events);
-                op_e = submit_wait_on_events(q, sycl_deps);
+                if (!copy_events.empty()) {
+                    // if any copy to recv_buf happened, q should wait
+                    auto sycl_deps = get_sycl_events(copy_events);
+                    op_e = submit_wait_on_events(q, sycl_deps);
+                } // if send_only mode just wait for the last op_e in q
                 return ccl::event::create_from_native(op_e);
             }
         }
     }
 
-    // default path
+    LOG_DEBUG("alltoallv scaleout only");
+    // the counts and displs stay global-rank-indexed: this is only reached when the p2p
+    // comm holds a single rank, so r2r_comm spans all the ranks in global order
     return alltoallv_scaleout_sycl(q,
                                    send_buf,
                                    send_counts,
@@ -413,8 +428,81 @@ ccl::event alltoallv_sycl_multi_domain(sycl::queue& q,
                                    deps,
                                    true,
                                    scaleout_tune_attr,
-                                   *options,
+                                   options,
                                    done);
+}
+
+ccl::event alltoallv_sycl_multi_domain(sycl::queue& q,
+                                       const void* send_buf,
+                                       const ccl::vector_class<size_t>& send_counts,
+                                       const ccl::vector_class<size_t>& send_displs,
+                                       void* recv_buf,
+                                       const ccl::vector_class<size_t>& recv_counts,
+                                       const ccl::vector_class<size_t>& recv_displs,
+                                       ccl::datatype dtype,
+                                       ccl_comm* comm,
+                                       std::shared_ptr<ccl_comm> p2p_comm,
+                                       std::shared_ptr<ccl_comm> r2r_comm,
+                                       ccl_stream* global_stream,
+                                       const vector_class<event>& deps,
+                                       alltoallv_ctx& options,
+                                       bool& done) {
+    if (send_buf && recv_buf && send_buf == recv_buf) {
+        LOG_WARN_ONCE("|CCL_SYCL| oneCCL does not support in-place Alltoallv; falling back");
+        done = false;
+        return ccl::event();
+    }
+
+    if (p2p_comm->size() == 1 || !transport_rdma_enabled()) {
+        return alltoallv_scaleout_only_sycl(q,
+                                            send_buf,
+                                            send_counts,
+                                            send_displs,
+                                            recv_buf,
+                                            recv_counts,
+                                            recv_displs,
+                                            dtype,
+                                            comm,
+                                            r2r_comm,
+                                            global_stream,
+                                            deps,
+                                            options,
+                                            done);
+    }
+
+    // pair-wise exchange in p2p_comm, followed by pairwise exchange
+    // on all ranks out of the p2p_comm
+    bool batch_mode = true;
+
+    // when the proxy service is enabled, run the scale-out exchange on the proxy thread;
+    // a service that failed to start leaves the non-proxy implementation
+    const bool use_proxy = ccl::global_data::env().sycl_enable_alltoall_scaleout_proxy &&
+                           ccl::global_data::get().proxy_service->is_started();
+
+    LOG_DEBUG("|CCL_SYCL| alltoallv selects numa pairwise only kernel, max count:",
+              options.max_count,
+              " datatype: ",
+              dtype,
+              " use_proxy: ",
+              use_proxy);
+
+    return alltoallv_sycl_numa_pairwise_rdma_oneshot(q,
+                                                     send_buf,
+                                                     send_counts,
+                                                     send_displs,
+                                                     recv_buf,
+                                                     recv_counts,
+                                                     recv_displs,
+                                                     dtype,
+                                                     comm,
+                                                     p2p_comm,
+                                                     r2r_comm,
+                                                     global_stream,
+                                                     deps,
+                                                     batch_mode,
+                                                     use_proxy,
+                                                     options,
+                                                     done);
 }
 
 ccl::event alltoallv_sycl(sycl::queue q,
@@ -428,7 +516,7 @@ ccl::event alltoallv_sycl(sycl::queue q,
                           const alltoallv_attr& attr,
                           const vector_class<event>& deps,
                           bool& done) {
-    if (send_buf == recv_buf) {
+    if (send_buf && recv_buf && send_buf == recv_buf) {
         LOG_WARN_ONCE("|CCL_SYCL| oneCCL does not support in-place Alltoallv; falling back");
         done = false;
         return ccl::event();
@@ -456,9 +544,9 @@ ccl::event alltoallv_sycl(sycl::queue q,
         size_t max_send = *std::max_element(send_counts.begin(), send_counts.end());
         size_t max_recv = *std::max_element(recv_counts.begin(), recv_counts.end());
         size_t total_recv_count = std::accumulate(recv_counts.begin(), recv_counts.end(), 0ul);
-        size_t total_send_bytes = std::accumulate(send_counts.begin(), send_counts.end(), 0ul);
+        size_t total_send_count = std::accumulate(send_counts.begin(), send_counts.end(), 0ul);
         size_t local_counts[2] = { std::max(max_send, max_recv),
-                                   total_send_bytes + total_recv_count };
+                                   total_send_count + total_recv_count };
         size_t global_counts[2] = { 0, 0 };
         int ep_idx = 0;
         atl_req_t req;
@@ -489,9 +577,13 @@ ccl::event alltoallv_sycl(sycl::queue q,
         recv_displs[i] = recv_displs[i - 1] + recv_counts[i - 1] * ccl_dtype.size();
     }
 
-    auto p2p_level = ccl_p2p_domain::sycl_get_default_p2p_level(comm, options.max_count * ccl_dtype.size(), ccl::global_data::env().sycl_p2p_level_threshold);
+    auto p2p_level = ccl_p2p_domain::sycl_get_alltoall_p2p_level(
+        comm,
+        options.max_count * ccl_dtype.size(),
+        ccl::global_data::env().sycl_p2p_level_alltoall_small_threshold,
+        ccl::global_data::env().sycl_p2p_level_alltoall_threshold);
 
-    auto [ p2p_comm, r2r_comm ] = ccl_p2p_domain::get_p2p_comms(comm, p2p_level);
+    auto [p2p_comm, r2r_comm] = ccl_p2p_domain::get_p2p_comms(comm, p2p_level);
 
     // single p2p domain
     if (r2r_comm->is_uniform && r2r_comm->size() == 1) {
@@ -527,7 +619,7 @@ ccl::event alltoallv_sycl(sycl::queue q,
                                        r2r_comm,
                                        op_stream,
                                        deps,
-                                       &options,
+                                       options,
                                        done);
 }
 

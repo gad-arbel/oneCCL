@@ -32,7 +32,13 @@
 // tmp-buf staged path. Same threshold is used by allgatherv_large_sycl
 // and reduce_scatter_large_sycl.
 //
-// Pull semantics: each rank reads its own slice from root's send_buf via the
+// Two directions are implemented and selected at runtime by
+// CCL_SYCL_SCATTER_READ (see scatter_large_impl below); write is the
+// default. Read dereferences node_ptrs_rd (peer send_buf) and write
+// dereferences node_ptrs_wr (peer recv_buf); scatter_large populates the array
+// the selected direction needs and gates the fast path on that same array.
+//
+// Read semantics: each rank reads its own slice from root's send_buf via the
 // IPC pointer. Two barriers — first to wait for root's data to be visible,
 // second to let root know readers finished. Root never writes to its own
 // IPC slot; if recv_buf already aliases its own block (in-place), the local
@@ -40,17 +46,33 @@
 // alltoall's per-peer memcpy plumbing — broadcast as the skeleton, alltoall
 // as confirmation that q.memcpy(recv, peer_ipc_ptr + offset, bytes) is the
 // correct shape for IPC-direct slice transfer.
-inline ccl::event scatter_large_impl_ipc(const void* send_buf,
-                                         void* recv_buf,
-                                         size_t count,
-                                         ccl::datatype dtype,
-                                         int root,
-                                         ccl_comm* comm,
-                                         const std::shared_ptr<ccl_comm>& p2p_comm,
-                                         sycl::queue q,
-                                         sycl_ptrs_type& sycl_ptrs,
-                                         const ccl::vector_class<ccl::event>& deps) {
-    LOG_DEBUG("scatter large kernel ipc");
+//
+// Write semantics: root writes every peer's slice into that peer's recv_buf
+// via node_ptrs_wr[peer], so only root moves data while the peers just
+// synchronize. The two barriers are collective and mirror the read variant:
+// the first one guarantees every peer's recv_buf is ready before root writes
+// into it, the second one publishes root's writes to the peers and keeps
+// send_buf alive until they complete. Root skips its own block when recv_buf
+// is already in-place inside send_buf.
+//
+// Root's per-peer copies go on the same in-order queue as the barriers, so
+// they issue back to back rather than concurrently. That is not the limiter
+// here: every copy leaves through root's egress link, which saturates around
+// 43 GB/s on this topology. Submitting the same copies on a private
+// out-of-order queue measured +2% at 8 ranks, +5% at 4 and +16% at 2 — the
+// gain shrinks as peers are added, the opposite of what copy serialization
+// would produce, because a deeper queue keeps the shared link busy on its own.
+inline ccl::event scatter_large_impl_ipc_read(const void* send_buf,
+                                              void* recv_buf,
+                                              size_t count,
+                                              ccl::datatype dtype,
+                                              int root,
+                                              ccl_comm* comm,
+                                              const std::shared_ptr<ccl_comm>& p2p_comm,
+                                              sycl::queue q,
+                                              sycl_ptrs_type& sycl_ptrs,
+                                              const ccl::vector_class<ccl::event>& deps) {
+    LOG_DEBUG("scatter large kernel ipc read");
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     const size_t dsize = ccl_dtype.size();
     std::vector<sycl::event> dep_events = get_sycl_events(deps);
@@ -82,6 +104,59 @@ inline ccl::event scatter_large_impl_ipc(const void* send_buf,
     // Second barrier so root knows readers are done before send_buf is reused.
     sycl::event ret_event = invoke_barrier(p2p_comm, q, {}, is_cpu_barrier);
 
+    return ccl::event::create_from_native(ret_event);
+}
+
+// Direct IPC write variant. Every rank participates in both barriers while the
+// root writes each peer's slice into that peer's receive buffer.
+inline ccl::event scatter_large_impl_ipc_write(const void* send_buf,
+                                              void* recv_buf,
+                                              size_t count,
+                                              ccl::datatype dtype,
+                                              int root,
+                                              ccl_comm* comm,
+                                              const std::shared_ptr<ccl_comm>& p2p_comm,
+                                              sycl::queue q,
+                                              sycl_ptrs_type& sycl_ptrs,
+                                              const ccl::vector_class<ccl::event>& deps) {
+    LOG_DEBUG("scatter large kernel ipc write");
+    auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
+    const size_t dsize = ccl_dtype.size();
+    std::vector<sycl::event> dep_events = get_sycl_events(deps);
+    const bool is_cpu_barrier = ccl::global_data::env().sycl_ccl_barrier;
+
+    const int comm_rank = p2p_comm->rank();
+    const int comm_size = p2p_comm->size();
+
+    sycl::event barrier_event = invoke_barrier(p2p_comm, q, dep_events, is_cpu_barrier);
+    std::vector<sycl::event> write_events;
+    if (comm_rank == root) {
+        // In-place is defined only for the root's own block, so evaluate it
+        // once here instead of once per peer.
+        const bool inplace =
+            ccl::is_scatter_inplace(send_buf, recv_buf, count, dsize, root, root, comm_size);
+        if (inplace) {
+            LOG_DEBUG("scatter large inplace at root, no copy");
+        }
+
+        for (int peer = 0; peer < comm_size; ++peer) {
+            // Root's block already sits at recv_buf when in-place; skip the self-copy.
+            if (peer == root && inplace) {
+                continue;
+            }
+
+            const size_t offset = static_cast<size_t>(peer) * count * dsize;
+            write_events.push_back(q.memcpy(sycl_ptrs.node_ptrs_wr[peer],
+                                            static_cast<const uint8_t*>(send_buf) + offset,
+                                            count * dsize,
+                                            barrier_event));
+        }
+    }
+    if (write_events.empty()) {
+        write_events.push_back(barrier_event);
+    }
+
+    sycl::event ret_event = invoke_barrier(p2p_comm, q, write_events, is_cpu_barrier);
     return ccl::event::create_from_native(ret_event);
 }
 
@@ -230,7 +305,11 @@ inline ccl::event scatter_large_impl(const void* send_buf,
     sycl::queue q = global_stream->get_native_stream();
 
     if (!is_tmp_used) {
-        return scatter_large_impl_ipc(
+        if (ccl::global_data::env().sycl_scatter_read) {
+            return scatter_large_impl_ipc_read(
+                send_buf, recv_buf, count, dtype, root, comm, p2p_comm, q, sycl_ptrs, deps);
+        }
+        return scatter_large_impl_ipc_write(
             send_buf, recv_buf, count, dtype, root, comm, p2p_comm, q, sycl_ptrs, deps);
     }
     return scatter_large_impl_tmp(

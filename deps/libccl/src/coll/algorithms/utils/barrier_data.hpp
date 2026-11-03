@@ -214,11 +214,13 @@ private:
     int m_rank;
     int m_size;
 
-    // per-peer call counters, local to this rank (not IPC-shared), MAX_NODE_RANKS entries
+    // per-(channel, peer) call counters, local to this rank (not IPC-shared),
+    // MAX_P2P_CHANNELS * MAX_NODE_RANKS entries, indexed channel * MAX_NODE_RANKS + peer.
+    // Single-work-group callers (p2p_barrier_pair) only ever use channel 0.
     size_t *d_pair_counts = nullptr;
 
     // IPC-opened pointers: d_remote_ptrs[r] points to rank r's pair_flags array.
-    // pair_flags layout: one cell per peer, indexed by writer rank.
+    // pair_flags layout: one cell per (channel, writer rank), same indexing as above.
     // A single cell is sufficient: Intel GPUs guarantee per-location coherence,
     // so the monotonic marker alone ensures a poll cannot observe a stale value.
     std::array<size_t *, MAX_NODE_RANKS> d_remote_ptrs{};

@@ -237,15 +237,6 @@ constexpr const char* CCL_SYCL_ALLGATHERV_TMP_BUF = "CCL_SYCL_ALLGATHERV_TMP_BUF
 constexpr const char* CCL_SYCL_ALLGATHERV_SMALL_THRESHOLD = "CCL_SYCL_ALLGATHERV_SMALL_THRESHOLD";
 
 /**
- * @brief Specify the threshold for the medium size algorithm in allgatherv
- *
- * @details Set the threshold in bytes to specify the medium size algorithm in the allgatherv
- * collective. Default value is 2097152. "<value>" : ">=0"
- * 
- */
-constexpr const char* CCL_SYCL_ALLGATHERV_MEDIUM_THRESHOLD = "CCL_SYCL_ALLGATHERV_MEDIUM_THRESHOLD";
-
-/**
  * @brief Specify the threshold for the scaleout algorithm in allgatherv
  *
  * @details Set the threshold in bytes to specify the scaleout algorithm in the allgatherv
@@ -277,16 +268,6 @@ constexpr const char* CCL_SYCL_ALLREDUCE_TMP_BUF = "CCL_SYCL_ALLREDUCE_TMP_BUF";
  */
 constexpr const char* CCL_SYCL_ALLREDUCE_SMALL_THRESHOLD = "CCL_SYCL_ALLREDUCE_SMALL_THRESHOLD";
 
-// CCL_SYCL_ALLREDUCE_MEDIUM_THRESHOLD
-/**
- * @brief Specify the threshold for the medium size algorithm in allreduce
- *
- * @details Set the threshold in bytes to specify the medium size algorithm in the allreduce
- * collective. Default value is 16777216. "<value>" : ">=0"
- * 
- */
-constexpr const char* CCL_SYCL_ALLREDUCE_MEDIUM_THRESHOLD = "CCL_SYCL_ALLREDUCE_MEDIUM_THRESHOLD";
-
 /**
  * @brief Specify the maximum threshold for the Allreduce Sycl scale-out algorithm
  *
@@ -315,6 +296,26 @@ constexpr const char* CCL_SYCL_ALLREDUCE_LL_THRESHOLD = "CCL_SYCL_ALLREDUCE_LL_T
 constexpr const char* CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD = "CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD";
 constexpr const char* CCL_SYCL_ALLREDUCE_SIMPLE_READ = "CCL_SYCL_ALLREDUCE_SIMPLE_READ";
 constexpr const char* CCL_SYCL_ALLREDUCE_CHUNKING_THRESHOLD = "CCL_SYCL_ALLREDUCE_CHUNKING_THRESHOLD";
+
+/**
+ * @brief Chunk size for the allreduce simple (non-LL) scale-up kernel, per message size.
+ *
+ * Splits the large kernel into chunks of at most this many bytes. The message size is
+ * count * dtype size bytes.
+ *
+ * Syntax (whole range):
+ *   CCL_SYCL_ALLREDUCE_SIMPLE_CHUNK_SIZE=<chunk_bytes>
+ * Syntax (per size range, in bytes; ranges must cover 0-max):
+ *   CCL_SYCL_ALLREDUCE_SIMPLE_CHUNK_SIZE="<chunk_1>:<lo_1>-<hi_1>;<chunk_2>:<lo_2>-<hi_2>;..."
+ *
+ * Example:
+ *   CCL_SYCL_ALLREDUCE_SIMPLE_CHUNK_SIZE="0:0-16777216;8388608:16777217-max"
+ *
+ * A chunk size of 0 disables chunking for that range; any other value must be at least 8 bytes.
+ * The spec is parsed on the first large call; later changes have no effect.
+ * Default: "" (no chunking).
+ */
+constexpr const char* CCL_SYCL_ALLREDUCE_SIMPLE_CHUNK_SIZE = "CCL_SYCL_ALLREDUCE_SIMPLE_CHUNK_SIZE";
 /**
  * @brief Specify allreduce SYCL scale-up LL transmit algorithm per message-size range
  *
@@ -349,10 +350,15 @@ constexpr const char* CCL_SYCL_ALLREDUCE_LL = "CCL_SYCL_ALLREDUCE_LL";
  * @brief Path to a JSON file describing the SYCL fast-path selection policy.
  * @details When set, the file at this path is loaded once at first use and
  * consulted by the sycl_policy engine for scaleup/scaleout algorithm choice.
- * When the variable is unset or the file is unreadable, the engine stays empty and
- * the fast path falls through to env-var-driven defaults
+ * When unset or unreadable, the built-in defaults are used.
+ *
+ * The policy takes precedence over the environment: a matching rule over the
+ * tuning env vars of its phase, its leaf knobs (chunk_bytes, copy_path,
+ * self_copy_threshold, simple_chunk_size, simple_ring_segment_size) over the
+ * variables they set, and its global_config entries over the same variables
+ * set in the environment.
  */
-constexpr const char* CCL_SELECTION_POLICY = "CCL_SELECTION_POLICY";
+constexpr const char* CCL_SELECTION_POLICY_PATH = "CCL_SELECTION_POLICY_PATH";
 
 /**
  * @brief Enable the use of persistent intermediate buffer in reduce
@@ -414,15 +420,6 @@ constexpr const char* CCL_SYCL_REDUCE_SCATTER_TMP_BUF = "CCL_SYCL_REDUCE_SCATTER
 constexpr const char* CCL_SYCL_REDUCE_SCATTER_SMALL_THRESHOLD = "CCL_SYCL_REDUCE_SCATTER_SMALL_THRESHOLD";
 
 /**
- * @brief Specify the threshold for the medium size algorithm in reduce_scatter
- *
- * @details Set the threshold in bytes to specify the medium size algorithm in the reduce_scatter
- * collective. Default value is 67108864. "<value>" : ">=0"
- * 
- */
-constexpr const char* CCL_SYCL_REDUCE_SCATTER_MEDIUM_THRESHOLD = "CCL_SYCL_REDUCE_SCATTER_MEDIUM_THRESHOLD";
-
-/**
  * @brief Specify the threshold for the Sycl scaleout algorithm in reduce-scatter
  *
  * @details Set the threshold in bytes to specify the Sycl scaleout algorithm in the reduce-scatter
@@ -474,6 +471,26 @@ constexpr const char* CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD = "CCL_SYCL_REDUC
  * the same algorithm is used for all sizes.
  */
 constexpr const char* CCL_SYCL_REDUCE_SCATTER_LL = "CCL_SYCL_REDUCE_SCATTER_LL";
+
+/**
+ * @brief Chunk size for the reduce-scatter simple (non-LL) scale-up kernel, per message size.
+ *
+ * Splits the large kernel into chunks of at most this many bytes of each rank's block.
+ * The message size is recv_count * comm size * dtype size bytes.
+ *
+ * Syntax (whole range):
+ *   CCL_SYCL_REDUCE_SCATTER_SIMPLE_CHUNK_SIZE=<chunk_bytes>
+ * Syntax (per size range, in bytes; ranges must cover 0-max):
+ *   CCL_SYCL_REDUCE_SCATTER_SIMPLE_CHUNK_SIZE="<chunk_1>:<lo_1>-<hi_1>;<chunk_2>:<lo_2>-<hi_2>;..."
+ *
+ * Example:
+ *   CCL_SYCL_REDUCE_SCATTER_SIMPLE_CHUNK_SIZE="0:0-16777216;8388608:16777217-max"
+ *
+ * A chunk size of 0 disables chunking for that range; any other value must be at least 8 bytes.
+ * The spec is parsed on the first large call; later changes have no effect.
+ * Default: "" (no chunking).
+ */
+constexpr const char* CCL_SYCL_REDUCE_SCATTER_SIMPLE_CHUNK_SIZE = "CCL_SYCL_REDUCE_SCATTER_SIMPLE_CHUNK_SIZE";
 
 /**
  * @addtogroup OneCCLvars
@@ -565,7 +582,7 @@ constexpr const char* CCL_SYCL_BROADCAST_SCALEOUT_THRESHOLD = "CCL_SYCL_BROADCAS
  * topologies (CRI/BMG) where the one-shot path is bottlenecked by N-1 ranks all
  * reading from root simultaneously.  Requires CCL_SYCL_BROADCAST_TMP_BUF=0
  * (the default); MT communicators always force tmp-buf and therefore never
- * use the ring.  On ARC/BMG, also bypasses broadcast_rt_ring (RT256 LL) for
+ * use the ring.  On ARC/BMG, also bypasses broadcast_ll_ring (RT256 LL) for
  * large messages so that large traffic reaches this path.  Small messages are
  * unaffected.
  *
@@ -714,6 +731,19 @@ constexpr const char* CCL_SYCL_BROADCAST_SCATTER_ALLGATHER_MAX_PPN =
 constexpr const char* CCL_SYCL_SCATTER_LARGE_TMP_BUF = "CCL_SYCL_SCATTER_LARGE_TMP_BUF";
 
 /**
+ * @brief Use the read-based IPC scatter implementation.
+ *
+ * @details When enabled, each rank reads its own slice from the root send
+ * buffer. When disabled, the root writes each slice into the destination
+ * rank's receive buffer.
+ *
+ * "<value>" : "0", "1"
+ *
+ * By-default: "0 (disabled, the root writes)"
+ */
+constexpr const char* CCL_SYCL_SCATTER_READ = "CCL_SYCL_SCATTER_READ";
+
+/**
  * @brief Threshold (bytes) below which scatter uses the small SYCL kernel.
  *
  * @details Set the threshold in bytes for the scatter small-kernel selection.
@@ -757,7 +787,90 @@ constexpr const char* CCL_SYCL_SCATTER_SCALEOUT_OVERLAP = "CCL_SYCL_SCATTER_SCAL
  */
 constexpr const char* CCL_SYCL_SCATTER_SCALEOUT_OVERLAP_BUF_SIZE = "CCL_SYCL_SCATTER_SCALEOUT_OVERLAP_BUF_SIZE";
 
+/**
+ * @brief Select read- or write-based device-to-device copy for the gather large
+ * kernel.
+ *
+ * @details "write" has every rank push its block into root's receive buffer.
+ * "read" has root pull each rank's block out of that rank's send buffer. Both
+ * move the same bytes; which one wins depends on how the fabric handles remote
+ * reads versus remote writes. Ignored when the tmp-buffer staged path is in use.
+ *
+ * "<value>" : "read", "write"
+ *
+ * By-default: "write"
+ */
+constexpr const char* CCL_SYCL_GATHER_LARGE_PROTOCOL = "CCL_SYCL_GATHER_LARGE_PROTOCOL";
+
+/**
+ * @brief Toggle tmp-buffer staging for the whole SYCL gather collective.
+ *
+ * @details Collective-wide switch; CCL_SYCL_GATHER_LARGE_TMP_BUF does the same
+ * for the large kernel alone, and either one selects the staged path. The small
+ * kernel is always staged, so this does not affect it.
+ *
+ * "<value>" : "0", "1"
+ *
+ * By-default: "0 (disabled)"
+ */
+constexpr const char* CCL_SYCL_GATHER_TMP_BUF = "CCL_SYCL_GATHER_TMP_BUF";
+
+/**
+ * @brief Toggle the tmp-buffer staged variant of the gather large kernel.
+ *
+ * @details The kernel already falls back to staging when IPC peer pointers are
+ * unavailable or misaligned; this forces it explicitly.
+ *
+ * "<value>" : "0", "1"
+ *
+ * By-default: "0 (disabled)"
+ */
+constexpr const char* CCL_SYCL_GATHER_LARGE_TMP_BUF = "CCL_SYCL_GATHER_LARGE_TMP_BUF";
+
+/**
+ * @brief Per-rank threshold (bytes) below which gather uses the small kernel.
+ *
+ * @details The small kernel also needs root's tmp buffer to hold every block at
+ * once, so a call at or below this threshold still runs on the large kernel when
+ * comm_size * count * dsize exceeds one tmp-buf generation.
+ *
+ * "<value>" : ">=0"
+ *
+ * By-default: "524288"
+ */
+constexpr const char* CCL_SYCL_GATHER_SMALL_THRESHOLD = "CCL_SYCL_GATHER_SMALL_THRESHOLD";
+
+/**
+ * @brief Per-rank byte threshold above which gather stops using SYCL kernels and
+ * hands the collective back to the `direct` algorithm.
+ *
+ * "<value>" : ">=0"
+ *
+ * By-default: "4294967296"
+ */
+constexpr const char* CCL_SYCL_GATHER_SCALEOUT_THRESHOLD = "CCL_SYCL_GATHER_SCALEOUT_THRESHOLD";
+
 constexpr const char* CCL_SYCL_ALLGATHERV_CHUNKING_THRESHOLD = "CCL_SYCL_ALLGATHERV_CHUNKING_THRESHOLD";
+
+/**
+ * @brief Chunk size for the allgatherv simple (non-LL) scale-up kernel, per message size.
+ *
+ * Splits the large kernel into chunks of at most this many bytes of each rank's block.
+ * The message size is send_count * dtype size bytes.
+ *
+ * Syntax (whole range):
+ *   CCL_SYCL_ALLGATHERV_SIMPLE_CHUNK_SIZE=<chunk_bytes>
+ * Syntax (per size range, in bytes; ranges must cover 0-max):
+ *   CCL_SYCL_ALLGATHERV_SIMPLE_CHUNK_SIZE="<chunk_1>:<lo_1>-<hi_1>;<chunk_2>:<lo_2>-<hi_2>;..."
+ *
+ * Example:
+ *   CCL_SYCL_ALLGATHERV_SIMPLE_CHUNK_SIZE="0:0-16777216;8388608:16777217-max"
+ *
+ * A chunk size of 0 disables chunking for that range; any other value must be at least 8 bytes.
+ * The spec is parsed on the first large call; later changes have no effect.
+ * Default: "" (no chunking).
+ */
+constexpr const char* CCL_SYCL_ALLGATHERV_SIMPLE_CHUNK_SIZE = "CCL_SYCL_ALLGATHERV_SIMPLE_CHUNK_SIZE";
 
 /**
  * @brief Select the alltoall SYCL scaleout algorithm.
@@ -776,11 +889,105 @@ constexpr const char* CCL_SYCL_ALLTOALL_TMP_BUF = "CCL_SYCL_ALLTOALL_TMP_BUF";
 
 constexpr const char* CCL_SYCL_ALLTOALL_LL_THRESHOLD = "CCL_SYCL_ALLTOALL_LL_THRESHOLD";
 
+/**
+ * @brief Selects the LL256 transmit kernel for the SYCL alltoall scale-up path
+ *
+ * @details Allows per-message-size selection between ring and oneshot transmits,
+ * where the size is the per-peer chunk size.
+ *
+ * Supported algorithms:
+ * - ring       Pairwise-exchange ring transmit, one step with a barrier per peer.
+ *              Best throughput for large messages.
+ * - oneshot    Barrier-free exchange of every per-peer chunk in a single shot.
+ *              Lowest latency for small messages. Falls back to ring above the
+ *              compile-time ONESHOT_MAX_MSGSIZE cap, so requesting oneshot at
+ *              large sizes is always safe.
+ *
+ * Syntax (whole range):
+ *   CCL_SYCL_ALLTOALL_LL=<algo_name>
+ * Syntax (per size range, in bytes):
+ *   CCL_SYCL_ALLTOALL_LL="<algo_1>:<lo_1>-<hi_1>;<algo_2>:<lo_2>-<hi_2>;..."
+ * Use the reserved word "max" for the upper bound of the largest range.
+ *
+ * Example:
+ *   CCL_SYCL_ALLTOALL_LL="ring"
+ *
+ * Default: "oneshot:0-256;ring:257-max" - the measured crossover on ARCB, where
+ * oneshot is 1.1-1.5x faster at or below 256 B per peer and slower above it.
+ */
+constexpr const char* CCL_SYCL_ALLTOALL_LL = "CCL_SYCL_ALLTOALL_LL";
+
 constexpr const char* CCL_SYCL_ALLTOALL_CHUNKING_THRESHOLD = "CCL_SYCL_ALLTOALL_CHUNKING_THRESHOLD";
+
+/**
+ * @brief Chunk size for the alltoall simple (non-LL) scale-up kernel, per message size.
+ *
+ * Splits the large kernel into chunks of at most this many bytes of each peer's block.
+ * The message size is the per-peer count * dtype size bytes.
+ *
+ * Syntax (whole range):
+ *   CCL_SYCL_ALLTOALL_SIMPLE_CHUNK_SIZE=<chunk_bytes>
+ * Syntax (per size range, in bytes; ranges must cover 0-max):
+ *   CCL_SYCL_ALLTOALL_SIMPLE_CHUNK_SIZE="<chunk_1>:<lo_1>-<hi_1>;<chunk_2>:<lo_2>-<hi_2>;..."
+ *
+ * Example:
+ *   CCL_SYCL_ALLTOALL_SIMPLE_CHUNK_SIZE="0:0-16777216;8388608:16777217-max"
+ *
+ * A chunk size of 0 disables chunking for that range; any other value must be at least 8 bytes.
+ * The spec is parsed on the first large call; later changes have no effect.
+ * Default: "" (no chunking). On ARC, CCL_SYCL_ALLTOALL_CHUNKING_THRESHOLD sets the chunk size
+ * when the spec is empty, and a non-empty spec overrides it.
+ */
+constexpr const char* CCL_SYCL_ALLTOALL_SIMPLE_CHUNK_SIZE = "CCL_SYCL_ALLTOALL_SIMPLE_CHUNK_SIZE";
 constexpr const char* CCL_SYCL_ALLTOALL_SINGLE_NODE_ALGORITHM = "CCL_SYCL_ALLTOALL_SINGLE_NODE_ALGORITHM";
 constexpr const char* CCL_SYCL_ALLTOALL_USE_BARRIER = "CCL_SYCL_ALLTOALL_USE_BARRIER";
 constexpr const char* CCL_SYCL_ALLTOALL_SIMPLE_THRESHOLD = "CCL_SYCL_ALLTOALL_SIMPLE_THRESHOLD";
+/**
+ * @brief Select the copy engine or EU kernels for large alltoall and alltoallv on Arc
+ *
+ * @details In auto mode alltoall uses the copy engine, except EU kernels for two ranks or
+ * peers that share a PCIe switch; on CRI the copy engine stays above
+ * CCL_SYCL_ALLTOALL_CRI_COPY_ENGINE_THRESHOLD bytes per peer. alltoallv uses the copy engine.
+ * The copy_path knob of a selection policy sets this variable for one call.
+ *
+ * "<value>" : "-1" (auto), "0" (EU kernels), "1" (copy engine)
+ *
+ * By-default: "-1 (auto)"
+ */
 constexpr const char* CCL_SYCL_ALLTOALL_COPY_ENGINE = "CCL_SYCL_ALLTOALL_COPY_ENGINE";
+/**
+ * @brief Set the per-peer size above which CRI keeps alltoall on the copy engine
+ *
+ * @details With CCL_SYCL_ALLTOALL_COPY_ENGINE in auto mode, alltoall on Arc falls back from
+ * the copy engine to EU kernels for two ranks or peers that share a PCIe switch. On CRI the
+ * fallback applies only up to this many bytes per peer, since above it the copy engine is
+ * faster. The size is count * dtype size of one peer's full block, also when the call is
+ * chunked.
+ *
+ * "<value>" : bytes per peer
+ *
+ * By-default: "4194304 (4 MB)"
+ */
+constexpr const char* CCL_SYCL_ALLTOALL_CRI_COPY_ENGINE_THRESHOLD =
+    "CCL_SYCL_ALLTOALL_CRI_COPY_ENGINE_THRESHOLD";
+/*
+ * @brief Set when the self copy of a copy-engine collective runs on a second copy engine
+ *
+ * @details On CRI the copy-engine paths of allgatherv, alltoall and alltoallv copy the rank's
+ * own block (local send buffer to local receive buffer) on a queue pinned to the last
+ * copy-only engine, in parallel with the copies to the peers on the stream queue. Below
+ * this many bytes of own block the self copy stays on the stream queue, since the
+ * cross-queue dependency and the join cost more than the overlap saves. One variable per
+ * collective; the own block is count * dtype size (alltoallv: send_counts[rank] * dtype size).
+ * Not used with graph recording, multi-thread communicators or the allgatherv tmp buffer path.
+ *
+ * "<value>" : bytes; "0" keeps the self copy on the stream queue at every size
+ *
+ * By-default: "8388608 (8 MB)"
+ */
+constexpr const char* CCL_SYCL_ALLGATHERV_SELF_COPY_THRESHOLD = "CCL_SYCL_ALLGATHERV_SELF_COPY_THRESHOLD";
+constexpr const char* CCL_SYCL_ALLTOALL_SELF_COPY_THRESHOLD = "CCL_SYCL_ALLTOALL_SELF_COPY_THRESHOLD";
+constexpr const char* CCL_SYCL_ALLTOALLV_SELF_COPY_THRESHOLD = "CCL_SYCL_ALLTOALLV_SELF_COPY_THRESHOLD";
 
 /** @} */
 /** @} */
@@ -802,7 +1009,6 @@ constexpr const char* CCL_SYCL_AUTO_USE_TMP_BUF = "CCL_SYCL_AUTO_USE_TMP_BUF";
 constexpr const char* CCL_SYCL_FORCE_USE_TMP_BUF_SCALEOUT = "CCL_SYCL_FORCE_USE_TMP_BUF_SCALEOUT";
 constexpr const char* CCL_SYCL_COPY_ENGINE = "CCL_SYCL_COPY_ENGINE";
 constexpr const char* CCL_SYCL_KERNEL_COPY = "CCL_SYCL_KERNEL_COPY";
-constexpr const char* CCL_SYCL_ESIMD = "CCL_SYCL_ESIMD";
 /*
  * @brief Specify whether to disable use of full vectors (>= 8 bytes)
  *
@@ -850,6 +1056,16 @@ constexpr const char* CCL_SYCL_GRAPH_TYPE = "CCL_SYCL_GRAPH_TYPE";
  * By-default: "1 (enable)"
  */
 constexpr const char* CCL_SYCL_ONESHOT_ALLGATHER_WA = "CCL_SYCL_ONESHOT_ALLGATHER_WA";
+/*
+ * @brief Disable oneshot alltoall ll with graph recording
+ *
+ * @details This is a workaround for a hang in some cases
+ *
+ * "<value>" : "1", "0"
+ *
+ * By-default: "1 (enable)"
+ */
+constexpr const char* CCL_SYCL_ONESHOT_ALLTOALL_WA = "CCL_SYCL_ONESHOT_ALLTOALL_WA";
 /* @brief Specify what host_task API is used in graph-related collectives
  *
  * @details Selects between legacy API for host tasks, with explicit events,
@@ -864,8 +1080,58 @@ constexpr const char* CCL_SYCL_ONESHOT_ALLGATHER_WA = "CCL_SYCL_ONESHOT_ALLGATHE
 constexpr const char* CCL_SYCL_HOST_TASK_TYPE = "CCL_SYCL_HOST_TASK_TYPE";
 constexpr const char* CCL_SYCL_KERNEL_MEMCPY_UPSIZE = "CCL_SYCL_KERNEL_MEMCPY_UPSIZE ";
 constexpr const char* CCL_SYCL_TMP_BUF_SIZE = "CCL_SYCL_TMP_BUF_SIZE";
+/**
+ * @brief Set the segment size of the simple ring kernels
+ *
+ * @details The large (simple) ring kernels of allreduce, reduce_scatter and
+ * allgatherv pipeline the message through the large temp buffer in segments,
+ * one segment per pipeline slot. These variables set the size of one segment
+ * in bytes, independently of the buffer allocation (CCL_SYCL_TMP_BUF_SIZE). A
+ * segment is rounded down to 4096 bytes and clamped so that all pipeline slots
+ * fit the allocation.
+ * The multi-domain allreduce phases run the reduce_scatter and allgatherv
+ * kernels and therefore use those collectives' values.
+ * The single-kernel rings (CCL_SYCL_SIMPLE_SINGLE_KERNEL) ignore these: they
+ * always take a whole temp buffer per slot.
+ *
+ * "<value>" : size in bytes, "0" keeps each kernel's default segment
+ *
+ * By-default: "0"
+ */
+constexpr const char* CCL_SYCL_ALLREDUCE_SIMPLE_RING_SEGMENT_SIZE =
+    "CCL_SYCL_ALLREDUCE_SIMPLE_RING_SEGMENT_SIZE";
+constexpr const char* CCL_SYCL_REDUCE_SCATTER_SIMPLE_RING_SEGMENT_SIZE =
+    "CCL_SYCL_REDUCE_SCATTER_SIMPLE_RING_SEGMENT_SIZE";
+constexpr const char* CCL_SYCL_ALLGATHERV_SIMPLE_RING_SEGMENT_SIZE =
+    "CCL_SYCL_ALLGATHERV_SIMPLE_RING_SEGMENT_SIZE";
+/**
+ * @brief Pipeline copy-engine copies with execution-unit reductions
+ *
+ * @details Large ring allreduce and reduce-scatter, 2 to 5 ranks, with CCL_SYCL_COPY_ENGINE=1:
+ * the copies run on their own copy-engine queue and overlap the reductions. Arc-class GPUs
+ * only (e.g. BMG, CRI). CCL_SYCL_CE_EU_PIPELINE_CHUNK_SIZE: at least 65536, at most half of
+ * CCL_SYCL_TMP_BUF_SIZE, rounded down to 4096; 0 = 8 MiB (allreduce) or 4 MiB (reduce-scatter),
+ * down to 2 MiB for small messages.
+ * The serial path is used for 6+ ranks, multi-thread communicators, graph recording, the CPU
+ * barrier, 1/2-byte types with counts not a multiple of 4 bytes, a tmp buffer below 132 KiB,
+ * or a part per rank of one chunk or less. 3, 4 and 5 ranks also need room for 8, 15 and 24
+ * chunks in the whole CCL_SYCL_TMP_BUF_SIZE.
+ * All ranks must use the same values of these variables, CCL_SYCL_COPY_ENGINE,
+ * CCL_SYCL_CCL_BARRIER, CCL_SYCL_FULL_VECTOR and CCL_SYCL_TMP_BUF_SIZE, and all or none must
+ * have a multi-thread communicator; a mismatch hangs.
+ *
+ * "<value>" : "0", "1" for CCL_SYCL_CE_EU_PIPELINE; the chunk size in bytes for
+ * CCL_SYCL_CE_EU_PIPELINE_CHUNK_SIZE
+ *
+ * By-default: "0 (disabled)" for CCL_SYCL_CE_EU_PIPELINE, "0 (automatic)" for
+ * CCL_SYCL_CE_EU_PIPELINE_CHUNK_SIZE
+ */
+constexpr const char* CCL_SYCL_CE_EU_PIPELINE = "CCL_SYCL_CE_EU_PIPELINE";
+constexpr const char* CCL_SYCL_CE_EU_PIPELINE_CHUNK_SIZE = "CCL_SYCL_CE_EU_PIPELINE_CHUNK_SIZE";
 constexpr const char* CCL_SYCL_SCALEOUT_HOST_BUF_SIZE = "CCL_SYCL_SCALEOUT_HOST_BUF_SIZE";
 constexpr const char* CCL_SYCL_SCALEOUT_DEVICE_BUF_SIZE = "CCL_SYCL_SCALEOUT_DEVICE_BUF_SIZE";
+constexpr const char* CCL_SYCL_SCALEOUT_SMALL_HOST_BUF_SIZE =
+    "CCL_SYCL_SCALEOUT_SMALL_HOST_BUF_SIZE";
 constexpr const char* CCL_SYCL_KERNELS_LINE_SIZE = "CCL_SYCL_KERNELS_LINE_SIZE";
 constexpr const char* CCL_SYCL_SCALEOUT_BUF_ALLOC_MODE = "CCL_SYCL_SCALEOUT_BUF_ALLOC_MODE";
 constexpr const char* CCL_SYCL_PT2PT_READ = "CCL_SYCL_PT2PT_READ";
@@ -943,6 +1209,35 @@ constexpr const char* CCL_SYCL_ENABLE_ALLGATHERV_SCALEOUT_PROXY =
     "CCL_SYCL_ENABLE_ALLGATHERV_SCALEOUT_PROXY";
 constexpr const char* CCL_SYCL_ENABLE_ALLTOALL_SCALEOUT_PROXY =
     "CCL_SYCL_ENABLE_ALLTOALL_SCALEOUT_PROXY";
+constexpr const char* CCL_SYCL_ENABLE_BROADCAST_SCALEOUT_PROXY =
+    "CCL_SYCL_ENABLE_BROADCAST_SCALEOUT_PROXY";
+
+/**
+ * @addtogroup ExpOneCCLvars
+ * @{
+ */
+
+/**
+ * @brief Select how a multi-domain reduce_scatter is structured across p2p domains
+ *
+ * @details "hierarchical" decomposes each call into a scale-up kernel over the local
+ * p2p domain plus a separate scale-out phase over the remaining ranks, whose algorithm
+ * is a separate axis (CCL_SYCL_REDUCE_SCATTER_SCALEOUT). "flat" instead runs one ring
+ * over all ranks of the global communicator inside a single kernel, issuing the hops
+ * that cross a domain boundary through the device-initiated proxy framework
+ * (proxy/device_initiated/) rather than tearing the kernel down for the network.
+ *
+ * "flat" is RDMA-only and needs the proxy service, so it also requires
+ * CCL_SYCL_ENABLE_REDUCE_SCATTER_SCALEOUT_PROXY. It falls back to "hierarchical"
+ * whenever unsupported, with the reason logged at debug level.
+ *
+ * "<value>" : "hierarchical", "flat"
+ *
+ * By-default: "hierarchical"
+ */
+constexpr const char* CCL_SYCL_REDUCE_SCATTER_DOMAIN_MODE =
+    "CCL_SYCL_REDUCE_SCATTER_DOMAIN_MODE";
+/** @} */
 
 /*
  * @brief Specify whether to enable sycl kenels with sub-communicators

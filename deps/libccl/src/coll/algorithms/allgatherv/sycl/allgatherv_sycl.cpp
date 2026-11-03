@@ -21,30 +21,7 @@
 #include "coll/algorithms/utils/sycl_selection.hpp"
 #include "coll/algorithms/utils/transmit/ring_transmit.hpp"
 #include "coll/algorithms/utils/transmit/oneshot_transmit.hpp"
-#include "coll/selection/selector_impl.hpp"
 #include "coll/algorithms/utils/p2p_domain.hpp"
-
-// Resolve which LL256 transmit kernel (ring/oneshot) to use for the SYCL
-// allgather(v) scale-up path. CCL_SYCL_ALLGATHERV_LL picks one of
-// "ring" / "oneshot" per message-size range using the same
-// "<algo>:<lo>-<hi>;..." syntax as the algorithm-selector framework
-// (re-uses fill_table_from_str / get_value_from_table with std::string keys).
-// When set to a single token, that algorithm is used for all sizes.
-// When explicitly cleared, defaults to ring.
-static std::string select_allgatherv_scaleup_ll_algo(size_t bytes) {
-    const std::string& spec = ccl::global_data::env().sycl_allgatherv_ll_algo;
-    if (spec.empty()) {
-        return "ring";
-    }
-
-    static ccl_selection_table_t<std::string> table = [&]() {
-        ccl_selection_table_t<std::string> t;
-        fill_table_from_str(spec, t);
-        return t;
-    }();
-
-    return ccl_algorithm_selector_base<std::string>::get_value_from_table(bytes, table);
-}
 
 namespace {
 
@@ -74,10 +51,7 @@ ccl::event allgatherv_scaleup_single_rank(sycl::queue& q,
     return ccl::event::create_from_native(sycl_e);
 }
 
-// Arc PCIe LL256 chunked ring. Splits the message into chunks and per-chunk
-// selects `oneshot` vs `ring` from `CCL_SYCL_ALLGATHERV_LL` (see
-// `select_allgatherv_scaleup_ll_algo`). Bails via `done=false` on unrecognised
-// spec or if any chunk fails.
+// Arc PCIe LL256 chunked ring; picks `oneshot` or `ring` per chunk.
 ccl::event allgatherv_scaleup_ll256(sycl::queue& q,
                                     const void* send_buf,
                                     size_t send_count,
@@ -88,7 +62,8 @@ ccl::event allgatherv_scaleup_ll256(sycl::queue& q,
                                     std::shared_ptr<ccl_comm> p2p_comm,
                                     ccl_stream* global_stream,
                                     const ccl::vector_class<ccl::event>& deps,
-                                    bool& done) {
+                                    bool& done,
+                                    const ccl::sycl_policy::ll_algo_lookup& ll) {
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     const int node_size = p2p_comm->size();
     const int chunk_size = ccl::global_data::env().sycl_allgatherv_chunking_threshold;
@@ -107,6 +82,7 @@ ccl::event allgatherv_scaleup_ll256(sycl::queue& q,
     ccl::event e;
     int send_offset = 0;
     int nchunks = (send_count + max_pack_count - 1) / max_pack_count;
+    LOG_DEBUG("AllGather LL - count: ", send_count, " datatype: ", dtype, " chunks: ", nchunks);
     for (int iter = 0; iter < nchunks; iter++) {
         int pack_count = (iter < nchunks - 1) ? max_pack_count : send_count - send_offset;
         std::vector<size_t> scaleup_counts(node_size, pack_count);
@@ -119,34 +95,39 @@ ccl::event allgatherv_scaleup_ll256(sycl::queue& q,
         ccl::profile::itt::task_begin(
             "allgatherv_ll_ring", "send_size", pack_count * ccl_dtype.size(), comm->unique_id());
 #endif // CCL_ENABLE_ITT
-        LOG_DEBUG("invoking allgatherv LL256 kernel, send_count:",
-                  pack_count, " datatype: ", dtype, " p2p_comm size: ", p2p_comm->size());
-        // Resolve the LL transmit algorithm for this chunk size via
-        // CCL_SYCL_ALLGATHERV_LL (ring/oneshot per byte range).
+        // Resolve the LL transmit algorithm for this chunk from the resolver's
+        // per-collective LL lookup (CCL_SYCL_ALLGATHERV_LL range spec).
         const size_t msg_bytes = pack_count * ccl_dtype.size();
-        const std::string ll_algo = select_allgatherv_scaleup_ll_algo(msg_bytes);
+        const auto ll_algo = ll.pick(msg_bytes);
         // TODO temporary workaround - disable oneshot allgatherv while recording
-        bool recording_wa = ccl::global_data::env().sycl_oneshot_allgather_wa && use_recording_path(q);
-        if (ll_algo == "oneshot" && msg_bytes < (size_t)ONESHOT_MAX_MSGSIZE && !recording_wa) {
+        const bool recording_wa =
+            ccl::global_data::env().sycl_oneshot_allgather_wa && use_recording_path(q);
+        if (ll_algo == ccl::sycl_policy::scaleup_algo::oneshot &&
+            msg_bytes < (size_t)ONESHOT_MAX_MSGSIZE && !recording_wa) {
             // OneShot broadcasts each rank's chunk in a single shot (minimum
             // latency); hard-capped at ONESHOT_MAX_MSGSIZE, above which it
             // falls back to ring. Tune via CCL_SYCL_ALLGATHERV_LL range syntax.
-            LOG_INFO("AllGather LL - using oneshot transmit");
+            LOG_DEBUG("AllGather LL - chunk ", iter, "/", nchunks, " using oneshot transmit, count: ",
+                      pack_count, " datatype: ", dtype, " p2p_comm size: ", p2p_comm->size());
             e = allgatherv_ll<OneShotTransmit>(q,
                                                (char*)send_buf + send_offset * ccl_dtype.size(),
                                                pack_count, recv_buf, scaleup_counts, scaleup_offsets,
                                                dtype, comm, p2p_comm, global_stream, deps, done);
         }
-        else if (ll_algo == "ring" || ll_algo == "oneshot") {
+        else if (ll_algo == ccl::sycl_policy::scaleup_algo::ring ||
+                 ll_algo == ccl::sycl_policy::scaleup_algo::oneshot) {
             // Ring is the default, also used as fallback when oneshot exceeds threshold.
-            LOG_INFO("AllGather LL - using ring transmit");
+            LOG_DEBUG("AllGather LL - chunk ", iter, "/", nchunks, " using ring transmit, count: ",
+                      pack_count, " datatype: ", dtype, " p2p_comm size: ", p2p_comm->size());
             e = allgatherv_ll<RingTransmit>(q,
                                             (char*)send_buf + send_offset * ccl_dtype.size(),
                                             pack_count, recv_buf, scaleup_counts, scaleup_offsets,
                                             dtype, comm, p2p_comm, global_stream, deps, done);
         }
         else {
-            LOG_ERROR("CCL_SYCL_ALLGATHERV_LL must be ring or oneshot, got: ", ll_algo);
+            LOG_ERROR("allgatherv LL supports ring or oneshot, got '",
+                      ccl::sycl_policy::to_str(ll_algo), "' (CCL_SYCL_ALLGATHERV_LL='",
+                      ccl::global_data::env().sycl_allgatherv_ll_algo, "')");
             done = false;
         }
         LOG_DEBUG("invoking allgatherv LL256 kernel, count:", pack_count, " datatype: ", dtype, " done");
@@ -159,8 +140,7 @@ ccl::event allgatherv_scaleup_ll256(sycl::queue& q,
     return e;
 }
 
-// Non-ESIMD vec path: try `allgatherv_small` first (bails via done=false when
-// the small kernel doesn't apply), then always run `allgatherv_large`.
+// Vec path. Resolver picked `small` or `large`.
 ccl::event allgatherv_scaleup_default(sycl::queue& q,
                                   const void* send_buf,
                                   size_t send_count,
@@ -173,16 +153,15 @@ ccl::event allgatherv_scaleup_default(sycl::queue& q,
                                   ccl_stream* global_stream,
                                   const ccl::vector_class<ccl::event>& deps,
                                   bool& done,
-                                  sycl_scaleup_options coll_attr) {
+                                  sycl_scaleup_options coll_attr,
+                                  ccl::sycl_policy::scaleup_algo algo) {
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
     ccl::event e;
-    if (send_count * ccl_dtype.size() <= ccl::global_data::env().sycl_allgatherv_small_threshold) {
+    if (algo == ccl::sycl_policy::scaleup_algo::small) {
 #ifdef CCL_ENABLE_ITT
         ccl::profile::itt::task_begin(
             "allgatherv_small", "send_size", send_count * ccl_dtype.size(), comm->unique_id());
 #endif // CCL_ENABLE_ITT
-        LOG_DEBUG("|CCL_SYCL| allgatherv selects small kernel, count: ", send_count, " datatype: ", dtype);
-        LOG_INFO("AllGather small - using small kernel");
         e = allgatherv_small(
             q, send_buf, send_count, recv_buf, recv_counts, offsets, dtype, comm, global_stream, deps, done);
         LOG_DEBUG("|CCL_SYCL| allgatherv selects small kernel, count: ",
@@ -206,90 +185,6 @@ ccl::event allgatherv_scaleup_default(sycl::queue& q,
     done = true;
     return e;
 }
-
-#ifdef CCL_ENABLE_ESIMD
-// ESIMD path: small (if in-threshold and all-vertices-connected), then medium
-// (if not single-tile), else large. Large has a dtype-recast fallback when
-// 16-bit vec support is missing at compile time.
-ccl::event allgatherv_scaleup_esimd(sycl::queue& q,
-                                    const void* send_buf,
-                                    size_t send_count,
-                                    void* recv_buf,
-                                    const ccl::vector_class<size_t>& recv_counts,
-                                    const ccl::vector_class<size_t>& offsets,
-                                    ccl::datatype dtype,
-                                    ccl_comm* comm,
-                                    ccl_stream* global_stream,
-                                    int rank,
-                                    uint32_t world,
-                                    bool is_single_tile,
-                                    bool has_all_vertices_connected,
-                                    const ccl::vector_class<ccl::event>& deps,
-                                    bool& done) {
-    auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
-    LOG_INFO("AllGather ESIMD");
-    ccl::event e;
-    if (send_count * ccl_dtype.size() <= ccl::global_data::env().sycl_allgatherv_small_threshold &&
-        has_all_vertices_connected) {
-        init_allgatherv_small(dtype, q, comm, global_stream, rank, world);
-#ifdef CCL_ENABLE_ITT
-        ccl::profile::itt::task_begin(
-            "allgatherv_small", "send_size", send_count * ccl_dtype.size(), comm->unique_id());
-#endif // CCL_ENABLE_ITT
-        LOG_DEBUG("|CCL_SYCL| allgatherv selects small kernel, count: ", send_count, " datatype: ", dtype);
-        e = run_allgatherv_small(dtype, q, send_buf, send_count, recv_buf, recv_counts, done);
-        LOG_DEBUG("|CCL_SYCL| allgatherv selects small kernel, count: ",
-                  send_count, " datatype: ", dtype, " done");
-#ifdef CCL_ENABLE_ITT
-        ccl::profile::itt::task_end();
-#endif // CCL_ENABLE_ITT
-        if (done) return e;
-    }
-    if (send_count * ccl_dtype.size() <= ccl::global_data::env().sycl_allgatherv_medium_threshold &&
-        !is_single_tile) {
-        init_allgatherv_medium(dtype, q, comm, global_stream, rank, world);
-#ifdef CCL_ENABLE_ITT
-        ccl::profile::itt::task_begin(
-            "allgatherv_medium", "send_size", send_count * ccl_dtype.size(), comm->unique_id());
-#endif // CCL_ENABLE_ITT
-        LOG_DEBUG("|CCL_SYCL| allgatherv selects medium kernel: count: ", send_count, " datatype: ", dtype);
-        e = run_allgatherv_medium(dtype, q, send_buf, send_count, recv_buf, recv_counts, done);
-        LOG_DEBUG("|CCL_SYCL| allgatherv selects medium kernel: count: ",
-                  send_count, " datatype: ", dtype, " done");
-#ifdef CCL_ENABLE_ITT
-        ccl::profile::itt::task_end();
-#endif // CCL_ENABLE_ITT
-        return e;
-    }
-#ifdef CCL_ENABLE_ITT
-    ccl::profile::itt::task_begin(
-        "allgatherv_large", "send_size", send_count * ccl_dtype.size(), comm->unique_id());
-#endif // CCL_ENABLE_ITT
-    LOG_DEBUG("|CCL_SYCL| invoking large allgatherv: count: ", send_count, " datatype: ", dtype);
-#if defined(CCL_SYCL_VEC_SUPPORT_FP16) && defined(CCL_SYCL_VEC_SUPPORT_BF16)
-    e = allgatherv_large(q, send_buf, send_count, recv_buf, recv_counts, offsets, dtype,
-                         comm, global_stream, deps);
-#else
-    // allgatherv_large is sycl::vec based algorithm; when 16-bit datatypes
-    // are not supported, gather by int16 instead.
-    ccl::datatype new_dtype = ccl::datatype::int16;
-    size_t new_send_count = send_count * ccl_dtype.size() / 2;
-    ccl::vector_class<size_t> new_recv_counts;
-    for (size_t i = 0; i < recv_counts.size(); i++) {
-        new_recv_counts.push_back(recv_counts[i] * ccl_dtype.size() / 2);
-    }
-    e = allgatherv_large(send_buf, new_send_count, recv_buf, new_recv_counts, offsets, new_dtype,
-                         comm, global_stream, deps);
-#endif // defined(CCL_SYCL_VEC_SUPPORT_FP16) && defined(CCL_SYCL_VEC_SUPPORT_BF16)
-    done = true;
-    LOG_DEBUG("|CCL_SYCL| allgatherv selects large kernel: count: ",
-              send_count, " datatype: ", dtype, " done");
-#ifdef CCL_ENABLE_ITT
-    ccl::profile::itt::task_end();
-#endif // CCL_ENABLE_ITT
-    return e;
-}
-#endif // CCL_ENABLE_ESIMD
 
 }  // namespace
 
@@ -332,29 +227,22 @@ ccl::event allgather_scaleup_sycl(sycl::queue& q,
 
     const auto tune = ccl::sycl_policy_resolver::scaleup_resolver{
         ccl::sycl_policy::policy_query(
-            ccl_coll_allgatherv, send_count * ccl_dtype.size(), ccl_dtype,
+            ccl_coll_allgatherv, send_count, ccl_dtype,
             /*r2r_size=*/0, comm->size(), use_recording_path(q))
             .with_comm(comm)
+            .with_p2p_comm(p2p_comm.get(), /*p2p_access_from_all=*/true)
             .with_stream(global_stream)
     }.allgatherv();
 
     switch (tune.protocol) {
         case ccl::sycl_policy::scaleup_protocol::ll:
             return allgatherv_scaleup_ll256(q, send_buf, send_count, recv_buf, offsets, dtype,
-                                            comm, p2p_comm, global_stream, deps, done);
-#ifdef CCL_ENABLE_ESIMD
-        case ccl::sycl_policy::scaleup_protocol::esimd:
-            return allgatherv_scaleup_esimd(q, send_buf, send_count, recv_buf, recv_counts, offsets,
-                                            dtype, comm, global_stream,
-                                            p2p_comm->rank(), p2p_comm->size(),
-                                            comm->get_pair_comm()->size() == 1,
-                                            comm->get_topo_manager().has_all_vertices_connected(),
-                                            deps, done);
-#endif
+                                            comm, p2p_comm, global_stream, deps, done, tune.ll);
         case ccl::sycl_policy::scaleup_protocol::default_kernel:
         default:
             return allgatherv_scaleup_default(q, send_buf, send_count, recv_buf, recv_counts, offsets,
-                                          dtype, comm, p2p_comm, global_stream, deps, done, coll_attr);
+                                          dtype, comm, p2p_comm, global_stream, deps, done, coll_attr,
+                                          tune.algo);
     }
 }
 
@@ -418,11 +306,12 @@ ccl::event allgatherv_sycl_multi_domain_small_msg(sycl::queue& q,
         }
 
         sycl_scaleout_tune_attr tune_attr = ccl::sycl_policy_resolver::scaleout_resolver{
-            ccl::sycl_policy::policy_query(ccl_coll_allgatherv, pack_count * ccl_dtype.size(), ccl_dtype,
+            ccl::sycl_policy::policy_query(ccl_coll_allgatherv, pack_count, ccl_dtype,
                 r2r_comm->size(), global_comm->size(), use_recording_path(q))
+                .with_p2p_comm(p2p_comm.get(), /*p2p_access_from_all=*/true)
         }.allgatherv();
 
-        if (tune_attr.algo() == ccl::sycl_policy::algorithm::direct) {
+        if (tune_attr.algo() == ccl::sycl_policy::scaleout_algo::direct) {
             copy_to_host = ccl::global_data::env().sycl_enable_direct_gpu_rdma ? false : true;
             ze_device_handle_t ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
             if (should_disable_rdma(ze_dev)) {
@@ -444,7 +333,7 @@ ccl::event allgatherv_sycl_multi_domain_small_msg(sycl::queue& q,
                                       tune_attr,
                                       copy_to_host);
         if (!done) {
-            LOG_INFO("allgatherv_sycl scaleout was not done -- falling back");
+            LOG_DEBUG("allgatherv_sycl scaleout was not done -- falling back");
             return ev;
         }
 
@@ -517,10 +406,11 @@ ccl::event allgatherv_sycl_multi_domain_large_msg(sycl::queue& q,
 
     bool overlap = ccl::global_data::env().sycl_allgatherv_scaleout_overlap;
     sycl_scaleout_tune_attr tune_attr = ccl::sycl_policy_resolver::scaleout_resolver{
-        ccl::sycl_policy::policy_query(ccl_coll_allgatherv, send_count * ccl_dtype.size(), ccl_dtype,
+        ccl::sycl_policy::policy_query(ccl_coll_allgatherv, send_count, ccl_dtype,
             r2r_comm->size(), global_comm->size(), use_recording_path(q))
+            .with_p2p_comm(p2p_comm.get(), /*p2p_access_from_all=*/true)
     }.allgatherv();
-    bool direct = tune_attr.algo() == ccl::sycl_policy::algorithm::direct;
+    bool direct = tune_attr.algo() == ccl::sycl_policy::scaleout_algo::direct;
     bool copy_to_host = ccl::global_data::env().sycl_enable_direct_gpu_rdma ? false : true;
     ze_device_handle_t ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
     if (should_disable_rdma(ze_dev)) {
@@ -592,7 +482,7 @@ ccl::event allgatherv_sycl_multi_domain_large_msg(sycl::queue& q,
                                       false,
                                       buf_info.get_ptr());
         if (!done) {
-            LOG_INFO("allgatherv_sycl scaleout was not done -- falling back");
+            LOG_DEBUG("allgatherv_sycl scaleout was not done -- falling back");
             return ev;
         }
 
@@ -695,9 +585,9 @@ ccl::event allgatherv_scaleout_only_sycl(sycl::queue& q,
     auto ccl_dtype = ccl::global_data::get().dtypes->get(dtype);
 
     // Scaleout-only variant: no p2p r2r-comm
-    ccl::sycl_policy::policy_query query(
-        ccl_coll_allgatherv, send_count * ccl_dtype.size(), ccl_dtype,
-        /*r2r_size=*/0, global_comm->size(), use_recording_path(q));
+    auto query = ccl::sycl_policy::policy_query(
+        ccl_coll_allgatherv, send_count, ccl_dtype,
+        global_comm->size(), global_comm->size(), use_recording_path(q));
     sycl_scaleout_tune_attr tune_attr =
         ccl::sycl_policy_resolver::scaleout_resolver{query}.allgatherv();
 
@@ -724,7 +614,7 @@ ccl::event allgatherv_scaleout_only_sycl(sycl::queue& q,
                                   tune_attr,
                                   copy_to_host);
     if (!done) {
-        LOG_INFO("allgatherv_sycl scaleout was not done -- falling back");
+        LOG_DEBUG("allgatherv_sycl scaleout was not done -- falling back");
     }
     return ev;
 }
@@ -756,7 +646,11 @@ ccl::event allgather_sycl(sycl::queue q,
         return allgather_scaleup_sycl(q, send_buf, send_count, recv_buf, recv_counts, {}, dtype, comm, p2p_comm, op_stream, deps, done);
     }
 
-    if (send_count * ccl_dtype.size() <= ccl::global_data::env().sycl_allgatherv_small_threshold) {
+    const auto size_algo = ccl::sycl_policy::pick_size_algo(
+        send_count * ccl_dtype.size(),
+        ccl::global_data::env().sycl_allgatherv_small_threshold);
+
+    if (size_algo == ccl::sycl_policy::scaleup_algo::small) {
         return allgatherv_sycl_multi_domain_small_msg(
             q, send_buf, send_count, recv_buf, recv_counts, dtype, comm, p2p_comm, r2r_comm, op_stream, deps, done);
     }
